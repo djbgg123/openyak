@@ -96,7 +96,6 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::resolve_command_path_with_env;
-    use std::ffi::OsString;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -113,6 +112,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn detects_windows_commands_via_pathext() {
+        use std::ffi::OsString;
+
         let dir = temp_test_dir("command-exists");
         let exe = dir.join("gh.EXE");
         fs::write(&exe, "").expect("test exe should write");
@@ -161,6 +162,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn resolves_first_matching_windows_command_in_path_order() {
+        use std::ffi::OsString;
+
         let first_dir = temp_test_dir("command-resolve-first");
         let second_dir = temp_test_dir("command-resolve-second");
         let first = first_dir.join("gh.CMD");

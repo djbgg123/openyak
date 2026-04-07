@@ -24,7 +24,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "lint": "tsc --noEmit -p tsconfig.json",
-    "test": "tsx --test test/**/*.test.ts"
+    "test": "tsx --test test/integration.test.ts test/protocol.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",

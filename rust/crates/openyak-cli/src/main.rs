@@ -6425,15 +6425,6 @@ mod tests {
 
         assert!(error.contains("missing clientId, authorizeUrl, tokenUrl"));
 
-        for _ in 0..5 {
-            match fs::remove_dir_all(&root) {
-                Ok(()) => return,
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(error) => panic!("cleanup temp dir: {error}"),
-            }
-        }
         crate::cleanup_temp_dir(&root);
     }
 

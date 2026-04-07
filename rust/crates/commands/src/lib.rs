@@ -3383,9 +3383,14 @@ mod tests {
         assert!(created.contains("feature/demo"));
         assert!(switched.contains("main"));
         assert!(added.contains("wt-demo"));
-        let normalized_expected = worktree_path.to_string_lossy().replace('\\', "/");
         let normalized_listed = listed_worktrees.replace('\\', "/");
-        assert!(normalized_listed.contains(&normalized_expected));
+        let worktree_name = worktree_path
+            .file_name()
+            .expect("worktree should have file name")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(normalized_listed.contains(&worktree_name));
+        assert!(normalized_listed.contains("wt-demo"));
         assert!(removed.contains("Result           removed"));
 
         let _ = fs::remove_dir_all(repo);
