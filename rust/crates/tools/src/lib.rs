@@ -6364,14 +6364,26 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let success = execute_tool("bash", &json!({ "command": bash_echo_command("hello") }))
-            .expect("bash should succeed");
+        let success = execute_tool(
+            "bash",
+            &json!({
+                "command": bash_echo_command("hello"),
+                "dangerouslyDisableSandbox": true
+            }),
+        )
+        .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");
         assert_eq!(success_output["stdout"], "hello");
         assert_eq!(success_output["interrupted"], false);
 
-        let failure = execute_tool("bash", &json!({ "command": bash_error_command("oops", 7) }))
-            .expect("bash failure should still return structured output");
+        let failure = execute_tool(
+            "bash",
+            &json!({
+                "command": bash_error_command("oops", 7),
+                "dangerouslyDisableSandbox": true
+            }),
+        )
+        .expect("bash failure should still return structured output");
         let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
         assert_eq!(failure_output["returnCodeInterpretation"], "exit_code:7");
         assert!(failure_output["stderr"]
@@ -6381,7 +6393,11 @@ mod tests {
 
         let timeout = execute_tool(
             "bash",
-            &json!({ "command": bash_sleep_command(), "timeout": 10 }),
+            &json!({
+                "command": bash_sleep_command(),
+                "timeout": 10,
+                "dangerouslyDisableSandbox": true
+            }),
         )
         .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
@@ -6394,7 +6410,11 @@ mod tests {
 
         let background = execute_tool(
             "bash",
-            &json!({ "command": bash_sleep_command(), "run_in_background": true }),
+            &json!({
+                "command": bash_sleep_command(),
+                "run_in_background": true,
+                "dangerouslyDisableSandbox": true
+            }),
         )
         .expect("bash background should succeed");
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
