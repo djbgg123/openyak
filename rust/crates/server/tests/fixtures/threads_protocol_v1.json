@@ -1,0 +1,481 @@
+{
+  "requests": {
+    "create_thread": {
+      "model": "claude-sonnet-4-6",
+      "permission_mode": "danger-full-access",
+      "allowed_tools": [
+        "bash"
+      ]
+    },
+    "start_turn": {
+      "message": "PARITY_SCENARIO:bash_stdout_roundtrip"
+    },
+    "submit_user_input": {
+      "request_id": "req-user-input-roundtrip",
+      "content": "feature",
+      "selected_option": "feature"
+    }
+  },
+  "responses": {
+    "create_thread": {
+      "protocol_version": "v1",
+      "thread_id": "thread-1",
+      "created_at": 0,
+      "updated_at": 0,
+      "state": {
+        "status": "idle"
+      },
+      "config": {
+        "cwd": "<cwd>",
+        "model": "claude-sonnet-4-6",
+        "permission_mode": "danger-full-access",
+        "allowed_tools": [
+          "bash"
+        ]
+      },
+      "session": {
+        "version": 1,
+        "messages": []
+      }
+    },
+    "list_threads": {
+      "protocol_version": "v1",
+      "threads": [
+        {
+          "thread_id": "thread-1",
+          "created_at": 0,
+          "updated_at": 0,
+          "state": {
+            "status": "idle"
+          },
+          "message_count": 0
+        }
+      ]
+    },
+    "get_thread": {
+      "protocol_version": "v1",
+      "thread_id": "thread-1",
+      "created_at": 0,
+      "updated_at": 0,
+      "state": {
+        "status": "idle"
+      },
+      "config": {
+        "cwd": "<cwd>",
+        "model": "claude-sonnet-4-6",
+        "permission_mode": "danger-full-access",
+        "allowed_tools": [
+          "bash"
+        ]
+      },
+      "session": {
+        "version": 1,
+        "messages": []
+      }
+    },
+    "turn_accepted": {
+      "protocol_version": "v1",
+      "thread_id": "thread-1",
+      "run_id": "run-1",
+      "status": "accepted"
+    },
+    "user_input_accepted": {
+      "protocol_version": "v1",
+      "thread_id": "thread-2",
+      "run_id": "run-2",
+      "request_id": "req-user-input-roundtrip",
+      "status": "accepted"
+    }
+  },
+  "errors": {
+    "invalid_request": {
+      "status": 400,
+      "body": {
+        "code": "invalid_request",
+        "message": "turn message must not be empty"
+      }
+    },
+    "conflict": {
+      "status": 409,
+      "body": {
+        "code": "conflict",
+        "message": "thread already has an active or blocked run",
+        "details": {
+          "status": {
+            "status": "awaiting_user_input",
+            "run_id": "run-2",
+            "pending_user_input": {
+              "request_id": "req-user-input-roundtrip",
+              "prompt": "Which branch should we continue with?",
+              "options": [
+                "main",
+                "feature"
+              ],
+              "allow_freeform": true
+            }
+          }
+        }
+      }
+    },
+    "not_found": {
+      "status": 404,
+      "body": {
+        "code": "not_found",
+        "message": "thread `thread-missing` not found"
+      }
+    },
+    "internal_error": {
+      "status": 500,
+      "body": {
+        "code": "internal_error",
+        "message": "fixture storage failure"
+      }
+    }
+  },
+  "events": {
+    "bash_turn": [
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-1",
+        "sequence": 0,
+        "timestamp_ms": 0,
+        "type": "thread.snapshot",
+        "payload": {
+          "protocol_version": "v1",
+          "thread_id": "thread-1",
+          "created_at": 0,
+          "updated_at": 0,
+          "state": {
+            "status": "idle"
+          },
+          "config": {
+            "cwd": "<cwd>",
+            "model": "claude-sonnet-4-6",
+            "permission_mode": "danger-full-access",
+            "allowed_tools": [
+              "bash"
+            ]
+          },
+          "session": {
+            "version": 1,
+            "messages": []
+          }
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-1",
+        "run_id": "run-1",
+        "sequence": 1,
+        "timestamp_ms": 0,
+        "type": "run.started",
+        "payload": {
+          "kind": "turn",
+          "message": "PARITY_SCENARIO:bash_stdout_roundtrip",
+          "status": "running"
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-1",
+        "run_id": "run-1",
+        "sequence": 2,
+        "timestamp_ms": 0,
+        "type": "assistant.tool_use",
+        "payload": {
+          "id": "toolu_bash_stdout",
+          "name": "bash",
+          "input": {
+            "command": "printf 'alpha from bash'",
+            "timeout": 1000
+          }
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-1",
+        "run_id": "run-1",
+        "sequence": 3,
+        "timestamp_ms": 0,
+        "type": "assistant.usage",
+        "payload": {
+          "input_tokens": 12,
+          "output_tokens": 4,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-1",
+        "run_id": "run-1",
+        "sequence": 4,
+        "timestamp_ms": 0,
+        "type": "assistant.message_stop",
+        "payload": {}
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-1",
+        "run_id": "run-1",
+        "sequence": 5,
+        "timestamp_ms": 0,
+        "type": "assistant.tool_result",
+        "payload": {
+          "tool_use_id": "toolu_bash_stdout",
+          "tool_name": "bash",
+          "output": "<tool-output>",
+          "is_error": false
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-1",
+        "run_id": "run-1",
+        "sequence": 6,
+        "timestamp_ms": 0,
+        "type": "assistant.text.delta",
+        "payload": {
+          "text": "<bash-completed-text>"
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-1",
+        "run_id": "run-1",
+        "sequence": 7,
+        "timestamp_ms": 0,
+        "type": "assistant.usage",
+        "payload": {
+          "input_tokens": 14,
+          "output_tokens": 7,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-1",
+        "run_id": "run-1",
+        "sequence": 8,
+        "timestamp_ms": 0,
+        "type": "assistant.message_stop",
+        "payload": {}
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-1",
+        "run_id": "run-1",
+        "sequence": 9,
+        "timestamp_ms": 0,
+        "type": "run.completed",
+        "payload": {
+          "iterations": 2,
+          "assistant_message_count": 2,
+          "tool_result_count": 1,
+          "cumulative_usage": {
+            "input_tokens": 26,
+            "output_tokens": 11,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+          }
+        }
+      }
+    ],
+    "user_input_roundtrip": [
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-2",
+        "sequence": 0,
+        "timestamp_ms": 0,
+        "type": "thread.snapshot",
+        "payload": {
+          "protocol_version": "v1",
+          "thread_id": "thread-2",
+          "created_at": 0,
+          "updated_at": 0,
+          "state": {
+            "status": "idle"
+          },
+          "config": {
+            "cwd": "<cwd>",
+            "model": "claude-sonnet-4-6",
+            "permission_mode": "danger-full-access",
+            "allowed_tools": [
+              "read_file"
+            ]
+          },
+          "session": {
+            "version": 1,
+            "messages": []
+          }
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-2",
+        "run_id": "run-2",
+        "sequence": 1,
+        "timestamp_ms": 0,
+        "type": "run.started",
+        "payload": {
+          "kind": "turn",
+          "message": "PARITY_SCENARIO:request_user_input_roundtrip",
+          "status": "running"
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-2",
+        "run_id": "run-2",
+        "sequence": 2,
+        "timestamp_ms": 0,
+        "type": "assistant.request_user_input",
+        "payload": {
+          "request_id": "req-user-input-roundtrip",
+          "prompt": "Which branch should we continue with?",
+          "options": [
+            "main",
+            "feature"
+          ],
+          "allow_freeform": true
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-2",
+        "run_id": "run-2",
+        "sequence": 3,
+        "timestamp_ms": 0,
+        "type": "assistant.usage",
+        "payload": {
+          "input_tokens": 12,
+          "output_tokens": 4,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-2",
+        "run_id": "run-2",
+        "sequence": 4,
+        "timestamp_ms": 0,
+        "type": "assistant.message_stop",
+        "payload": {}
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-2",
+        "run_id": "run-2",
+        "sequence": 5,
+        "timestamp_ms": 0,
+        "type": "run.waiting_user_input",
+        "payload": {
+          "request_id": "req-user-input-roundtrip",
+          "prompt": "Which branch should we continue with?",
+          "options": [
+            "main",
+            "feature"
+          ],
+          "allow_freeform": true
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-2",
+        "run_id": "run-2",
+        "sequence": 6,
+        "timestamp_ms": 0,
+        "type": "user_input.submitted",
+        "payload": {
+          "request_id": "req-user-input-roundtrip",
+          "content": "feature",
+          "selected_option": "feature"
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-2",
+        "run_id": "run-2",
+        "sequence": 7,
+        "timestamp_ms": 0,
+        "type": "assistant.text.delta",
+        "payload": {
+          "text": "request-user-input completed: feature"
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-2",
+        "run_id": "run-2",
+        "sequence": 8,
+        "timestamp_ms": 0,
+        "type": "assistant.usage",
+        "payload": {
+          "input_tokens": 14,
+          "output_tokens": 7,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-2",
+        "run_id": "run-2",
+        "sequence": 9,
+        "timestamp_ms": 0,
+        "type": "assistant.message_stop",
+        "payload": {}
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-2",
+        "run_id": "run-2",
+        "sequence": 10,
+        "timestamp_ms": 0,
+        "type": "run.completed",
+        "payload": {
+          "iterations": 1,
+          "assistant_message_count": 1,
+          "tool_result_count": 0,
+          "cumulative_usage": {
+            "input_tokens": 26,
+            "output_tokens": 11,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+          }
+        }
+      }
+    ],
+    "thread_resync_required": {
+      "protocol_version": "v1",
+      "thread_id": "thread-lag",
+      "sequence": 160,
+      "timestamp_ms": 0,
+      "type": "thread.resync_required",
+      "payload": {
+        "skipped": 1,
+        "snapshot": {
+          "protocol_version": "v1",
+          "thread_id": "thread-lag",
+          "created_at": 0,
+          "updated_at": 0,
+          "state": {
+            "status": "idle"
+          },
+          "config": {
+            "cwd": "<cwd>",
+            "model": "opus",
+            "permission_mode": "danger-full-access",
+            "allowed_tools": []
+          },
+          "session": {
+            "version": 1,
+            "messages": []
+          }
+        }
+      }
+    }
+  }
+}

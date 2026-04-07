@@ -1,0 +1,12 @@
+{
+  "oauth": {
+    "clientId": "REPLACE_WITH_YOUR_CLIENT_ID",
+    "authorizeUrl": "https://REPLACE-WITH-YOUR-AUTH-BACKEND.example.com/oauth/authorize",
+    "tokenUrl": "https://REPLACE-WITH-YOUR-AUTH-BACKEND.example.com/oauth/token",
+    "callbackPort": 4545,
+    "scopes": [
+      "openid",
+      "profile"
+    ]
+  }
+}

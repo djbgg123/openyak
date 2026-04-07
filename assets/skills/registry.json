@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "registry_id": "packaged-skills",
+  "channel": "stable",
+  "skills": [
+    {
+      "skill_id": "release-checklist",
+      "version": "2.0.0",
+      "description": "Release checklist with smoke checks and shadowing review.",
+      "placement": "standard",
+      "package_layout": "skill_directory_v1",
+      "package_path": "packages/release-checklist-v2",
+      "sha256": "f8323b2e7363da693de25b0bb50ec40e6b35115d5dbf15a1b79050a99e4c412e",
+      "minimum_openyak_version": "0.1.0",
+      "tags": ["release", "verification"]
+    },
+    {
+      "skill_id": "release-checklist",
+      "version": "1.0.0",
+      "description": "Release checklist focused on the core verification loop.",
+      "placement": "standard",
+      "package_layout": "skill_directory_v1",
+      "package_path": "packages/release-checklist-v1",
+      "sha256": "c0db55d0b5427eaf7ef5e6a72504aeb3286a55e5200891409b5137f815444419",
+      "minimum_openyak_version": "0.1.0",
+      "tags": ["release", "verification"]
+    },
+    {
+      "skill_id": "session-handoff",
+      "version": "1.0.0",
+      "description": "Summarize what changed, what was verified, and what remains.",
+      "placement": "standard",
+      "package_layout": "skill_directory_v1",
+      "package_path": "packages/session-handoff-v1",
+      "sha256": "067b8474f744b2d990867aa48baf73ce1282125c6c3b1c818762e8e4285652a2",
+      "minimum_openyak_version": "0.1.0",
+      "tags": ["handoff", "notes"]
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+.git/
+
+# Local agent/runtime state
+.omx/
+.openyak/
+.pytest_cache/
+tmp/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# Python caches and build outputs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Node / TypeScript build outputs
+node_modules/
+coverage/
+
+# Rust build and local verification outputs
+rust/target/
+rust/target-*/
+rust/dist/
+rust/tmp/
+rust/.openyak/
+rust/.openyak-agents/
+rust/.claw/
+rust/.claw.json
+rust/.claw-agents/
+rust/.sandbox-home/
+rust/.sandbox-tmp/
+rust/.tmp-claw-home/
+rust/crates/openyak-cli/.claw/
+rust/server-smoke-stdout.txt
+rust/server-smoke-stderr.txt
+rust/audit-export.txt
+
+# SDK local caches
+sdk/python/.pytest_cache/
+sdk/python/.ruff_cache/
+sdk/python/.mypy_cache/
+sdk/typescript/dist/

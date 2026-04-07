@@ -1,0 +1,407 @@
+# openyak Rust 工作区
+
+`rust/` 是当前仓库的主产品实现面。这里包含可直接构建、运行和维护的 `openyak` CLI，以及其运行时、工具系统、插件框架和配套服务。
+
+最近一次全量文档与命令面对齐完成于 `2026-04-07`。本文内容已对照当前 `openyak` CLI help、release-binary 逐命令巡检，以及工作区和 SDK 本地验证结果更新。
+
+## 当前定位
+
+openyak 受 Claude Code 启发，但采用清洁重写实现。当前 Rust 工作区已经不是实验性骨架，而是一套可直接用于本地 coding-agent 工作流的主实现。
+
+当前对外能力边界需要明确：
+
+- Task / Team / Cron 当前提供的是 registry-backed、operator-facing foundation slices，不是完整的持久化服务。
+- LSP / MCP 当前重点是 registry-backed bridge 和可观测能力，不是完整的 user-facing control plane。
+- `openyak server` 已通过 `openyak server` 命令作为本地 HTTP/SSE thread server surfaced，暴露 `/v1/threads` 与 legacy `/sessions` compatibility routes，并把线程状态持久化到工作区 `.openyak/state.sqlite3`。
+- `openyak server` 不是 codex-style full app-server，也不是远程控制面。
+- 同一工作区下如果存在重叠生命周期的多个 `openyak server` 实例，thread discovery 文件现在会按 `pid` 做 owner-safe 清理，较早退出的实例不会误删较新实例的发现入口。
+- `sdk/typescript` 与 `sdk/python` 已提供 attach-first、本地-only 的 alpha SDK，公共边界锁定在当前 `/v1/threads` 合约，不包含 launcher/runtime bundling，也不把 `/sessions` 暴露为 SDK 公共边界。
+- `openyak doctor` 已提供本地只读的 config/auth/runtime 健康检查入口。
+- 顶层 help 路由、逐个顶层命令 help、直接命令、skills lifecycle、direct slash CLI、resume-safe slash command 链路，以及 `login` / `onboard` / `prompt` / self-target `package-release` 的受控失败路径现在已由二进制 smoke/regression 测试锁定，不再只依赖一次性的人工巡检。
+- 插件 manifest 的文件路径现在会做边界校验；解析后的结果必须保持在插件根目录内。
+
+当前版本：
+
+- 版本号：`0.1.0`
+- 发布阶段：源码构建可用，打包分发仍在完善
+- 主二进制：`openyak`
+
+## 前置要求
+
+- Rust stable 工具链
+- Cargo
+- 你要使用的模型 Provider 凭据
+- 如果要跑 GitHub PR/Issue 链路，需要本机可用的 `gh`
+
+## 构建与运行
+
+### 构建
+
+```bash
+cargo build --workspace
+cargo build --release -p openyak-cli
+```
+
+### 运行 CLI
+
+```bash
+cargo run --bin openyak -- --help
+cargo run --bin openyak -- --version
+cargo run --bin openyak --
+cargo run --bin openyak -- "总结这个工作区"
+cargo run --bin openyak -- prompt "总结这个工作区"
+cargo run --bin openyak -- dump-manifests
+cargo run --bin openyak -- bootstrap-plan
+cargo run --bin openyak -- skills
+cargo run --bin openyak -- skills available
+cargo run --bin openyak -- agents
+cargo run --bin openyak -- system-prompt --date 2030-02-03
+cargo run --bin openyak -- onboard
+cargo run --bin openyak -- doctor
+cargo run --bin openyak -- server --help
+cargo build --release -p openyak-cli
+```
+
+类 Unix release binary：
+
+```bash
+./target/release/openyak package-release --output-dir dist
+```
+
+Windows PowerShell release binary：
+
+```powershell
+.\target\release\openyak.exe package-release --output-dir dist
+```
+
+最近一轮 packaged-use 验收已确认：`openyak package-release` 会生成形如 `dist/openyak-0.1.0-<target>/` 的目录，其中至少包含 `openyak(.exe)`、`INSTALL.txt` 和 `release-metadata.json`。如果 `--binary` 已经指向目标输出目录里的现成 artifact，命令会显式拒绝 self-target packaging，而不是在 Windows 上退化成模糊的复制权限错误。
+
+### 初始化目标项目
+
+```bash
+cargo run --bin openyak -- init
+```
+
+`openyak init` 当前会为目标项目脚手架生成：
+
+- `OPENYAK.md`
+- `.openyak.json`
+- `.openyak/`
+- 推荐的本地 `.gitignore` 条目
+
+直接运行构建产物：
+
+类 Unix：
+
+```bash
+./target/debug/openyak
+./target/debug/openyak prompt "解释 crates/runtime"
+```
+
+Windows：
+
+```powershell
+.\target\debug\openyak.exe
+.\target\debug\openyak.exe prompt "解释 crates/runtime"
+```
+
+## 认证与 Provider 配置
+
+### API Key 模式
+
+按所选 Provider 配置对应环境变量即可。如果使用兼容端点，通常还需要同时设置对应的 `*_BASE_URL`。
+
+Anthropic 兼容示例：
+
+```bash
+export ANTHROPIC_API_KEY="..."
+export ANTHROPIC_BASE_URL="https://api.anthropic.com"
+```
+
+PowerShell 写法：
+
+```powershell
+$env:ANTHROPIC_API_KEY = "..."
+$env:ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+```
+
+OpenAI 兼容示例：
+
+```bash
+export OPENAI_API_KEY="..."
+export OPENAI_BASE_URL="https://api.openai.com/v1"
+```
+
+Grok 示例：
+
+```bash
+export XAI_API_KEY="..."
+export XAI_BASE_URL="https://api.x.ai"
+```
+
+### OAuth 模式
+
+```bash
+cargo run --bin openyak -- login
+cargo run --bin openyak -- logout
+```
+
+`openyak login` 不再内置默认 OAuth 站点。要使用它，必须先在 `settings.oauth` 里显式配置至少这三个字段；OAuth 后端由你自己提供，CLI 不会替你补任何默认 URL。仓库提供两份可直接填写的模板：
+
+- loopback 回调版：[`docs/oauth.settings.loopback.template.json`](./docs/oauth.settings.loopback.template.json)
+- 手动回调版：[`docs/oauth.settings.manual-redirect.template.json`](./docs/oauth.settings.manual-redirect.template.json)
+
+- `clientId`
+- `authorizeUrl`
+- `tokenUrl`
+
+可选字段：
+
+- `callbackPort`：本地回调端口；未设置时默认使用 `4545`
+- `manualRedirectUrl`：启用手动回调模式，不再监听本地 `localhost`
+- `scopes`
+
+示例：
+
+```json
+{
+  "oauth": {
+    "clientId": "your-client-id",
+    "authorizeUrl": "https://auth.example.com/oauth/authorize",
+    "tokenUrl": "https://auth.example.com/oauth/token",
+    "manualRedirectUrl": "https://auth.example.com/oauth/callback",
+    "scopes": ["openid", "profile"]
+  }
+}
+```
+
+行为说明：
+
+- 未配置 `manualRedirectUrl` 时，`openyak login` 使用本地回调地址 `http://localhost:<port>/callback`
+- 配置了 `manualRedirectUrl` 时，`openyak login` 会要求手动粘贴最终回跳 URL 或 query string
+- OAuth token 优先写入系统凭据库；仅在系统凭据库不可用时，才回退到用户级配置目录下的 `credentials.json`
+- 如果你要接自己的认证后端，把 `authorizeUrl` / `tokenUrl` / `manualRedirectUrl` 指向你的服务即可；未配置时 `openyak login` 会直接报错，而不是使用默认站点
+- 如果你想使用本地 loopback 回调，可以保留 `callbackPort` 并删除 `manualRedirectUrl`
+
+### GitHub CLI
+
+如果要使用 `/pr`、`/issue`、`/commit-push-pr` 等链路，先完成：
+
+```bash
+gh auth login --web
+```
+
+Windows 下的 `gh` 解析和浏览器启动已经统一走运行时 helper；如果链路失败，优先检查相应命令是否真的在系统环境中可解析。
+
+如果要先做本地健康预检：
+
+```bash
+cargo run --bin openyak -- doctor
+```
+
+如果想要一个显式、可重跑的本地 onboarding flow，把 repo init、默认模型、auth guidance 和 doctor handoff 串起来：
+
+```bash
+cargo run --bin openyak -- onboard
+```
+
+`openyak onboard` 只在交互式本地终端中运行；它不会改变 `openyak` 无参数默认进入 REPL 的语义，也不会把 provider secrets 写进配置文件。在非交互终端中调用时，它会直接拒绝执行并说明原因。
+
+## 用户目录、配置与 skills 规则
+
+当前工作区已经统一了用户目录和配置目录解析，优先级如下：
+
+1. `OPENYAK_CONFIG_HOME`：显式指定用户级 `.openyak` 目录
+2. `CODEX_HOME`：显式指定用户级 `.codex` 目录，并用其父目录推导默认用户根目录
+3. 平台默认用户目录
+
+平台默认用户目录的回退顺序：
+
+- Windows：`USERPROFILE`，其次 `HOMEDRIVE` + `HOMEPATH`，最后 `HOME`
+- macOS / Linux：`HOME`，其次 `USERPROFILE`，再其次 `HOMEDRIVE` + `HOMEPATH`
+
+如果这些环境变量都不可用，运行时最后回退到系统临时目录，而不是当前工作目录。
+
+这套规则覆盖：
+
+- OAuth 凭据读写
+- 全局 `settings.json`
+- `openyak agents`
+- `openyak skills`
+- `Skill` 工具
+- 远程相关默认路径
+
+项目级配置仍然使用：
+
+- `.openyak.json`
+- `.openyak/settings.json`
+- `.openyak/settings.local.json`
+
+skills 目录支持两种布局：
+
+- `skills/<name>/SKILL.md`
+- `skills/.system/<name>/SKILL.md`
+
+`openyak skills` 和 `Skill` 工具使用同一套发现/解析逻辑，因此它们看到的结果一致。
+
+系统提示和状态输出中的当前日期由运行时在执行时生成，不再依赖仓库中的硬编码日期常量。
+
+## 当前命令面
+
+### 顶层命令
+
+- `openyak`
+- `openyak prompt "..."`
+- `openyak agents`
+- `openyak skills`
+- `openyak login`
+- `openyak logout`
+- `openyak init`
+- `openyak onboard`
+- `openyak doctor`
+- `openyak package-release [--output-dir PATH] [--binary PATH]`
+- `openyak server [--bind HOST:PORT]`
+- `openyak dump-manifests`
+- `openyak bootstrap-plan`
+- `openyak system-prompt`
+
+### 代表性 slash command
+
+- 状态与会话：`/status`、`/compact`、`/clear`、`/session`、`/resume`、`/export`
+- 配置与内存：`/config`、`/memory`、`/init`、`/diff`、`/version`
+- 交互控制：`/model`、`/permissions`
+- 发现与诊断：`/agents`、`/skills`、`/teleport`、`/bughunter`、`/ultraplan`、`/debug-tool-call`
+- Git/GitHub：`/branch`、`/worktree`、`/commit`、`/pr`、`/issue`、`/commit-push-pr`
+- 插件：`/plugin`、`/plugins`
+
+## 当前能力面
+
+当前 Rust 主实现已经支持：
+
+- 交互式 REPL 与单次 prompt 执行
+- 会话保存、查看、恢复、导出
+- 内置工具：shell、文件读写/编辑、搜索、Web fetch/search、todo、notebook、skill、agent、tool search 等
+- attach-first、本地-only 的 TypeScript 与 Python SDK alpha，直连 `openyak server` 当前 `/v1/threads` 协议
+- local-only 的 Session operator surface：`SessionList`、`SessionGet`、`SessionCreate`、`SessionSend`、`SessionResume`、`SessionWait`
+- 顶层命令与 REPL slash command 的本地发现和执行
+- direct slash CLI 入口（`openyak /agents`、`openyak /skills`）以及 `--resume` 形式的 resume-safe slash command 恢复执行
+- `openyak doctor` 对配置加载、OAuth 配置/凭据、活动模型鉴权预检和 GitHub CLI 可用性做本地只读检查
+- `openyak package-release` 生成本地 release artifact 目录，供 release/upload 与脱离源码目录的 packaged-use 验证
+- 插件发现、安装、启用、禁用、卸载、更新
+- 插件工具聚合、插件 hook 聚合与生命周期
+- mock parity harness 基础设施，以及一批 registry-backed parity foundation tools（Task/Team/Cron + LSP/MCP registry surface）
+- MCP stdio、OAuth、registry-backed LSP/MCP operator bridges，以及 `openyak server` 暴露的本地 HTTP/SSE thread/session surface
+- Git / GitHub 工作流命令
+- 顶层子命令专属 `--help` 输出，以及 `/diff` 对未跟踪文件的正确展示
+
+## Registry-backed parity foundation
+
+当前 `rust/` 已经有一批低风险、registry-backed 的 parity foundation slices，可直接作为 operator-facing baseline 理解：
+
+- Task lifecycle：`TaskCreate` / `TaskGet` / `TaskList` / `TaskStop` / `TaskUpdate` / `TaskOutput` / `TaskWait`
+- Team / Cron foundation：`TeamCreate` / `TeamGet` / `TeamList` / `TeamDelete` / `CronCreate` / `CronGet` / `CronDisable` / `CronEnable` / `CronDelete` / `CronList`
+- Session operator surface：`SessionList` / `SessionGet` / `SessionCreate` / `SessionSend` / `SessionResume` / `SessionWait`
+- LSP registry query bridge：`LSP`（含 registry server listing / status / diagnostics）
+- MCP registry bridge：`ListMcpServers` / `ListMcpTools` / `ListMcpResources` / `ReadMcpResource` / `McpAuth` / `MCP`
+
+其中 `Session*` 是 OP6 phase-1 的 hybrid local-only surface：thread-kind mutation 通过当前本地 `openyak server` 的 `/v1/threads` 真值面完成，`managed_session` 保持只读，`agent_run` 保持只读/有限 wait；其余能力继续建立在 `runtime` 里的 in-memory registries / bridges 之上。
+
+当前 V1 contract 已冻结的核心口径：
+
+- Task / Team / Cron registry 保持 `process_local_v1` 语义，只存在于当前 runtime 进程
+- 当前不承诺持久化、恢复、租约 ownership、跨实例共享或 crash recovery
+- 对外更重视稳定 metadata：`created_at`、`updated_at`、`last_error`、`disabled_reason`、`origin`、`capabilities`
+
+更细的代码评审结论、能力矩阵和 staged follow-ups 见：[`docs/parity-foundation-registries.md`](./docs/parity-foundation-registries.md)。
+
+## 工作区 crate 结构
+
+- `openyak-cli`：主二进制、REPL、输出渲染、初始化与命令分发
+- `api`：Provider 客户端与流式响应处理
+- `runtime`：会话、配置、权限、prompt、OAuth、MCP 与运行时核心
+- `tools`：内置工具实现
+- `commands`：slash command 注册表与信息展示
+- `plugins`：插件发现、注册表、hook 与生命周期
+- `lsp`：语言服务器相关类型与 prompt 上下文增强基础
+- `server`：本地 HTTP/SSE 服务端 crate（由 `openyak server` 暴露为本地 thread/session server）
+- `compat-harness`：兼容性和迁移辅助
+
+## 验证
+
+最近一次工作区全量验收（`2026-04-07`）已覆盖：
+
+```bash
+cargo fmt --all --check
+cargo build --workspace
+cargo build --release -p openyak-cli
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo test -p openyak-cli --test command_surface_cli_smoke
+cargo test -p openyak-cli --test doctor_cli_smoke
+cargo test -p openyak-cli --test onboard_cli_smoke
+cargo test -p openyak-cli --test package_release_cli_smoke
+cargo test -p openyak-cli --test server_cli_smoke
+cargo test -p openyak-cli --test mock_parity_harness
+```
+
+根目录 Python 对照层最近一次验收已覆盖：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+SDK 验证命令：
+
+```bash
+cd sdk/python
+python -m pytest
+python -m ruff check .
+python -m mypy
+python -m build
+```
+
+```bash
+cd sdk/typescript
+pnpm test
+pnpm lint
+pnpm build
+```
+
+另外还做过一轮在 `2026-04-07` 完成的 fresh release binary 级命令面巡检，覆盖：
+
+- `openyak --help`、`openyak --version`
+- `openyak prompt`、`openyak dump-manifests`、`openyak bootstrap-plan`、`openyak agents`、`openyak skills`、`openyak system-prompt`、`openyak login`、`openyak logout`、`openyak init`、`openyak onboard`、`openyak doctor`、`openyak package-release`、`openyak server` 的 help
+- `openyak dump-manifests`、`openyak bootstrap-plan`、`openyak agents`、`openyak skills`、`openyak system-prompt`、`openyak logout`、`openyak init`、`openyak doctor`、`openyak package-release` 的直接执行路径
+- `openyak skills available/help/info/install/update/uninstall`
+- `openyak /agents`、`openyak /skills`、`openyak /skills help`，以及 `openyak --resume ...` 的 resume-safe slash command 链路
+- `openyak server --bind 127.0.0.1:0` 的真实启动探测
+- `openyak login`、`openyak onboard`、`openyak prompt` 与 self-target `openyak package-release` 的受控失败路径
+
+依赖外部环境的链路仍然需要单独准备条件后再做全链路验收：
+
+- 模型调用：需要 Provider 凭据
+- OAuth：需要你配置自己的后端
+- GitHub：需要本机可用并已登录的 `gh`
+
+Mock harness 的运行说明见：[`MOCK_PARITY_HARNESS.md`](./MOCK_PARITY_HARNESS.md)。
+
+## 当前限制
+
+- 当前已经支持通过 `openyak package-release` 生成 release artifact 目录，但压缩、上传和自动发布流程仍未完成。
+- CI 当前主要覆盖工作区构建和测试；正式发布流程仍需继续完善。
+- 某些 live-provider 集成测试默认不启用，因为它们依赖真实外部凭据和网络环境。
+- `openyak doctor` 当前只做本地只读预检，不提供自动修复、迁移或远程探测。
+- Task / Team / Cron registry 当前仍是进程内临时状态，不提供 durability / restore / lease 语义。
+- `openyak server` 当前只提供本地 thread/session HTTP/SSE 路由，不是完整 app-server 或远程控制面。
+- 当前补齐的 LSP/MCP 仍以 registry-backed tool/operator surface 为主；完整独立 LSP main entry 继续作为分阶段 follow-up。
+- 在 `0.x` 阶段，命令面和交互细节仍可能继续演进。
+
+## 相关文档
+
+- 仓库总览：[`../README.md`](../README.md)
+- 仓库维护约定：[`../OPENYAK.md`](../OPENYAK.md)
+- Rust 工作区维护契约：[`OPENYAK.md`](./OPENYAK.md)
+- 贡献指南：[`CONTRIBUTING.md`](./CONTRIBUTING.md)
+- Foundation parity/operator surface：[`docs/parity-foundation-registries.md`](./docs/parity-foundation-registries.md)
+- Mock parity harness：[`MOCK_PARITY_HARNESS.md`](./MOCK_PARITY_HARNESS.md)
+- 发布说明草案：[`docs/releases/0.1.0.md`](./docs/releases/0.1.0.md)
