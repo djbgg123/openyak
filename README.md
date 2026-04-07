@@ -2,7 +2,32 @@
 
 > Rust-first 的本地 coding-agent CLI 清洁重写项目。当前仓库中，`rust/` 是唯一按产品标准持续维护的主实现；`src/` 与 `tests/` 只承担对照、审计和迁移辅助职责。
 
+[`快速开始`](#快速开始) · [`当前状态`](#当前状态) · [`仓库结构`](#仓库结构) · [`Rust 工作区说明`](./rust/README.md) · [`0.1.0 发布说明`](./rust/docs/releases/0.1.0.md) · [`贡献指南`](./rust/CONTRIBUTING.md)
+
 最近一次全量文档与命令面对齐完成于 `2026-04-07`。本文内容已对照当前 `openyak --help` / `openyak skills help` / `openyak server --help`、最新 release-binary 逐命令巡检，以及 Rust、Python、TypeScript 三条本地验证链路收口。
+
+## 一眼看懂
+
+- 主产品实现面是 `rust/`，可直接构建、运行并打包 `openyak` CLI。
+- 当前主线已接通 REPL、单次 prompt、skills/agents、`openyak doctor`、`openyak onboard`、`openyak package-release` 和 `openyak server`。
+- `openyak server` 是 local-only 的 thread/session HTTP/SSE server，当前公共协议边界锁定在 `/v1/threads`；它不是 hosted control plane，也不是 codex-style full app-server。
+- `sdk/python` 和 `sdk/typescript` 是 attach-first、本地-only 的 alpha SDK，直接连接当前 `/v1/threads` 协议。
+- 最近一次 fresh release-binary 命令面巡检完成于 `2026-04-07`，已覆盖顶层 help、直接命令、skills lifecycle、direct slash CLI、resume-safe slash command 链路，以及环境依赖路径的受控失败。
+
+## 30 秒开始
+
+```bash
+cd rust
+cargo build --release -p openyak-cli
+cargo run --bin openyak -- --help
+cargo run --bin openyak -- doctor
+```
+
+如果你只想先看最重要的用户能力，优先从这三个入口开始：
+
+- `openyak --help`：看当前顶层命令面
+- `openyak doctor`：做本地 config/auth/runtime 预检
+- `openyak server --help`：看本地 thread server 的边界和运行方式
 
 ## 项目定位
 
