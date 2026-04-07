@@ -118,6 +118,19 @@ cargo test -p openyak-cli --test server_cli_smoke
 cargo test -p openyak-cli --test mock_parity_harness
 ```
 
+## GitHub Actions 基线
+
+公开仓库的 CI 基线位于 [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml)。
+
+它当前镜像四条已经在仓库内接受并可本地复现的验证链路：
+
+- Rust 工作区
+- 根目录 Python 对照层
+- Python SDK
+- TypeScript SDK
+
+这条工作流用于保证公开协作中的构建、测试、lint 和打包检查持续可重复；它不代表 release 上传、签名或自动分发已经建立。
+
 如果改动影响真实交互链路，仅跑测试还不够。优先再做一次直接功能验证，例如：
 
 - `cargo run --bin openyak -- --help`

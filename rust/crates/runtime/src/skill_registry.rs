@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
@@ -776,10 +777,22 @@ fn compute_directory_sha256(root: &Path) -> Result<String, SkillRegistryError> {
         let normalized = relative.to_string_lossy().replace('\\', "/");
         hasher.update(normalized.as_bytes());
         hasher.update([0]);
-        hasher.update(fs::read(&file_path)?);
+        let file_bytes = fs::read(&file_path)?;
+        hasher.update(normalize_text_line_endings_for_digest(&file_bytes).as_ref());
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn normalize_text_line_endings_for_digest(bytes: &[u8]) -> Cow<'_, [u8]> {
+    if !bytes.windows(2).any(|window| window == b"\r\n") {
+        return Cow::Borrowed(bytes);
+    }
+    match std::str::from_utf8(bytes) {
+        // Keep registry digests stable across Windows CRLF checkouts for text-based skill packages.
+        Ok(text) => Cow::Owned(text.replace("\r\n", "\n").into_bytes()),
+        Err(_) => Cow::Borrowed(bytes),
+    }
 }
 
 fn is_skill_version_compatible(minimum_openyak_version: Option<&str>) -> bool {
@@ -1126,6 +1139,42 @@ mod tests {
         assert!(error
             .to_string()
             .contains("sha256 mismatch for release-checklist@1.0.0"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_skill_registry_accepts_crlf_checkout_for_text_skill_packages() {
+        let root = temp_dir("digest-crlf");
+        let registry_root = root.join("registry");
+        let package_dir = write_skill_package(
+            &registry_root.join("packages"),
+            "release-checklist-v1",
+            "release-checklist",
+            "Release checklist",
+            "Check build artifacts.",
+        );
+        let registry_path = registry_root.join("registry.json");
+        write_registry(
+            &registry_path,
+            &[RegistryEntryFixture {
+                skill_id: "release-checklist",
+                version: "1.0.0",
+                description: "Release checklist",
+                placement: "standard",
+                package_dir: package_dir.clone(),
+                minimum_openyak_version: None,
+            }],
+        );
+        fs::write(
+            package_dir.join("SKILL.md"),
+            "---\r\nname: release-checklist\r\ndescription: Release checklist\r\n---\r\n\r\n# release-checklist\r\n\r\nCheck build artifacts.\r\n",
+        )
+        .expect("rewrite package with CRLF");
+
+        let registry = load_skill_registry(&registry_path).expect("crlf checkout should load");
+        assert_eq!(registry.skills.len(), 1);
+        assert_eq!(registry.skills[0].skill_id, "release-checklist");
 
         let _ = fs::remove_dir_all(root);
     }

@@ -38,11 +38,13 @@ Inside this repo:
 
 ```bash
 cd sdk/typescript
-pnpm install
+pnpm install --frozen-lockfile
 pnpm build
 ```
 
 For local verification inside this repo, keep using the workspace package root instead of importing files from `src/` directly.
+
+`pnpm-lock.yaml` is the canonical repo lockfile for this SDK and is the file mirrored by CI/fresh-clone verification.
 
 ## Start a local server first
 

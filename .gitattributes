@@ -1,0 +1,5 @@
+assets/skills/registry.json text eol=lf
+assets/skills/packages/** text eol=lf
+sdk/typescript/pnpm-lock.yaml text eol=lf
+sdk/typescript/pnpm-workspace.yaml text eol=lf
+.github/workflows/*.yml text eol=lf
