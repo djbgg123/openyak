@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::net::IpAddr;
+use std::fs;
+use std::io::{Read, Write};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use api::{
@@ -13,12 +16,13 @@ use plugins::PluginTool;
 use reqwest::{blocking::Client, Method, Url};
 use runtime::{
     command_exists, current_local_date_string, default_openyak_home, edit_file, execute_bash,
-    glob_search, grep_search, home_locations, load_system_prompt, read_file,
-    resolve_skill_path_from_roots, write_file, ApiClient, ApiRequest, AssistantEvent,
-    BashCommandInput, ContentBlock, ConversationMessage, ConversationRuntime, CronRegistry,
-    EnforcementResult, GrepSearchInput, LspRegistry, McpToolRegistry, MessageRole,
-    PermissionEnforcer, PermissionMode, PermissionPolicy, RuntimeError, Session, TaskRegistry,
-    TeamRegistry, TokenUsage, ToolError, ToolExecutor, UserInputRequest,
+    execute_bash_with_config, glob_search, grep_search, home_locations, load_system_prompt,
+    read_file, resolve_command_path, resolve_skill_path_from_roots, write_file, ApiClient,
+    ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
+    ConversationRuntime, CronRegistry, EnforcementResult, GrepSearchInput, LspRegistry,
+    McpToolRegistry, MessageRole, PermissionEnforcer, PermissionMode, PermissionPolicy,
+    RuntimeBrowserControlConfig, RuntimeError, Session, TaskRegistry, TeamRegistry, TokenUsage,
+    ToolError, ToolExecutor, ToolProfileBashPolicy, UserInputRequest,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -45,6 +49,18 @@ pub struct ToolRegistry {
     entries: Vec<ToolManifestEntry>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoundationSurface {
+    pub key: &'static str,
+    pub summary: &'static str,
+    pub access_type: &'static str,
+    pub backing_model: &'static str,
+    pub boundary_note: &'static str,
+    pub adjacent_scope: Option<&'static str>,
+    pub not_promised: &'static str,
+    pub tool_names: &'static [&'static str],
+}
+
 impl ToolRegistry {
     #[must_use]
     pub fn new(entries: Vec<ToolManifestEntry>) -> Self {
@@ -55,6 +71,105 @@ impl ToolRegistry {
     pub fn entries(&self) -> &[ToolManifestEntry] {
         &self.entries
     }
+}
+
+const TASK_FOUNDATION_TOOLS: &[&str] = &[
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskStop",
+    "TaskUpdate",
+    "TaskOutput",
+    "TaskWait",
+];
+
+const TEAM_FOUNDATION_TOOLS: &[&str] = &["TeamCreate", "TeamGet", "TeamList", "TeamDelete"];
+
+const CRON_FOUNDATION_TOOLS: &[&str] = &[
+    "CronCreate",
+    "CronGet",
+    "CronDisable",
+    "CronEnable",
+    "CronDelete",
+    "CronList",
+];
+
+const LSP_FOUNDATION_TOOLS: &[&str] = &["LSP"];
+
+const MCP_FOUNDATION_TOOLS: &[&str] = &[
+    "ListMcpServers",
+    "ListMcpTools",
+    "ListMcpResources",
+    "ReadMcpResource",
+    "McpAuth",
+    "MCP",
+];
+
+const FOUNDATION_SURFACES: &[FoundationSurface] = &[
+    FoundationSurface {
+        key: "task",
+        summary: "Metadata-first task lifecycle foundation for the current runtime.",
+        access_type: "process-local foundation",
+        backing_model: "process_local_v1 current-runtime registry",
+        boundary_note: "Fresh CLI processes do not inherit durable task inventory.",
+        adjacent_scope: None,
+        not_promised: "persistence, leases, cross-process scheduling, remote execution",
+        tool_names: TASK_FOUNDATION_TOOLS,
+    },
+    FoundationSurface {
+        key: "team",
+        summary: "Metadata-first team grouping foundation for the current runtime.",
+        access_type: "process-local foundation",
+        backing_model: "process_local_v1 current-runtime registry",
+        boundary_note: "Fresh CLI processes do not inherit durable team inventory.",
+        adjacent_scope: None,
+        not_promised: "persistence, leases, cross-process orchestration, remote execution",
+        tool_names: TEAM_FOUNDATION_TOOLS,
+    },
+    FoundationSurface {
+        key: "cron",
+        summary: "Metadata-first cron foundation for low-risk operator scheduling semantics.",
+        access_type: "process-local foundation",
+        backing_model: "process_local_v1 current-runtime registry",
+        boundary_note: "Fresh CLI processes do not inherit durable cron inventory.",
+        adjacent_scope: None,
+        not_promised: "durable schedulers, crash recovery, shared services, remote execution",
+        tool_names: CRON_FOUNDATION_TOOLS,
+    },
+    FoundationSurface {
+        key: "lsp",
+        summary: "Registry-backed query bridge for current LSP visibility and diagnostics.",
+        access_type: "registry-backed bridge",
+        backing_model: "current runtime LSP registry bridge",
+        boundary_note: "This is not a standalone openyak lsp host or control plane.",
+        adjacent_scope: Some("MB2 keeps standalone server/LSP surfacing narrow."),
+        not_promised:
+            "standalone host lifecycle, daemon management, broader control-plane behavior",
+        tool_names: LSP_FOUNDATION_TOOLS,
+    },
+    FoundationSurface {
+        key: "mcp",
+        summary:
+            "Registry-backed bridge for current MCP server, tool, resource, and auth visibility.",
+        access_type: "registry-backed bridge",
+        backing_model: "current runtime MCP registry bridge",
+        boundary_note: "This is not a broader MCP control plane.",
+        adjacent_scope: Some("MB5 owns deeper configured/auth/error lifecycle hardening."),
+        not_promised: "remote orchestration, notification buses, wider control-plane behavior",
+        tool_names: MCP_FOUNDATION_TOOLS,
+    },
+];
+
+#[must_use]
+pub fn foundation_surfaces() -> &'static [FoundationSurface] {
+    FOUNDATION_SURFACES
+}
+
+#[must_use]
+pub fn foundation_surface(name: &str) -> Option<&'static FoundationSurface> {
+    foundation_surfaces()
+        .iter()
+        .find(|surface| surface.key.eq_ignore_ascii_case(name))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +184,8 @@ pub struct ToolSpec {
 pub struct GlobalToolRegistry {
     plugin_tools: Vec<PluginTool>,
     enforcer: Option<PermissionEnforcer>,
+    bash_policy: Option<ToolProfileBashPolicy>,
+    browser_control: RuntimeBrowserControlConfig,
 }
 
 impl GlobalToolRegistry {
@@ -77,6 +194,8 @@ impl GlobalToolRegistry {
         Self {
             plugin_tools: Vec::new(),
             enforcer: None,
+            bash_policy: None,
+            browser_control: RuntimeBrowserControlConfig::default(),
         }
     }
 
@@ -102,6 +221,8 @@ impl GlobalToolRegistry {
         Ok(Self {
             plugin_tools,
             enforcer: None,
+            bash_policy: None,
+            browser_control: RuntimeBrowserControlConfig::default(),
         })
     }
 
@@ -109,6 +230,36 @@ impl GlobalToolRegistry {
     pub fn with_enforcer(mut self, enforcer: PermissionEnforcer) -> Self {
         self.enforcer = Some(enforcer);
         self
+    }
+
+    #[must_use]
+    pub fn with_bash_policy(mut self, bash_policy: ToolProfileBashPolicy) -> Self {
+        self.bash_policy = Some(bash_policy);
+        self
+    }
+
+    pub fn with_browser_control(
+        mut self,
+        browser_control: RuntimeBrowserControlConfig,
+    ) -> Result<Self, String> {
+        if browser_control.enabled() {
+            let optional_names = enabled_optional_builtin_specs(&browser_control)
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect::<BTreeSet<_>>();
+            if let Some(conflict) = self
+                .plugin_tools
+                .iter()
+                .map(|tool| tool.definition().name.as_str())
+                .find(|name| optional_names.contains(name))
+            {
+                return Err(format!(
+                    "plugin tool `{conflict}` conflicts with an optional built-in tool name"
+                ));
+            }
+        }
+        self.browser_control = browser_control;
+        Ok(self)
     }
 
     pub fn normalize_allowed_tools(
@@ -120,9 +271,15 @@ impl GlobalToolRegistry {
         }
 
         let builtin_specs = mvp_tool_specs();
+        let enabled_optional_specs = enabled_optional_builtin_specs(&self.browser_control);
         let canonical_names = builtin_specs
             .iter()
             .map(|spec| spec.name.to_string())
+            .chain(
+                enabled_optional_specs
+                    .iter()
+                    .map(|spec| spec.name.to_string()),
+            )
             .chain(
                 self.plugin_tools
                     .iter()
@@ -151,6 +308,14 @@ impl GlobalToolRegistry {
                 .filter(|token| !token.is_empty())
             {
                 let normalized = normalize_tool_name(token);
+                if !self.browser_control.enabled() {
+                    if normalized == normalize_tool_name(BROWSER_OBSERVE_TOOL_NAME) {
+                        return Err(browser_tool_disabled_error(BROWSER_OBSERVE_TOOL_NAME));
+                    }
+                    if normalized == normalize_tool_name(BROWSER_INTERACT_TOOL_NAME) {
+                        return Err(browser_tool_disabled_error(BROWSER_INTERACT_TOOL_NAME));
+                    }
+                }
                 let canonical = name_map.get(&normalized).ok_or_else(|| {
                     format!(
                         "unsupported tool in --allowedTools: {token} (expected one of: {})",
@@ -174,6 +339,14 @@ impl GlobalToolRegistry {
                 description: Some(spec.description.to_string()),
                 input_schema: spec.input_schema,
             });
+        let optional_builtin = enabled_optional_builtin_specs(&self.browser_control)
+            .into_iter()
+            .filter(|spec| allowed_tools.is_some_and(|allowed| allowed.contains(spec.name)))
+            .map(|spec| ToolDefinition {
+                name: spec.name.to_string(),
+                description: Some(spec.description.to_string()),
+                input_schema: spec.input_schema,
+            });
         let plugin = self
             .plugin_tools
             .iter()
@@ -186,7 +359,7 @@ impl GlobalToolRegistry {
                 description: tool.definition().description.clone(),
                 input_schema: tool.definition().input_schema.clone(),
             });
-        builtin.chain(plugin).collect()
+        builtin.chain(optional_builtin).chain(plugin).collect()
     }
 
     #[must_use]
@@ -197,6 +370,10 @@ impl GlobalToolRegistry {
         let builtin = mvp_tool_specs()
             .into_iter()
             .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
+            .map(|spec| (spec.name.to_string(), spec.required_permission));
+        let optional_builtin = enabled_optional_builtin_specs(&self.browser_control)
+            .into_iter()
+            .filter(|spec| allowed_tools.is_some_and(|allowed| allowed.contains(spec.name)))
             .map(|spec| (spec.name.to_string(), spec.required_permission));
         let plugin = self
             .plugin_tools
@@ -211,12 +388,25 @@ impl GlobalToolRegistry {
                     permission_mode_from_plugin(tool.required_permission()),
                 )
             });
-        builtin.chain(plugin).collect()
+        builtin.chain(optional_builtin).chain(plugin).collect()
     }
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
-        if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input);
+        if is_browser_optional_tool_name(name) && !self.browser_control.enabled() {
+            return Err(browser_tool_disabled_error(name));
+        }
+        if mvp_tool_specs().iter().any(|spec| spec.name == name)
+            || enabled_optional_builtin_specs(&self.browser_control)
+                .iter()
+                .any(|spec| spec.name == name)
+        {
+            return execute_tool_with_enforcer(
+                self.enforcer.as_ref(),
+                self.bash_policy.as_ref(),
+                Some(&self.browser_control),
+                name,
+                input,
+            );
         }
         self.plugin_tools
             .iter()
@@ -267,6 +457,138 @@ fn permission_mode_from_plugin(value: &str) -> PermissionMode {
         "workspace-write" => PermissionMode::WorkspaceWrite,
         "danger-full-access" => PermissionMode::DangerFullAccess,
         other => panic!("unsupported plugin permission: {other}"),
+    }
+}
+
+const BROWSER_OBSERVE_TOOL_NAME: &str = "BrowserObserve";
+const BROWSER_INTERACT_TOOL_NAME: &str = "BrowserInteract";
+const BROWSER_OBSERVE_SUPPORTED_WAIT_KINDS: &[&str] =
+    &["load", "network_idle", "text", "title_contains"];
+const BROWSER_INTERACT_SUPPORTED_WAIT_KINDS: &[&str] =
+    &["load", "text", "title_contains", "url_contains"];
+
+fn browser_tool_disabled_error(tool_name: &str) -> String {
+    format!(
+        "{tool_name} is disabled; set browserControl.enabled=true before using --allowedTools {tool_name}"
+    )
+}
+
+fn is_browser_optional_tool_name(name: &str) -> bool {
+    matches!(name, BROWSER_OBSERVE_TOOL_NAME | BROWSER_INTERACT_TOOL_NAME)
+}
+
+fn enabled_optional_builtin_specs(browser_control: &RuntimeBrowserControlConfig) -> Vec<ToolSpec> {
+    if browser_control.enabled() {
+        vec![browser_observe_tool_spec(), browser_interact_tool_spec()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn browser_observe_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: BROWSER_OBSERVE_TOOL_NAME,
+        description:
+            "Observe a local browser-rendered page from the current CLI run, with bounded wait conditions, optional visible-text capture, and workspace-local screenshot artifacts.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "format": "uri" },
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 60000 },
+                "wait": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": BROWSER_OBSERVE_SUPPORTED_WAIT_KINDS
+                        },
+                        "value": { "type": "string" }
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": false
+                },
+                "capture_visible_text": { "type": "boolean" },
+                "screenshot": {
+                    "type": "object",
+                    "properties": {
+                        "capture": { "type": "boolean" },
+                        "format": { "type": "string", "enum": ["png", "jpeg"] }
+                    },
+                    "required": ["capture"],
+                    "additionalProperties": false
+                },
+                "viewport": {
+                    "type": "object",
+                    "properties": {
+                        "width": { "type": "integer", "minimum": 320, "maximum": 4096 },
+                        "height": { "type": "integer", "minimum": 240, "maximum": 4096 }
+                    },
+                    "required": ["width", "height"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["url"],
+            "additionalProperties": false
+        }),
+        required_permission: PermissionMode::DangerFullAccess,
+    }
+}
+
+fn browser_interact_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: BROWSER_INTERACT_TOOL_NAME,
+        description:
+            "Click one selector in a local browser-rendered page from the current CLI run, then return bounded post-action page state and optional workspace-local screenshot artifacts.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "format": "uri" },
+                "action": {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["click"] },
+                        "selector": { "type": "string" }
+                    },
+                    "required": ["kind", "selector"],
+                    "additionalProperties": false
+                },
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 60000 },
+                "wait": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": BROWSER_INTERACT_SUPPORTED_WAIT_KINDS
+                        },
+                        "value": { "type": "string" }
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": false
+                },
+                "capture_visible_text": { "type": "boolean" },
+                "screenshot": {
+                    "type": "object",
+                    "properties": {
+                        "capture": { "type": "boolean" },
+                        "format": { "type": "string", "enum": ["png", "jpeg"] }
+                    },
+                    "required": ["capture"],
+                    "additionalProperties": false
+                },
+                "viewport": {
+                    "type": "object",
+                    "properties": {
+                        "width": { "type": "integer", "minimum": 320, "maximum": 4096 },
+                        "height": { "type": "integer", "minimum": 240, "maximum": 4096 }
+                    },
+                    "required": ["width", "height"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["url", "action"],
+            "additionalProperties": false
+        }),
+        required_permission: PermissionMode::DangerFullAccess,
     }
 }
 
@@ -1019,42 +1341,61 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
 }
 
 pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
-    execute_tool_with_enforcer(None, name, input)
+    execute_tool_with_enforcer(None, None, None, name, input)
 }
 
 #[allow(clippy::too_many_lines)]
 fn execute_tool_with_enforcer(
     enforcer: Option<&PermissionEnforcer>,
+    bash_policy: Option<&ToolProfileBashPolicy>,
+    browser_control: Option<&RuntimeBrowserControlConfig>,
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
     match name {
         "bash" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<BashCommandInput>(input).and_then(run_bash)
+            let bash_input = from_value::<BashCommandInput>(input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, Some(&bash_input), input)?;
+            run_bash(bash_input, bash_policy)
         }
         "read_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<ReadFileInput>(input).and_then(run_read_file)
         }
         "write_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<WriteFileInput>(input).and_then(run_write_file)
         }
         "edit_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<EditFileInput>(input).and_then(run_edit_file)
         }
         "glob_search" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<GlobSearchInputValue>(input).and_then(run_glob_search)
         }
         "grep_search" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<GrepSearchInput>(input).and_then(run_grep_search)
         }
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
+        BROWSER_OBSERVE_TOOL_NAME => {
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
+            let browser_control = browser_control
+                .filter(|config| config.enabled())
+                .ok_or_else(|| browser_tool_disabled_error(BROWSER_OBSERVE_TOOL_NAME))?;
+            parse_browser_observe_input(input)
+                .and_then(|browser_input| run_browser_observe(browser_input, browser_control))
+        }
+        BROWSER_INTERACT_TOOL_NAME => {
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
+            let browser_control = browser_control
+                .filter(|config| config.enabled())
+                .ok_or_else(|| browser_tool_disabled_error(BROWSER_INTERACT_TOOL_NAME))?;
+            parse_browser_interact_input(input)
+                .and_then(|browser_input| run_browser_interact(browser_input, browser_control))
+        }
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
@@ -1069,61 +1410,61 @@ fn execute_tool_with_enforcer(
         "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
         "PowerShell" => from_value::<PowerShellInput>(input).and_then(run_powershell),
         "TaskCreate" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<TaskCreateInput>(input).and_then(run_task_create)
         }
         "TaskGet" => from_value::<TaskIdInput>(input).and_then(run_task_get),
         "TaskList" => run_task_list(input.clone()),
         "TaskStop" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<TaskIdInput>(input).and_then(run_task_stop)
         }
         "TaskUpdate" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<TaskUpdateInput>(input).and_then(run_task_update)
         }
         "TaskOutput" => from_value::<TaskIdInput>(input).and_then(run_task_output),
         "TaskWait" => from_value::<TaskWaitInput>(input).and_then(run_task_wait),
         "TeamCreate" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<TeamCreateInput>(input).and_then(run_team_create)
         }
         "TeamGet" => from_value::<TeamIdInput>(input).and_then(run_team_get),
         "TeamList" => run_team_list(input.clone()),
         "TeamDelete" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<TeamIdInput>(input).and_then(run_team_delete)
         }
         "CronCreate" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<CronCreateInput>(input).and_then(run_cron_create)
         }
         "CronGet" => from_value::<CronIdInput>(input).and_then(run_cron_get),
         "CronDisable" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<CronIdInput>(input).and_then(run_cron_disable)
         }
         "CronEnable" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<CronIdInput>(input).and_then(run_cron_enable)
         }
         "CronDelete" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<CronIdInput>(input).and_then(run_cron_delete)
         }
         "CronList" => run_cron_list(input.clone()),
         "SessionList" => from_value::<SessionListInput>(input).and_then(run_session_list),
         "SessionGet" => from_value::<SessionRefInput>(input).and_then(run_session_get),
         "SessionCreate" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<SessionCreateInput>(input).and_then(run_session_create)
         }
         "SessionSend" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<SessionSendInput>(input).and_then(run_session_send)
         }
         "SessionResume" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<SessionResumeInput>(input).and_then(run_session_resume)
         }
         "SessionWait" => from_value::<SessionWaitInput>(input).and_then(run_session_wait),
@@ -1135,11 +1476,11 @@ fn execute_tool_with_enforcer(
         }
         "ReadMcpResource" => from_value::<McpResourceInput>(input).and_then(run_read_mcp_resource),
         "McpAuth" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<McpAuthInput>(input).and_then(run_mcp_auth)
         }
         "MCP" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
+            maybe_enforce_permission_check(enforcer, bash_policy, name, None, input)?;
             from_value::<McpToolInput>(input).and_then(run_mcp_tool)
         }
         "TestingPermission" => {
@@ -1151,7 +1492,9 @@ fn execute_tool_with_enforcer(
 
 fn maybe_enforce_permission_check(
     enforcer: Option<&PermissionEnforcer>,
+    bash_policy: Option<&ToolProfileBashPolicy>,
     tool_name: &str,
+    bash_input: Option<&BashCommandInput>,
     input: &Value,
 ) -> Result<(), String> {
     let Some(enforcer) = enforcer else {
@@ -1174,14 +1517,20 @@ fn maybe_enforce_permission_check(
             }
         }
         "bash" => {
-            let command = input
-                .get("command")
-                .and_then(Value::as_str)
+            let command = bash_input
+                .map(|parsed| parsed.command.as_str())
+                .or_else(|| input.get("command").and_then(Value::as_str))
                 .unwrap_or_default();
             match enforcer.check_bash(command) {
                 EnforcementResult::Allowed => Ok(()),
                 EnforcementResult::Denied { reason, .. } => Err(reason),
+            }?;
+            if let Some(policy) = bash_policy {
+                if let Some(parsed) = bash_input {
+                    policy.validate_override(parsed)?;
+                }
             }
+            Ok(())
         }
         _ => {
             let input_str = serde_json::to_string(input).unwrap_or_default();
@@ -1197,9 +1546,734 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
     serde_json::from_value(input.clone()).map_err(|error| error.to_string())
 }
 
-fn run_bash(input: BashCommandInput) -> Result<String, String> {
-    serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+fn parse_browser_observe_input(input: &Value) -> Result<BrowserObserveInput, String> {
+    from_value::<BrowserObserveInput>(input)
+        .map_err(|error| format!("BrowserObserve rejected unsupported request shape: {error}"))
+}
+
+fn parse_browser_interact_input(input: &Value) -> Result<BrowserInteractInput, String> {
+    from_value::<BrowserInteractInput>(input)
+        .map_err(|error| format!("BrowserInteract rejected unsupported request shape: {error}"))
+}
+
+fn run_bash(
+    input: BashCommandInput,
+    bash_policy: Option<&ToolProfileBashPolicy>,
+) -> Result<String, String> {
+    let output = match bash_policy {
+        Some(policy) => {
+            execute_bash_with_config(input, &policy.sandbox).map_err(|error| error.to_string())?
+        }
+        None => execute_bash(input).map_err(|error| error.to_string())?,
+    };
+    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
+}
+
+const DEFAULT_BROWSER_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_BROWSER_NETWORK_IDLE_BUDGET_MS: u64 = 1_500;
+const MAX_BROWSER_TIMEOUT_MS: u64 = 60_000;
+const MAX_BROWSER_VISIBLE_TEXT_CHARS: usize = 4_000;
+const DEFAULT_BROWSER_VIEWPORT_WIDTH: u32 = 1440;
+const DEFAULT_BROWSER_VIEWPORT_HEIGHT: u32 = 900;
+
+fn run_browser_observe(
+    input: BrowserObserveInput,
+    browser_control: &RuntimeBrowserControlConfig,
+) -> Result<String, String> {
+    let started_at = Instant::now();
+    validate_browser_observe_input(&input)?;
+    let url =
+        Url::parse(&input.url).map_err(|error| format!("invalid BrowserObserve url: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "BrowserObserve only supports http and https URLs in slice 1B; received {}",
+            url.scheme()
+        ));
+    }
+
+    let browser = find_supported_browser_command().ok_or_else(|| {
+        format!(
+            "BrowserObserve could not find a supported local browser executable (checked: {})",
+            supported_browser_candidates().join(", ")
+        )
+    })?;
+
+    let observe_result = observe_browser_page(&browser, &input)?;
+    let (visible_text, visible_text_truncated) = if input.capture_visible_text {
+        truncate_browser_visible_text(&observe_result.snapshot.visible_text)
+    } else {
+        (None, false)
+    };
+
+    let workspace_root = std::env::current_dir().map_err(|error| error.to_string())?;
+    let (screenshot, screenshot_elapsed_ms) =
+        match input.screenshot.as_ref().filter(|request| request.capture) {
+            Some(request) => {
+                let screenshot_started_at = Instant::now();
+                let call_id = browser_observe_call_id();
+                let artifact_dir = browser_control.artifacts_dir().join(&call_id);
+                fs::create_dir_all(&artifact_dir).map_err(io_to_string)?;
+                let extension = request.format.extension();
+                let artifact_path = artifact_dir.join(format!("observe.{extension}"));
+                let _ = run_browser_capture(
+                    &browser,
+                    &input,
+                    Some(&artifact_path),
+                    BrowserObserveCapturePhase::Screenshot,
+                )?;
+                let relative_path =
+                    portable_workspace_relative_path(&artifact_path, &workspace_root)?;
+                let bytes = fs::metadata(&artifact_path).map_err(io_to_string)?.len();
+                let file_name = artifact_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("observe")
+                    .to_string();
+                (
+                    Some(BrowserObserveArtifact {
+                        relative_path,
+                        file_name,
+                        format: request.format.as_str().to_string(),
+                        media_type: request.format.media_type().to_string(),
+                        bytes,
+                    }),
+                    Some(elapsed_ms(screenshot_started_at.elapsed())),
+                )
+            }
+            None => (None, None),
+        };
+
+    to_pretty_json(BrowserObserveOutput {
+        requested_url: input.url,
+        final_url: None,
+        title: observe_result.snapshot.title,
+        load_outcome: observe_result.load_outcome,
+        wait: observe_result.wait,
+        visible_text,
+        visible_text_truncated,
+        screenshot,
+        browser_runtime: BrowserObserveRuntime {
+            executable: browser.display().to_string(),
+            mode: String::from("headless_cli"),
+            capture_backend: String::from("headless_cli_dump_dom"),
+        },
+        timings_ms: BrowserObserveTimings {
+            observation: observe_result.observation_elapsed_ms,
+            screenshot: screenshot_elapsed_ms,
+            total: elapsed_ms(started_at.elapsed()),
+        },
+        warnings: vec![String::from(
+            "slice 1B does not surface post-navigation final_url; requested_url is returned separately",
+        )],
+    })
+}
+
+const DEFAULT_BROWSER_STARTUP_POLL_MS: u64 = 50;
+const DEFAULT_BROWSER_INTERACT_POLL_MS: u64 = 100;
+
+fn run_browser_interact(
+    input: BrowserInteractInput,
+    browser_control: &RuntimeBrowserControlConfig,
+) -> Result<String, String> {
+    let started_at = Instant::now();
+    validate_browser_interact_input(&input)?;
+    let url =
+        Url::parse(&input.url).map_err(|error| format!("invalid BrowserInteract url: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "BrowserInteract only supports http and https URLs in slice 2A; received {}",
+            url.scheme()
+        ));
+    }
+
+    let browser = find_supported_browser_command().ok_or_else(|| {
+        format!(
+            "BrowserInteract could not find a supported local browser executable (checked: {})",
+            supported_browser_candidates().join(", ")
+        )
+    })?;
+    let call_id = browser_observe_call_id();
+    let timeout_ms = browser_interact_wait_budget_ms(&input);
+    let mut session = BrowserInteractSession::launch(&browser, &input, timeout_ms, &call_id)
+        .map_err(|error| format!("BrowserInteract launch/connect failed: {error}"))?;
+    session
+        .wait_for_initial_load(timeout_ms)
+        .map_err(|error| format!("BrowserInteract wait failed before interaction: {error}"))?;
+    let action_report = session
+        .click_selector(&input.action.selector, timeout_ms)
+        .map_err(|error| format!("BrowserInteract interaction failed: {error}"))?;
+    let (page_state, wait_report) = session
+        .capture_post_action_state(input.wait.as_ref(), timeout_ms)
+        .map_err(|error| format!("BrowserInteract wait failed: {error}"))?;
+
+    let (visible_text, visible_text_truncated) = if input.capture_visible_text {
+        truncate_browser_visible_text(&page_state.visible_text)
+    } else {
+        (None, false)
+    };
+
+    let workspace_root = std::env::current_dir().map_err(|error| error.to_string())?;
+    let (screenshot, screenshot_elapsed_ms) =
+        match input.screenshot.as_ref().filter(|request| request.capture) {
+            Some(request) => {
+                let screenshot_started_at = Instant::now();
+                let artifact_dir = browser_control.artifacts_dir().join(&call_id);
+                fs::create_dir_all(&artifact_dir).map_err(io_to_string)?;
+                let extension = request.format.extension();
+                let artifact_path = artifact_dir.join(format!("interact.{extension}"));
+                let artifact = session
+                    .capture_screenshot(
+                        request.format,
+                        &artifact_path,
+                        &workspace_root,
+                        BROWSER_INTERACT_TOOL_NAME,
+                    )
+                    .map_err(|error| format!("BrowserInteract screenshot failed: {error}"))?;
+                (
+                    Some(artifact),
+                    Some(elapsed_ms(screenshot_started_at.elapsed())),
+                )
+            }
+            None => (None, None),
+        };
+
+    to_pretty_json(BrowserInteractOutput {
+        requested_url: input.url,
+        final_url: page_state.url,
+        title: page_state.title,
+        action: action_report,
+        load_outcome: browser_interact_load_outcome(input.wait.as_ref()),
+        wait: wait_report,
+        visible_text,
+        visible_text_truncated,
+        screenshot,
+        browser_runtime: BrowserObserveRuntime {
+            executable: browser.display().to_string(),
+            mode: String::from("headless_cdp"),
+            capture_backend: String::from("headless_cdp_single_call"),
+        },
+        timings_ms: BrowserInteractTimings {
+            interaction: session.elapsed_ms(),
+            screenshot: screenshot_elapsed_ms,
+            total: elapsed_ms(started_at.elapsed()),
+        },
+        warnings: vec![String::from(
+            "slice 2A supports one selector-backed click per call; durable browser sessions and /v1/threads browser support remain unavailable",
+        )],
+    })
+}
+
+fn browser_interact_load_outcome(wait: Option<&BrowserObserveWait>) -> String {
+    match wait.map(|wait| wait.kind.as_str()) {
+        None => String::from("captured_after_click"),
+        Some("load") => String::from("clicked_after_page_load"),
+        Some("text" | "title_contains" | "url_contains") => {
+            String::from("clicked_after_wait_budget")
+        }
+        Some(_) => String::from("unsupported"),
+    }
+}
+
+fn validate_browser_interact_input(input: &BrowserInteractInput) -> Result<(), String> {
+    if input.url.trim().is_empty() {
+        return Err(String::from("BrowserInteract url must not be empty"));
+    }
+    if input.action.kind.trim().is_empty() {
+        return Err(String::from(
+            "BrowserInteract action.kind must not be empty",
+        ));
+    }
+    if !input.action.kind.eq_ignore_ascii_case("click") {
+        return Err(format!(
+            "BrowserInteract action.kind={} is not supported in slice 2A; supported kinds are click",
+            input.action.kind
+        ));
+    }
+    if input.action.selector.trim().is_empty() {
+        return Err(String::from(
+            "BrowserInteract action.selector must not be empty",
+        ));
+    }
+    if let Some(timeout_ms) = input.timeout_ms {
+        if timeout_ms == 0 || timeout_ms > MAX_BROWSER_TIMEOUT_MS {
+            return Err(format!(
+                "BrowserInteract timeout_ms must be between 1 and {MAX_BROWSER_TIMEOUT_MS}"
+            ));
+        }
+    }
+    if let Some(viewport) = &input.viewport {
+        if !(320..=4096).contains(&viewport.width) {
+            return Err(String::from(
+                "BrowserInteract viewport.width must be between 320 and 4096",
+            ));
+        }
+        if !(240..=4096).contains(&viewport.height) {
+            return Err(String::from(
+                "BrowserInteract viewport.height must be between 240 and 4096",
+            ));
+        }
+    }
+    if let Some(wait) = &input.wait {
+        match wait.kind {
+            BrowserObserveWaitKind::Load => {
+                if wait.expected_value().is_some() {
+                    return Err(String::from(
+                        "BrowserInteract wait.kind=load does not accept `value` in slice 2A",
+                    ));
+                }
+            }
+            BrowserObserveWaitKind::Text
+            | BrowserObserveWaitKind::TitleContains
+            | BrowserObserveWaitKind::UrlContains => {
+                if wait.expected_value().is_none() {
+                    return Err(format!(
+                        "BrowserInteract wait.kind={} requires a non-empty `value`",
+                        wait.kind.as_str()
+                    ));
+                }
+            }
+            BrowserObserveWaitKind::NetworkIdle | BrowserObserveWaitKind::Selector => {
+                return Err(format!(
+                    "BrowserInteract wait.kind={} is not supported in slice 2A; supported kinds are {}",
+                    wait.kind.as_str(),
+                    BROWSER_INTERACT_SUPPORTED_WAIT_KINDS.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn browser_interact_wait_budget_ms(input: &BrowserInteractInput) -> u64 {
+    input.timeout_ms.unwrap_or(DEFAULT_BROWSER_TIMEOUT_MS)
+}
+
+fn validate_browser_observe_input(input: &BrowserObserveInput) -> Result<(), String> {
+    if input.url.trim().is_empty() {
+        return Err(String::from("BrowserObserve url must not be empty"));
+    }
+    if let Some(timeout_ms) = input.timeout_ms {
+        if timeout_ms == 0 || timeout_ms > MAX_BROWSER_TIMEOUT_MS {
+            return Err(format!(
+                "BrowserObserve timeout_ms must be between 1 and {MAX_BROWSER_TIMEOUT_MS}"
+            ));
+        }
+    }
+    if let Some(viewport) = &input.viewport {
+        if !(320..=4096).contains(&viewport.width) {
+            return Err(String::from(
+                "BrowserObserve viewport.width must be between 320 and 4096",
+            ));
+        }
+        if !(240..=4096).contains(&viewport.height) {
+            return Err(String::from(
+                "BrowserObserve viewport.height must be between 240 and 4096",
+            ));
+        }
+    }
+    if let Some(wait) = &input.wait {
+        match wait.kind {
+            BrowserObserveWaitKind::Load | BrowserObserveWaitKind::NetworkIdle => {
+                if wait.expected_value().is_some() {
+                    return Err(format!(
+                        "BrowserObserve wait.kind={} does not accept `value` in slice 1B",
+                        wait.kind.as_str()
+                    ));
+                }
+            }
+            BrowserObserveWaitKind::Text | BrowserObserveWaitKind::TitleContains => {
+                if wait.expected_value().is_none() {
+                    return Err(format!(
+                        "BrowserObserve wait.kind={} requires a non-empty `value`",
+                        wait.kind.as_str()
+                    ));
+                }
+            }
+            BrowserObserveWaitKind::Selector | BrowserObserveWaitKind::UrlContains => {
+                return Err(format!(
+                    "BrowserObserve wait.kind={} is not supported in slice 1B; supported kinds are {}",
+                    wait.kind.as_str(),
+                    BROWSER_OBSERVE_SUPPORTED_WAIT_KINDS.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn observe_browser_page(
+    browser: &Path,
+    input: &BrowserObserveInput,
+) -> Result<BrowserObserveObservation, String> {
+    let started_at = Instant::now();
+    let html = run_browser_capture(
+        browser,
+        input,
+        None,
+        BrowserObserveCapturePhase::Observation,
+    )?;
+    let snapshot = BrowserObserveSnapshot::from_html(&html);
+    let wait = browser_wait_report(input, &snapshot)?;
+    let load_outcome = input.wait.as_ref().map_or_else(
+        || String::from("loaded"),
+        |wait| match wait.kind {
+            BrowserObserveWaitKind::Load => String::from("loaded"),
+            BrowserObserveWaitKind::NetworkIdle => String::from("loaded_after_network_idle_budget"),
+            BrowserObserveWaitKind::Text | BrowserObserveWaitKind::TitleContains => {
+                String::from("loaded_after_wait_budget")
+            }
+            BrowserObserveWaitKind::Selector | BrowserObserveWaitKind::UrlContains => {
+                String::from("unsupported")
+            }
+        },
+    );
+
+    Ok(BrowserObserveObservation {
+        snapshot,
+        load_outcome,
+        wait,
+        observation_elapsed_ms: elapsed_ms(started_at.elapsed()),
+    })
+}
+
+fn browser_wait_report(
+    input: &BrowserObserveInput,
+    snapshot: &BrowserObserveSnapshot,
+) -> Result<BrowserObserveWaitReport, String> {
+    let wait_budget_ms = browser_wait_budget_ms(input);
+    let default_report = BrowserObserveWaitReport {
+        kind: String::from("load"),
+        status: String::from("satisfied"),
+        detail: String::from("captured DOM after page load"),
+        expected: None,
+    };
+    let Some(wait) = &input.wait else {
+        return Ok(default_report);
+    };
+
+    match wait.kind {
+        BrowserObserveWaitKind::Load => Ok(BrowserObserveWaitReport {
+            kind: wait.kind.as_str().to_string(),
+            status: String::from("satisfied"),
+            detail: String::from("captured DOM after page load"),
+            expected: None,
+        }),
+        BrowserObserveWaitKind::NetworkIdle => Ok(BrowserObserveWaitReport {
+            kind: wait.kind.as_str().to_string(),
+            status: String::from("satisfied"),
+            detail: format!(
+                "captured DOM after allowing up to {}ms of virtual browser time",
+                browser_virtual_time_budget_ms(input)
+                    .unwrap_or(DEFAULT_BROWSER_NETWORK_IDLE_BUDGET_MS)
+            ),
+            expected: None,
+        }),
+        BrowserObserveWaitKind::Text => {
+            let expected = wait.expected_value().expect("validated text wait");
+            if snapshot.visible_text.contains(expected) {
+                Ok(BrowserObserveWaitReport {
+                    kind: wait.kind.as_str().to_string(),
+                    status: String::from("satisfied"),
+                    detail: String::from("captured DOM contained the required text fragment"),
+                    expected: Some(expected.to_string()),
+                })
+            } else {
+                Err(format!(
+                    "BrowserObserve did not observe text containing `{expected}` within the {wait_budget_ms}ms wait budget"
+                ))
+            }
+        }
+        BrowserObserveWaitKind::TitleContains => {
+            let expected = wait.expected_value().expect("validated title wait");
+            let matches = snapshot
+                .title
+                .as_deref()
+                .is_some_and(|title| title.contains(expected));
+            if matches {
+                Ok(BrowserObserveWaitReport {
+                    kind: wait.kind.as_str().to_string(),
+                    status: String::from("satisfied"),
+                    detail: String::from("captured DOM title contained the required fragment"),
+                    expected: Some(expected.to_string()),
+                })
+            } else {
+                Err(format!(
+                    "BrowserObserve did not observe a page title containing `{expected}` within the {wait_budget_ms}ms wait budget"
+                ))
+            }
+        }
+        BrowserObserveWaitKind::Selector | BrowserObserveWaitKind::UrlContains => Err(format!(
+            "BrowserObserve wait.kind={} is not supported in slice 1B",
+            wait.kind.as_str()
+        )),
+    }
+}
+
+fn run_browser_capture(
+    browser: &Path,
+    input: &BrowserObserveInput,
+    screenshot_path: Option<&Path>,
+    phase: BrowserObserveCapturePhase,
+) -> Result<String, String> {
+    let mut command = Command::new(browser);
+    command
+        .arg("--headless=new")
+        .arg("--disable-gpu")
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check");
+
+    let timeout_ms = input.timeout_ms.unwrap_or(DEFAULT_BROWSER_TIMEOUT_MS);
+    command.arg(format!("--timeout={timeout_ms}"));
+
+    if let Some(virtual_time_budget_ms) = browser_virtual_time_budget_ms(input) {
+        command.arg(format!("--virtual-time-budget={virtual_time_budget_ms}"));
+    }
+
+    let viewport = input.viewport.as_ref().map_or(
+        (
+            DEFAULT_BROWSER_VIEWPORT_WIDTH,
+            DEFAULT_BROWSER_VIEWPORT_HEIGHT,
+        ),
+        |viewport| (viewport.width, viewport.height),
+    );
+    command.arg(format!("--window-size={},{}", viewport.0, viewport.1));
+
+    match screenshot_path {
+        Some(path) => {
+            command.arg(format!("--screenshot={}", path.display()));
+        }
+        None => {
+            command.arg("--dump-dom");
+        }
+    }
+    command.arg(&input.url);
+
+    let output = command.output().map_err(|error| {
+        format!(
+            "BrowserObserve {} failed to launch {}: {error}",
+            phase.as_str(),
+            browser.display()
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let suffix = if stderr.trim().is_empty() {
+            String::new()
+        } else {
+            format!(": {}", stderr.trim())
+        };
+        return Err(format!(
+            "BrowserObserve {} failed with status {}{}",
+            phase.as_str(),
+            output
+                .status
+                .code()
+                .map_or_else(|| String::from("terminated"), |code| code.to_string()),
+            suffix
+        ));
+    }
+
+    if screenshot_path.is_some() {
+        return Ok(String::new());
+    }
+
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("BrowserObserve captured non-UTF-8 DOM output: {error}"))
+}
+
+fn browser_virtual_time_budget_ms(input: &BrowserObserveInput) -> Option<u64> {
+    let wait = input.wait.as_ref()?;
+    match wait.kind {
+        BrowserObserveWaitKind::NetworkIdle => Some(
+            input
+                .timeout_ms
+                .unwrap_or(DEFAULT_BROWSER_NETWORK_IDLE_BUDGET_MS),
+        ),
+        BrowserObserveWaitKind::Text | BrowserObserveWaitKind::TitleContains => {
+            Some(browser_wait_budget_ms(input))
+        }
+        BrowserObserveWaitKind::Load
+        | BrowserObserveWaitKind::Selector
+        | BrowserObserveWaitKind::UrlContains => None,
+    }
+}
+
+fn browser_wait_budget_ms(input: &BrowserObserveInput) -> u64 {
+    input.timeout_ms.unwrap_or(DEFAULT_BROWSER_TIMEOUT_MS)
+}
+
+fn elapsed_ms(duration: Duration) -> u64 {
+    duration
+        .as_millis()
+        .min(u128::from(u64::MAX))
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn find_supported_browser_command() -> Option<PathBuf> {
+    supported_browser_candidates()
+        .into_iter()
+        .find_map(|candidate| resolve_command_path(&candidate))
+}
+
+fn supported_browser_candidates() -> Vec<String> {
+    let mut candidates = vec![
+        String::from("msedge"),
+        String::from("chrome"),
+        String::from("chromium"),
+        String::from("google-chrome"),
+        String::from("google-chrome-stable"),
+        String::from("chromium-browser"),
+        String::from("microsoft-edge"),
+    ];
+
+    if cfg!(windows) {
+        candidates.extend([
+            String::from(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+            String::from(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+            String::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            String::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+        ]);
+    } else if cfg!(target_os = "macos") {
+        candidates.extend([
+            String::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            String::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+        ]);
+    }
+
+    candidates
+}
+
+fn browser_observe_call_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("call-{nanos}")
+}
+
+fn portable_workspace_relative_path(path: &Path, workspace_root: &Path) -> Result<String, String> {
+    portable_workspace_relative_path_for_browser_tool(
+        path,
+        workspace_root,
+        BROWSER_OBSERVE_TOOL_NAME,
+    )
+}
+
+fn portable_workspace_relative_path_for_browser_tool(
+    path: &Path,
+    workspace_root: &Path,
+    tool_name: &str,
+) -> Result<String, String> {
+    let relative = path.strip_prefix(workspace_root).map_err(|_| {
+        format!(
+            "{tool_name} artifact path {} is outside the current workspace {}",
+            path.display(),
+            workspace_root.display()
+        )
+    })?;
+    Ok(relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
+fn extract_html_title(html: &str) -> Option<String> {
+    let lowered = html.to_ascii_lowercase();
+    let title_start = lowered.find("<title")?;
+    let title_open_end = html[title_start..].find('>')? + title_start + 1;
+    let title_close = lowered[title_open_end..].find("</title>")? + title_open_end;
+    let title = decode_html_entities_basic(html[title_open_end..title_close].trim());
+    (!title.is_empty()).then_some(title)
+}
+
+fn visible_text_from_html(html: &str) -> String {
+    let without_scripts = strip_html_block(html, "script");
+    let without_styles = strip_html_block(&without_scripts, "style");
+    let without_noscript = strip_html_block(&without_styles, "noscript");
+    let mut text = String::new();
+    let mut in_tag = false;
+
+    for ch in without_noscript.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                text.push(' ');
+            }
+            '>' => {
+                in_tag = false;
+                text.push(' ');
+            }
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+
+    decode_html_entities_basic(&text.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn strip_html_block(html: &str, tag: &str) -> String {
+    let mut output = html.to_string();
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+
+    loop {
+        let lowered = output.to_ascii_lowercase();
+        let Some(start) = lowered.find(&open) else {
+            break;
+        };
+        let Some(close_start_rel) = lowered[start..].find(&close) else {
+            output.replace_range(start..output.len(), " ");
+            break;
+        };
+        let close_start = start + close_start_rel;
+        let close_end = close_start + close.len();
+        let remove_end = output[close_end..]
+            .find('>')
+            .map_or(output.len(), |offset| close_end + offset + 1);
+        output.replace_range(start..remove_end, " ");
+    }
+
+    output
+}
+
+fn decode_html_entities_basic(value: &str) -> String {
+    value
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+fn truncate_browser_visible_text(value: &str) -> (Option<String>, bool) {
+    if value.is_empty() {
+        return (None, false);
+    }
+    let total_chars = value.chars().count();
+    if total_chars <= MAX_BROWSER_VISIBLE_TEXT_CHARS {
+        return (Some(value.to_string()), false);
+    }
+    let truncated = value
+        .chars()
+        .take(MAX_BROWSER_VISIBLE_TEXT_CHARS)
+        .collect::<String>();
+    (Some(truncated), true)
+}
+
+fn truncate_browser_text_summary(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::from("?");
+    }
+    let total_chars = trimmed.chars().count();
+    if total_chars <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut truncated = trimmed.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2583,6 +3657,1058 @@ fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn io_to_string(error: std::io::Error) -> String {
     error.to_string()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserObserveInput {
+    url: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    wait: Option<BrowserObserveWait>,
+    #[serde(default)]
+    capture_visible_text: bool,
+    #[serde(default)]
+    screenshot: Option<BrowserObserveScreenshotRequest>,
+    #[serde(default)]
+    viewport: Option<BrowserObserveViewport>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserInteractInput {
+    url: String,
+    action: BrowserInteractAction,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    wait: Option<BrowserObserveWait>,
+    #[serde(default)]
+    capture_visible_text: bool,
+    #[serde(default)]
+    screenshot: Option<BrowserObserveScreenshotRequest>,
+    #[serde(default)]
+    viewport: Option<BrowserObserveViewport>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserInteractAction {
+    kind: String,
+    selector: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserObserveWait {
+    kind: BrowserObserveWaitKind,
+    #[serde(default)]
+    value: Option<String>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BrowserObserveWaitKind {
+    Load,
+    NetworkIdle,
+    Text,
+    TitleContains,
+    Selector,
+    UrlContains,
+}
+
+impl BrowserObserveWaitKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::NetworkIdle => "network_idle",
+            Self::Text => "text",
+            Self::TitleContains => "title_contains",
+            Self::Selector => "selector",
+            Self::UrlContains => "url_contains",
+        }
+    }
+}
+
+impl BrowserObserveWait {
+    fn expected_value(&self) -> Option<&str> {
+        self.value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserObserveScreenshotRequest {
+    capture: bool,
+    #[serde(default)]
+    format: BrowserObserveScreenshotFormat,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+enum BrowserObserveScreenshotFormat {
+    #[default]
+    Png,
+    Jpeg,
+}
+
+impl BrowserObserveScreenshotFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
+        }
+    }
+
+    fn media_type(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserObserveViewport {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserObserveOutput {
+    requested_url: String,
+    final_url: Option<String>,
+    title: Option<String>,
+    load_outcome: String,
+    wait: BrowserObserveWaitReport,
+    visible_text: Option<String>,
+    visible_text_truncated: bool,
+    screenshot: Option<BrowserObserveArtifact>,
+    browser_runtime: BrowserObserveRuntime,
+    timings_ms: BrowserObserveTimings,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserInteractOutput {
+    requested_url: String,
+    final_url: Option<String>,
+    title: Option<String>,
+    action: BrowserInteractActionReport,
+    load_outcome: String,
+    wait: BrowserObserveWaitReport,
+    visible_text: Option<String>,
+    visible_text_truncated: bool,
+    screenshot: Option<BrowserObserveArtifact>,
+    browser_runtime: BrowserObserveRuntime,
+    timings_ms: BrowserInteractTimings,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserInteractActionReport {
+    kind: String,
+    selector: String,
+    status: String,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserObserveArtifact {
+    relative_path: String,
+    file_name: String,
+    format: String,
+    media_type: String,
+    bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserObserveRuntime {
+    executable: String,
+    mode: String,
+    capture_backend: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserObserveWaitReport {
+    kind: String,
+    status: String,
+    detail: String,
+    expected: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserObserveTimings {
+    observation: u64,
+    screenshot: Option<u64>,
+    total: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserInteractTimings {
+    interaction: u64,
+    screenshot: Option<u64>,
+    total: u64,
+}
+
+#[derive(Debug)]
+struct BrowserObserveObservation {
+    snapshot: BrowserObserveSnapshot,
+    load_outcome: String,
+    wait: BrowserObserveWaitReport,
+    observation_elapsed_ms: u64,
+}
+
+#[derive(Debug)]
+struct BrowserObserveSnapshot {
+    title: Option<String>,
+    visible_text: String,
+}
+
+impl BrowserObserveSnapshot {
+    fn from_html(html: &str) -> Self {
+        Self {
+            title: extract_html_title(html),
+            visible_text: visible_text_from_html(html),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BrowserObserveCapturePhase {
+    Observation,
+    Screenshot,
+}
+
+impl BrowserObserveCapturePhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Observation => "observation capture",
+            Self::Screenshot => "screenshot capture",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserInteractPageState {
+    #[serde(rename = "readyState")]
+    ready_state: Option<String>,
+    url: Option<String>,
+    title: Option<String>,
+    #[serde(rename = "visibleText", default)]
+    visible_text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserInteractSelectorProbe {
+    found: bool,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserInteractClickOutcome {
+    found: bool,
+    clicked: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserDevtoolsTarget {
+    #[serde(rename = "type")]
+    target_type: String,
+    #[serde(default)]
+    url: String,
+    #[serde(rename = "webSocketDebuggerUrl")]
+    web_socket_debugger_url: Option<String>,
+}
+
+struct BrowserInteractSession {
+    child: Child,
+    socket: BrowserDevtoolsSocket,
+    runtime_dir: PathBuf,
+    started_at: Instant,
+}
+
+impl BrowserInteractSession {
+    fn launch(
+        browser: &Path,
+        input: &BrowserInteractInput,
+        timeout_ms: u64,
+        call_id: &str,
+    ) -> Result<Self, String> {
+        let runtime_dir = std::env::temp_dir().join(format!("openyak-browser-{call_id}"));
+        if runtime_dir.exists() {
+            let _ = fs::remove_dir_all(&runtime_dir);
+        }
+        fs::create_dir_all(&runtime_dir).map_err(io_to_string)?;
+
+        let mut command = Command::new(browser);
+        command
+            .arg("--headless=new")
+            .arg("--disable-gpu")
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg("--remote-debugging-address=127.0.0.1")
+            .arg("--remote-debugging-port=0")
+            .arg(format!("--user-data-dir={}", runtime_dir.display()))
+            .arg(format!(
+                "--window-size={},{}",
+                input
+                    .viewport
+                    .as_ref()
+                    .map_or(DEFAULT_BROWSER_VIEWPORT_WIDTH, |viewport| viewport.width),
+                input
+                    .viewport
+                    .as_ref()
+                    .map_or(DEFAULT_BROWSER_VIEWPORT_HEIGHT, |viewport| viewport.height)
+            ))
+            .arg(&input.url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut child = command.spawn().map_err(|error| {
+            format!(
+                "failed to launch {} with remote debugging enabled: {error}",
+                browser.display()
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let port = wait_for_browser_devtools_port(&mut child, &runtime_dir, deadline)?;
+        let websocket_url = discover_browser_devtools_target(port, &input.url, deadline)?;
+        let socket = BrowserDevtoolsSocket::connect(&websocket_url, deadline)?;
+
+        Ok(Self {
+            child,
+            socket,
+            runtime_dir,
+            started_at: Instant::now(),
+        })
+    }
+
+    fn wait_for_initial_load(&mut self, timeout_ms: u64) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let _ = self.wait_for_page_condition(deadline, None, |state| {
+            state.ready_state.as_deref() == Some("complete")
+        })?;
+        Ok(())
+    }
+
+    fn click_selector(
+        &mut self,
+        selector: &str,
+        timeout_ms: u64,
+    ) -> Result<BrowserInteractActionReport, String> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let selector_probe = self.wait_for_selector(selector, deadline)?;
+        let click_expression = browser_interact_click_expression(selector)?;
+        let outcome: BrowserInteractClickOutcome =
+            self.evaluate_json(&click_expression, deadline)?;
+        if !outcome.found {
+            return Err(format!(
+                "selector `{selector}` was not found when BrowserInteract attempted the click"
+            ));
+        }
+        if !outcome.clicked {
+            let reason = outcome
+                .reason
+                .unwrap_or_else(|| String::from("unknown reason"));
+            return Err(format!(
+                "selector `{selector}` could not be clicked in slice 2A: {reason}"
+            ));
+        }
+
+        let tag = outcome
+            .tag
+            .or(selector_probe.tag)
+            .unwrap_or_else(|| String::from("element"));
+        let text = outcome.text.or(selector_probe.text).map_or_else(
+            || String::from("no visible label"),
+            |text| truncate_browser_text_summary(&text, 80),
+        );
+        Ok(BrowserInteractActionReport {
+            kind: String::from("click"),
+            selector: selector.to_string(),
+            status: String::from("performed"),
+            detail: format!("clicked <{tag}> selector with label {text}"),
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn capture_post_action_state(
+        &mut self,
+        wait: Option<&BrowserObserveWait>,
+        timeout_ms: u64,
+    ) -> Result<(BrowserInteractPageState, BrowserObserveWaitReport), String> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        match wait {
+            None => {
+                let state = self.capture_page_state(deadline)?;
+                Ok((
+                    state,
+                    BrowserObserveWaitReport {
+                        kind: String::from("load"),
+                        status: String::from("satisfied"),
+                        detail: String::from(
+                            "captured page state immediately after the selector click",
+                        ),
+                        expected: None,
+                    },
+                ))
+            }
+            Some(wait) => match wait.kind {
+                BrowserObserveWaitKind::Load => {
+                    let state = self.wait_for_page_condition(deadline, None, |state| {
+                        state.ready_state.as_deref() == Some("complete")
+                    })?;
+                    Ok((
+                        state,
+                        BrowserObserveWaitReport {
+                            kind: String::from("load"),
+                            status: String::from("satisfied"),
+                            detail: String::from(
+                                "captured page state after the selector click reached readyState=complete",
+                            ),
+                            expected: None,
+                        },
+                    ))
+                }
+                BrowserObserveWaitKind::Text => {
+                    let expected = wait.expected_value().expect("validated text wait");
+                    let state =
+                        self.wait_for_page_condition(deadline, Some(expected), |state| {
+                            state.visible_text.contains(expected)
+                        })?;
+                    Ok((
+                        state,
+                        BrowserObserveWaitReport {
+                            kind: String::from("text"),
+                            status: String::from("satisfied"),
+                            detail: String::from(
+                                "captured page state contained the required text fragment after the selector click",
+                            ),
+                            expected: Some(expected.to_string()),
+                        },
+                    ))
+                }
+                BrowserObserveWaitKind::TitleContains => {
+                    let expected = wait.expected_value().expect("validated title wait");
+                    let state =
+                        self.wait_for_page_condition(deadline, Some(expected), |state| {
+                            state
+                                .title
+                                .as_deref()
+                                .is_some_and(|title| title.contains(expected))
+                        })?;
+                    Ok((
+                        state,
+                        BrowserObserveWaitReport {
+                            kind: String::from("title_contains"),
+                            status: String::from("satisfied"),
+                            detail: String::from(
+                                "captured page title contained the required fragment after the selector click",
+                            ),
+                            expected: Some(expected.to_string()),
+                        },
+                    ))
+                }
+                BrowserObserveWaitKind::UrlContains => {
+                    let expected = wait.expected_value().expect("validated url wait");
+                    let state =
+                        self.wait_for_page_condition(deadline, Some(expected), |state| {
+                            state
+                                .url
+                                .as_deref()
+                                .is_some_and(|url| url.contains(expected))
+                        })?;
+                    Ok((
+                        state,
+                        BrowserObserveWaitReport {
+                            kind: String::from("url_contains"),
+                            status: String::from("satisfied"),
+                            detail: String::from(
+                                "captured final URL contained the required fragment after the selector click",
+                            ),
+                            expected: Some(expected.to_string()),
+                        },
+                    ))
+                }
+                BrowserObserveWaitKind::NetworkIdle | BrowserObserveWaitKind::Selector => {
+                    Err(format!(
+                        "wait.kind={} is not supported in BrowserInteract slice 2A",
+                        wait.kind.as_str()
+                    ))
+                }
+            },
+        }
+    }
+
+    fn capture_screenshot(
+        &mut self,
+        format: BrowserObserveScreenshotFormat,
+        artifact_path: &Path,
+        workspace_root: &Path,
+        tool_name: &str,
+    ) -> Result<BrowserObserveArtifact, String> {
+        let deadline = Instant::now() + Duration::from_millis(DEFAULT_BROWSER_TIMEOUT_MS);
+        let result = self.socket.call(
+            "Page.captureScreenshot",
+            &json!({
+                "format": format.as_str(),
+                "fromSurface": true
+            }),
+            deadline,
+        )?;
+        let encoded = result
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| String::from("Page.captureScreenshot did not return image data"))?;
+        let bytes = decode_base64_standard(encoded)?;
+        fs::write(artifact_path, &bytes).map_err(io_to_string)?;
+        Ok(BrowserObserveArtifact {
+            relative_path: portable_workspace_relative_path_for_browser_tool(
+                artifact_path,
+                workspace_root,
+                tool_name,
+            )?,
+            file_name: artifact_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("interact")
+                .to_string(),
+            format: format.as_str().to_string(),
+            media_type: format.media_type().to_string(),
+            bytes: bytes.len().try_into().unwrap_or(u64::MAX),
+        })
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        elapsed_ms(self.started_at.elapsed())
+    }
+
+    fn wait_for_selector(
+        &mut self,
+        selector: &str,
+        deadline: Instant,
+    ) -> Result<BrowserInteractSelectorProbe, String> {
+        let probe_expression = browser_interact_selector_probe_expression(selector)?;
+        loop {
+            let probe =
+                self.evaluate_json::<BrowserInteractSelectorProbe>(&probe_expression, deadline)?;
+            if probe.found && !probe.disabled {
+                return Ok(probe);
+            }
+            if Instant::now() >= deadline {
+                return if probe.found && probe.disabled {
+                    Err(format!(
+                        "selector `{selector}` was found but remained disabled within the interaction budget"
+                    ))
+                } else {
+                    Err(format!(
+                        "selector `{selector}` was not found within the interaction budget"
+                    ))
+                };
+            }
+            thread::sleep(Duration::from_millis(DEFAULT_BROWSER_INTERACT_POLL_MS));
+        }
+    }
+
+    fn wait_for_page_condition<F>(
+        &mut self,
+        deadline: Instant,
+        expected: Option<&str>,
+        predicate: F,
+    ) -> Result<BrowserInteractPageState, String>
+    where
+        F: Fn(&BrowserInteractPageState) -> bool,
+    {
+        let mut last_error = None;
+        let mut last_state = None;
+        loop {
+            match self.capture_page_state(deadline) {
+                Ok(state) => {
+                    if predicate(&state) {
+                        return Ok(state);
+                    }
+                    last_state = Some(state);
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(DEFAULT_BROWSER_INTERACT_POLL_MS));
+        }
+
+        if let Some(expected) = expected {
+            if let Some(state) = last_state {
+                return Err(format!(
+                    "the clicked page did not satisfy `{expected}` within the wait budget (last title: {}, last url: {})",
+                    state.title.unwrap_or_else(|| String::from("?")),
+                    state.url.unwrap_or_else(|| String::from("?"))
+                ));
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            String::from("page state did not satisfy the wait condition within the budget")
+        }))
+    }
+
+    fn capture_page_state(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<BrowserInteractPageState, String> {
+        let expression = String::from(
+            "(() => ({ readyState: document.readyState || null, url: location.href || null, title: document.title || null, visibleText: document.body && typeof document.body.innerText === 'string' ? document.body.innerText : '' }))()",
+        );
+        self.evaluate_json(&expression, deadline)
+    }
+
+    fn evaluate_json<T: for<'de> Deserialize<'de>>(
+        &mut self,
+        expression: &str,
+        deadline: Instant,
+    ) -> Result<T, String> {
+        let result = self.socket.call(
+            "Runtime.evaluate",
+            &json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true
+            }),
+            deadline,
+        )?;
+        let remote_result = result
+            .get("result")
+            .ok_or_else(|| String::from("Runtime.evaluate did not return a result payload"))?;
+        let value = remote_result
+            .get("value")
+            .cloned()
+            .ok_or_else(|| String::from("Runtime.evaluate did not return a value"))?;
+        serde_json::from_value(value).map_err(|error| error.to_string())
+    }
+}
+
+impl Drop for BrowserInteractSession {
+    fn drop(&mut self) {
+        self.socket.close();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_dir_all(&self.runtime_dir);
+    }
+}
+
+struct BrowserDevtoolsSocket {
+    stream: std::net::TcpStream,
+    next_id: u64,
+}
+
+impl BrowserDevtoolsSocket {
+    fn connect(websocket_url: &str, deadline: Instant) -> Result<Self, String> {
+        let url = Url::parse(websocket_url)
+            .map_err(|error| format!("invalid browser DevTools websocket URL: {error}"))?;
+        if url.scheme() != "ws" {
+            return Err(format!(
+                "BrowserInteract only supports ws:// DevTools endpoints in slice 2A; received {}",
+                url.scheme()
+            ));
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| String::from("DevTools websocket URL did not include a host"))?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| String::from("DevTools websocket URL did not include a port"))?;
+        let address = format!("{host}:{port}");
+        let socket_address = address
+            .to_socket_addrs()
+            .map_err(io_to_string)?
+            .next()
+            .ok_or_else(|| format!("could not resolve {address}"))?;
+        let mut stream = std::net::TcpStream::connect_timeout(
+            &socket_address,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .map_err(io_to_string)?;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(DEFAULT_BROWSER_STARTUP_POLL_MS)))
+            .map_err(io_to_string)?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .map_err(io_to_string)?;
+        let path = if let Some(query) = url.query() {
+            format!("{}?{query}", url.path())
+        } else {
+            url.path().to_string()
+        };
+        let handshake = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        stream
+            .write_all(handshake.as_bytes())
+            .map_err(io_to_string)?;
+        stream.flush().map_err(io_to_string)?;
+        let response = read_http_headers(&mut stream, deadline)?;
+        if !(response.starts_with("HTTP/1.1 101") || response.starts_with("HTTP/1.0 101")) {
+            return Err(format!("DevTools websocket handshake failed: {response}"));
+        }
+        Ok(Self { stream, next_id: 1 })
+    }
+
+    fn call(&mut self, method: &str, params: &Value, deadline: Instant) -> Result<Value, String> {
+        let request_id = self.next_id;
+        self.next_id += 1;
+        let payload = serde_json::to_string(&json!({
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }))
+        .map_err(|error| error.to_string())?;
+        self.send_text(&payload)?;
+        loop {
+            let message = self.read_text(deadline)?;
+            let value: Value = serde_json::from_str(&message).map_err(|error| error.to_string())?;
+            if value
+                .get("id")
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value == request_id)
+            {
+                if let Some(error) = value.get("error") {
+                    return Err(format!(
+                        "{method} returned a browser protocol error: {}",
+                        truncate_browser_text_summary(&error.to_string(), 160)
+                    ));
+                }
+                return value
+                    .get("result")
+                    .cloned()
+                    .ok_or_else(|| format!("{method} returned no result payload"));
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        let _ = self.send_control_frame(0x8, &[]);
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    fn send_text(&mut self, message: &str) -> Result<(), String> {
+        self.send_control_frame(0x1, message.as_bytes())
+    }
+
+    fn send_control_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), String> {
+        let mut frame = Vec::with_capacity(payload.len() + 14);
+        frame.push(0x80 | opcode);
+        let mask_key = [0x13_u8, 0x37, 0x42, 0x99];
+        match payload.len() {
+            0..=125 => frame.push(
+                0x80 | u8::try_from(payload.len())
+                    .expect("small websocket frame length should fit in u8"),
+            ),
+            126..=65535 => {
+                frame.push(0x80 | 0x7e);
+                frame.extend_from_slice(
+                    &u16::try_from(payload.len())
+                        .expect("medium websocket frame length should fit in u16")
+                        .to_be_bytes(),
+                );
+            }
+            _ => {
+                frame.push(0x80 | 127);
+                frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(&mask_key);
+        for (index, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask_key[index % mask_key.len()]);
+        }
+        self.stream.write_all(&frame).map_err(io_to_string)?;
+        self.stream.flush().map_err(io_to_string)
+    }
+
+    fn read_text(&mut self, deadline: Instant) -> Result<String, String> {
+        loop {
+            let frame = self.read_frame(deadline)?;
+            match frame.opcode {
+                0x1 => {
+                    return String::from_utf8(frame.payload).map_err(|error| {
+                        format!("browser DevTools returned non-UTF-8 text: {error}")
+                    });
+                }
+                0x8 => {
+                    return Err(String::from(
+                        "browser DevTools websocket closed before BrowserInteract completed",
+                    ));
+                }
+                0x9 => {
+                    self.send_control_frame(0xA, &frame.payload)?;
+                }
+                0xA => {}
+                other => {
+                    return Err(format!(
+                        "browser DevTools websocket returned unsupported opcode {other}"
+                    ));
+                }
+            }
+        }
+    }
+
+    fn read_frame(&mut self, deadline: Instant) -> Result<BrowserWebSocketFrame, String> {
+        let mut header = [0_u8; 2];
+        read_exact_until(&mut self.stream, &mut header, deadline)?;
+        let masked = header[1] & 0x80 != 0;
+        let mut payload_len = u64::from(header[1] & 0x7f);
+        if payload_len == 126 {
+            let mut extended = [0_u8; 2];
+            read_exact_until(&mut self.stream, &mut extended, deadline)?;
+            payload_len = u64::from(u16::from_be_bytes(extended));
+        } else if payload_len == 127 {
+            let mut extended = [0_u8; 8];
+            read_exact_until(&mut self.stream, &mut extended, deadline)?;
+            payload_len = u64::from_be_bytes(extended);
+        }
+        let mut mask_key = [0_u8; 4];
+        if masked {
+            read_exact_until(&mut self.stream, &mut mask_key, deadline)?;
+        }
+        let payload_len_usize = usize::try_from(payload_len)
+            .map_err(|_| String::from("websocket payload too large"))?;
+        let mut payload = vec![0_u8; payload_len_usize];
+        read_exact_until(&mut self.stream, &mut payload, deadline)?;
+        if masked {
+            for (index, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask_key[index % mask_key.len()];
+            }
+        }
+        Ok(BrowserWebSocketFrame {
+            opcode: header[0] & 0x0f,
+            payload,
+        })
+    }
+}
+
+struct BrowserWebSocketFrame {
+    opcode: u8,
+    payload: Vec<u8>,
+}
+
+fn wait_for_browser_devtools_port(
+    child: &mut Child,
+    runtime_dir: &Path,
+    deadline: Instant,
+) -> Result<u16, String> {
+    let active_port_path = runtime_dir.join("DevToolsActivePort");
+    loop {
+        if let Ok(contents) = fs::read_to_string(&active_port_path) {
+            let port = contents
+                .lines()
+                .next()
+                .ok_or_else(|| String::from("DevToolsActivePort was empty"))?
+                .trim()
+                .parse::<u16>()
+                .map_err(|error| {
+                    format!("DevToolsActivePort contained an invalid port: {error}")
+                })?;
+            return Ok(port);
+        }
+        if let Some(status) = child.try_wait().map_err(io_to_string)? {
+            return Err(format!(
+                "browser exited before remote debugging became available (status {})",
+                status
+                    .code()
+                    .map_or_else(|| String::from("terminated"), |code| code.to_string())
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(String::from(
+                "timed out waiting for the browser remote-debugging port file",
+            ));
+        }
+        thread::sleep(Duration::from_millis(DEFAULT_BROWSER_STARTUP_POLL_MS));
+    }
+}
+
+fn discover_browser_devtools_target(
+    port: u16,
+    requested_url: &str,
+    deadline: Instant,
+) -> Result<String, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_millis(DEFAULT_BROWSER_STARTUP_POLL_MS))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let endpoint = format!("http://127.0.0.1:{port}/json/list");
+    let requested_url = requested_url.trim();
+    loop {
+        match client.get(&endpoint).send() {
+            Ok(response) => {
+                let targets: Vec<BrowserDevtoolsTarget> =
+                    response.json().map_err(|error| error.to_string())?;
+                if let Some(target) = targets.iter().find(|target| {
+                    target.target_type == "page"
+                        && target.web_socket_debugger_url.is_some()
+                        && target.url == requested_url
+                }) {
+                    return target
+                        .web_socket_debugger_url
+                        .clone()
+                        .ok_or_else(|| String::from("page target did not expose a websocket URL"));
+                }
+                if let Some(target) = targets.iter().find(|target| {
+                    target.target_type == "page" && target.web_socket_debugger_url.is_some()
+                }) {
+                    return target
+                        .web_socket_debugger_url
+                        .clone()
+                        .ok_or_else(|| String::from("page target did not expose a websocket URL"));
+                }
+            }
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(format!("failed to query browser targets: {error}"));
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(String::from(
+                "timed out waiting for a browser page target to become available",
+            ));
+        }
+        thread::sleep(Duration::from_millis(DEFAULT_BROWSER_STARTUP_POLL_MS));
+    }
+}
+
+fn browser_interact_selector_probe_expression(selector: &str) -> Result<String, String> {
+    let selector = serde_json::to_string(selector).map_err(|error| error.to_string())?;
+    Ok(format!(
+        "(() => {{ const selector = {selector}; const element = document.querySelector(selector); if (!element) return {{ found: false, disabled: false }}; const text = typeof element.innerText === 'string' ? element.innerText : (typeof element.textContent === 'string' ? element.textContent : ''); return {{ found: true, disabled: !!element.disabled || element.getAttribute('aria-disabled') === 'true', tag: element.tagName ? element.tagName.toLowerCase() : null, text: typeof text === 'string' ? text.slice(0, 160) : null }}; }})()"
+    ))
+}
+
+fn browser_interact_click_expression(selector: &str) -> Result<String, String> {
+    let selector = serde_json::to_string(selector).map_err(|error| error.to_string())?;
+    Ok(format!(
+        "(() => {{ const selector = {selector}; const element = document.querySelector(selector); if (!element) return {{ found: false, clicked: false, reason: 'not_found' }}; if (typeof element.scrollIntoView === 'function') element.scrollIntoView({{ block: 'center', inline: 'center' }}); if (typeof element.click !== 'function') return {{ found: true, clicked: false, reason: 'missing_click_method', tag: element.tagName ? element.tagName.toLowerCase() : null }}; const text = typeof element.innerText === 'string' ? element.innerText : (typeof element.textContent === 'string' ? element.textContent : ''); element.click(); return {{ found: true, clicked: true, tag: element.tagName ? element.tagName.toLowerCase() : null, text: typeof text === 'string' ? text.slice(0, 160) : null }}; }})()"
+    ))
+}
+
+fn read_http_headers(
+    stream: &mut std::net::TcpStream,
+    deadline: Instant,
+) -> Result<String, String> {
+    let mut buffer = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        read_exact_until(stream, &mut byte, deadline)?;
+        buffer.push(byte[0]);
+        if buffer.ends_with(b"\r\n\r\n") {
+            return String::from_utf8(buffer).map_err(|error| {
+                format!("browser websocket handshake response was not UTF-8: {error}")
+            });
+        }
+    }
+}
+
+fn read_exact_until(
+    stream: &mut std::net::TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        if Instant::now() >= deadline {
+            return Err(String::from(
+                "timed out while reading from the browser DevTools websocket",
+            ));
+        }
+        match stream.read(&mut buffer[filled..]) {
+            Ok(0) => {
+                return Err(String::from(
+                    "browser DevTools websocket closed unexpectedly while reading",
+                ))
+            }
+            Ok(read) => filled += read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
+}
+
+fn decode_base64_standard(value: &str) -> Result<Vec<u8>, String> {
+    fn sextet(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let filtered = value
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if filtered.len() % 4 != 0 {
+        return Err(String::from(
+            "browser screenshot payload was not valid base64",
+        ));
+    }
+
+    let mut output = Vec::with_capacity((filtered.len() / 4) * 3);
+    for chunk in filtered.chunks(4) {
+        let mut values = [0_u8; 4];
+        let mut padding = 0;
+        for (index, byte) in chunk.iter().enumerate() {
+            if *byte == b'=' {
+                padding += 1;
+                values[index] = 0;
+            } else {
+                values[index] = sextet(*byte).ok_or_else(|| {
+                    String::from("browser screenshot payload contained invalid base64 data")
+                })?;
+            }
+        }
+        output.push((values[0] << 2) | (values[1] >> 4));
+        if padding < 2 {
+            output.push((values[1] << 4) | (values[2] >> 2));
+        }
+        if padding < 1 {
+            output.push((values[2] << 6) | values[3]);
+        }
+    }
+
+    Ok(output)
 }
 
 #[derive(Debug, Deserialize)]
@@ -5186,18 +7312,18 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
     let _ = &input.description;
     let shell = detect_powershell_shell()?;
     execute_shell_command(
-        shell,
+        &shell,
         &input.command,
         input.timeout,
         input.run_in_background,
     )
 }
 
-fn detect_powershell_shell() -> std::io::Result<&'static str> {
-    if command_exists("pwsh") {
-        Ok("pwsh")
-    } else if command_exists("powershell") {
-        Ok("powershell")
+fn detect_powershell_shell() -> std::io::Result<std::path::PathBuf> {
+    if let Some(shell) = resolve_command_path("pwsh") {
+        Ok(shell)
+    } else if let Some(shell) = resolve_command_path("powershell") {
+        Ok(shell)
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -5208,7 +7334,7 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
 
 #[allow(clippy::too_many_lines)]
 fn execute_shell_command(
-    shell: &str,
+    shell: &std::path::Path,
     command: &str,
     timeout: Option<u64>,
     run_in_background: Option<bool>,
@@ -5408,17 +7534,22 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, execute_agent_with_spawn,
-        execute_tool, final_assistant_text, global_cron_registry, global_lsp_registry,
-        global_mcp_registry, global_task_registry, global_team_registry, mvp_tool_specs,
+        agent_permission_policy, allowed_tools_for_subagent, browser_interact_tool_spec,
+        browser_observe_tool_spec, execute_agent_with_spawn, execute_tool,
+        execute_tool_with_enforcer, final_assistant_text, foundation_surface, foundation_surfaces,
+        global_cron_registry, global_lsp_registry, global_mcp_registry, global_task_registry,
+        global_team_registry, maybe_enforce_permission_check, mvp_tool_specs,
         persist_agent_terminal_state, push_output_block, AgentInput, AgentJob, AgentOutput,
-        GlobalToolRegistry, SubagentToolExecutor, SESSION_SERVER_URL_ENV,
-        THREAD_SERVER_INFO_FILENAME,
+        GlobalToolRegistry, SubagentToolExecutor, BROWSER_INTERACT_SUPPORTED_WAIT_KINDS,
+        BROWSER_INTERACT_TOOL_NAME, BROWSER_OBSERVE_SUPPORTED_WAIT_KINDS,
+        BROWSER_OBSERVE_TOOL_NAME, SESSION_SERVER_URL_ENV, THREAD_SERVER_INFO_FILENAME,
     };
     use api::OutputContentBlock;
+    use runtime::sandbox::{FilesystemIsolationMode, SandboxConfig};
     use runtime::{
-        ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, ConversationRuntime,
-        PermissionEnforcer, PermissionMode, PermissionPolicy, RuntimeError, Session,
+        ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
+        ConversationRuntime, PermissionEnforcer, PermissionMode, PermissionPolicy,
+        RuntimeBrowserControlConfig, RuntimeError, Session, ToolProfileBashPolicy,
     };
     use serde_json::{json, Value};
 
@@ -5438,6 +7569,313 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("openyak-tools-{unique}-{name}"))
+    }
+
+    fn full_access_enforcer(tool_name: &str) -> PermissionEnforcer {
+        PermissionEnforcer::new(
+            PermissionPolicy::new(PermissionMode::DangerFullAccess)
+                .with_tool_requirement(tool_name, PermissionMode::DangerFullAccess),
+        )
+    }
+
+    fn strict_bash_policy(
+        filesystem_mode: FilesystemIsolationMode,
+        network_isolation: bool,
+        allowed_mounts: &[&str],
+    ) -> ToolProfileBashPolicy {
+        ToolProfileBashPolicy {
+            sandbox: SandboxConfig {
+                enabled: Some(true),
+                namespace_restrictions: Some(true),
+                network_isolation: Some(network_isolation),
+                filesystem_mode: Some(filesystem_mode),
+                allowed_mounts: allowed_mounts
+                    .iter()
+                    .map(|mount| (*mount).to_string())
+                    .collect(),
+            },
+            allow_dangerously_disable_sandbox: false,
+        }
+    }
+
+    fn browser_control_config(root: &std::path::Path) -> RuntimeBrowserControlConfig {
+        RuntimeBrowserControlConfig::new(
+            true,
+            root.join(".openyak").join("artifacts").join("browser"),
+        )
+    }
+
+    fn browser_enabled_registry(root: &std::path::Path) -> GlobalToolRegistry {
+        GlobalToolRegistry::builtin()
+            .with_browser_control(browser_control_config(root))
+            .expect("browser registry should build")
+    }
+
+    fn write_browser_command_script(
+        dir: &std::path::Path,
+        name: &str,
+        windows_script: &str,
+        unix_script: &str,
+    ) -> PathBuf {
+        let path = if cfg!(windows) {
+            dir.join(format!("{name}.cmd"))
+        } else {
+            dir.join(name)
+        };
+        let script = if cfg!(windows) {
+            windows_script
+        } else {
+            unix_script
+        };
+        fs::write(&path, script).expect("fake browser should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&path)
+                .expect("fake browser metadata should load")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions)
+                .expect("fake browser permissions should update");
+        }
+        path
+    }
+
+    fn write_fake_browser_command(dir: &std::path::Path, name: &str) -> PathBuf {
+        write_browser_command_script(
+            dir,
+            name,
+            "@echo off\r\nsetlocal EnableDelayedExpansion\r\nfor %%A in (%*) do (\r\n  set \"ARG=%%~A\"\r\n  if /I \"!ARG:~0,13!\"==\"--screenshot=\" (\r\n    set \"SHOT=!ARG:~13!\"\r\n    type nul > \"!SHOT!\"\r\n  )\r\n)\r\necho ^<html^>^<head^>^<title^>Fake Browser^</title^>^</head^>^<body^>Hello Browser^</body^>^</html^>\r\n",
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --screenshot=*) touch \"${arg#--screenshot=}\" ;;\n  esac\ndone\nprintf '%s' '<html><head><title>Fake Browser</title></head><body>Hello Browser</body></html>'\n",
+        )
+    }
+
+    fn write_screenshot_failing_browser_command(dir: &std::path::Path, name: &str) -> PathBuf {
+        write_browser_command_script(
+            dir,
+            name,
+            "@echo off\r\nsetlocal EnableDelayedExpansion\r\nfor %%A in (%*) do (\r\n  set \"ARG=%%~A\"\r\n  if /I \"!ARG:~0,13!\"==\"--screenshot=\" (\r\n    >&2 echo screenshot failure\r\n    exit /b 9\r\n  )\r\n)\r\necho ^<html^>^<head^>^<title^>Fake Browser^</title^>^</head^>^<body^>Hello Browser^</body^>^</html^>\r\n",
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --screenshot=*) echo 'screenshot failure' >&2; exit 9 ;;\n  esac\ndone\nprintf '%s' '<html><head><title>Fake Browser</title></head><body>Hello Browser</body></html>'\n",
+        )
+    }
+
+    fn write_fake_browser_interact_command(dir: &std::path::Path, name: &str) -> PathBuf {
+        write_browser_command_script(
+            dir,
+            name,
+            "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset \"PORT=%OPENYAK_FAKE_BROWSER_PORT%\"\r\nset \"PROFILE=\"\r\nfor %%A in (%*) do (\r\n  set \"ARG=%%~A\"\r\n  if /I \"!ARG:~0,16!\"==\"--user-data-dir=\" set \"PROFILE=!ARG:~16!\"\r\n)\r\nif not defined PROFILE exit /b 7\r\n(\r\n  echo %PORT%\r\n  echo /devtools/browser/fake\r\n) > \"!PROFILE!\\DevToolsActivePort\"\r\ntimeout /t 15 /nobreak >nul\r\n",
+            "#!/bin/sh\nport=\"${OPENYAK_FAKE_BROWSER_PORT:?}\"\nprofile=\"\"\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --user-data-dir=*) profile=\"${arg#--user-data-dir=}\" ;;\n  esac\ndone\n[ -n \"$profile\" ] || exit 7\nprintf '%s\n/devtools/browser/fake\n' \"$port\" > \"$profile/DevToolsActivePort\"\nsleep 15\n",
+        )
+    }
+
+    struct FakeBrowserInteractServer {
+        port: u16,
+        join_handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeBrowserInteractServer {
+        #[allow(clippy::too_many_lines)]
+        fn start(requested_url: &str) -> Self {
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("fake browser listener");
+            let port = listener.local_addr().expect("listener addr").port();
+            let requested_url = requested_url.to_string();
+            let join_handle = std::thread::spawn(move || {
+                let websocket_path = "/devtools/page/fake-target";
+                loop {
+                    let (mut stream, _) = listener.accept().expect("fake browser accept");
+                    let request = read_fake_http_request(&mut stream);
+                    if request.starts_with("GET /json/list ") {
+                        let body = format!(
+                            "[{{\"id\":\"page-1\",\"type\":\"page\",\"url\":\"{requested_url}\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1:{port}{websocket_path}\"}}]"
+                        );
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("fake browser json/list response");
+                        continue;
+                    }
+                    if request.starts_with(&format!("GET {websocket_path} ")) {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: fake\r\n\r\n",
+                            )
+                            .expect("fake browser websocket handshake");
+                        let mut clicked = false;
+                        while let Some(message) = read_fake_ws_text(&mut stream) {
+                            let payload: Value =
+                                serde_json::from_str(&message).expect("cdp request json");
+                            let id = payload["id"].as_u64().expect("cdp request id");
+                            let method = payload["method"].as_str().expect("cdp request method");
+                            let response = match method {
+                                "Runtime.evaluate" => {
+                                    let expression = payload["params"]["expression"]
+                                        .as_str()
+                                        .expect("cdp expression");
+                                    if expression.contains("element.click()") {
+                                        clicked = true;
+                                        json!({
+                                            "id": id,
+                                            "result": {
+                                                "result": {
+                                                    "type": "object",
+                                                    "value": {
+                                                        "found": true,
+                                                        "clicked": true,
+                                                        "tag": "button",
+                                                        "text": "Sign in"
+                                                    }
+                                                }
+                                            }
+                                        })
+                                    } else if expression.contains("document.querySelector") {
+                                        json!({
+                                            "id": id,
+                                            "result": {
+                                                "result": {
+                                                    "type": "object",
+                                                    "value": {
+                                                        "found": true,
+                                                        "disabled": false,
+                                                        "tag": "button",
+                                                        "text": "Sign in"
+                                                    }
+                                                }
+                                            }
+                                        })
+                                    } else {
+                                        let state = if clicked {
+                                            json!({
+                                                "readyState": "complete",
+                                                "url": "https://example.test/dashboard",
+                                                "title": "Dashboard",
+                                                "visibleText": "Welcome back"
+                                            })
+                                        } else {
+                                            json!({
+                                                "readyState": "complete",
+                                                "url": requested_url,
+                                                "title": "Login",
+                                                "visibleText": "Sign in"
+                                            })
+                                        };
+                                        json!({
+                                            "id": id,
+                                            "result": {
+                                                "result": {
+                                                    "type": "object",
+                                                    "value": state
+                                                }
+                                            }
+                                        })
+                                    }
+                                }
+                                "Page.captureScreenshot" => {
+                                    json!({ "id": id, "result": { "data": "aGVsbG8=" } })
+                                }
+                                _ => json!({ "id": id, "result": {} }),
+                            };
+                            write_fake_ws_text(&mut stream, &response.to_string());
+                        }
+                        break;
+                    }
+                }
+            });
+            Self {
+                port,
+                join_handle: Some(join_handle),
+            }
+        }
+    }
+
+    impl Drop for FakeBrowserInteractServer {
+        fn drop(&mut self) {
+            if let Some(handle) = self.join_handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn read_fake_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            let read = stream.read(&mut byte).expect("fake browser http read");
+            if read == 0 {
+                break;
+            }
+            buffer.push(byte[0]);
+            if buffer.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(buffer).expect("fake browser http request should be utf8")
+    }
+
+    fn read_fake_ws_text(stream: &mut std::net::TcpStream) -> Option<String> {
+        let mut header = [0_u8; 2];
+        if stream.read_exact(&mut header).is_err() {
+            return None;
+        }
+        let opcode = header[0] & 0x0f;
+        let masked = header[1] & 0x80 != 0;
+        let mut payload_len = usize::from(header[1] & 0x7f);
+        if payload_len == 126 {
+            let mut extended = [0_u8; 2];
+            stream
+                .read_exact(&mut extended)
+                .expect("fake browser extended frame size");
+            payload_len = usize::from(u16::from_be_bytes(extended));
+        }
+        let mut mask_key = [0_u8; 4];
+        if masked {
+            stream
+                .read_exact(&mut mask_key)
+                .expect("fake browser websocket mask");
+        }
+        let mut payload = vec![0_u8; payload_len];
+        stream
+            .read_exact(&mut payload)
+            .expect("fake browser websocket payload");
+        if masked {
+            for (index, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask_key[index % mask_key.len()];
+            }
+        }
+        match opcode {
+            0x1 => Some(String::from_utf8(payload).expect("fake browser websocket text")),
+            _ => None,
+        }
+    }
+
+    fn write_fake_ws_text(stream: &mut std::net::TcpStream, payload: &str) {
+        let bytes = payload.as_bytes();
+        let mut frame = Vec::with_capacity(bytes.len() + 4);
+        frame.push(0x81);
+        match bytes.len() {
+            0..=125 => frame.push(
+                u8::try_from(bytes.len()).expect("small fake websocket payload should fit in u8"),
+            ),
+            126..=65535 => {
+                frame.push(126);
+                frame.extend_from_slice(
+                    &u16::try_from(bytes.len())
+                        .expect("medium fake websocket payload should fit in u16")
+                        .to_be_bytes(),
+                );
+            }
+            _ => panic!("fake websocket payload too large"),
+        }
+        frame.extend_from_slice(bytes);
+        stream
+            .write_all(&frame)
+            .expect("fake browser websocket response");
     }
 
     #[test]
@@ -5467,6 +7905,437 @@ mod tests {
     fn rejects_unknown_tool_names() {
         let error = execute_tool("nope", &json!({})).expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool"));
+    }
+
+    #[test]
+    fn browser_observe_allowlist_is_rejected_when_disabled() {
+        let error = GlobalToolRegistry::builtin()
+            .normalize_allowed_tools(&[String::from("BrowserObserve")])
+            .expect_err("disabled browser tool should be rejected");
+        assert!(error.contains("BrowserObserve is disabled"));
+    }
+
+    #[test]
+    fn browser_interact_allowlist_is_rejected_when_disabled() {
+        let error = GlobalToolRegistry::builtin()
+            .normalize_allowed_tools(&[String::from("BrowserInteract")])
+            .expect_err("disabled browser interact tool should be rejected");
+        assert!(error.contains("BrowserInteract is disabled"));
+    }
+
+    #[test]
+    fn browser_observe_remains_hidden_by_default_when_enabled() {
+        let root = temp_path("browser-hidden-default");
+        fs::create_dir_all(&root).expect("workspace should exist");
+        let registry = browser_enabled_registry(&root);
+        let names = registry
+            .definitions(None)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+
+        assert!(!names.iter().any(|name| name == BROWSER_OBSERVE_TOOL_NAME));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_observe_is_exposed_only_when_explicitly_allowed() {
+        let root = temp_path("browser-allowed");
+        fs::create_dir_all(&root).expect("workspace should exist");
+        let registry = browser_enabled_registry(&root);
+        let allowed = registry
+            .normalize_allowed_tools(&[String::from("BrowserObserve")])
+            .expect("allowlist should normalize")
+            .expect("allowlist should be present");
+
+        let names = registry
+            .definitions(Some(&allowed))
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == BROWSER_OBSERVE_TOOL_NAME));
+
+        let permission = registry
+            .permission_specs(Some(&allowed))
+            .into_iter()
+            .find(|(name, _)| name == BROWSER_OBSERVE_TOOL_NAME)
+            .expect("browser permission spec should exist");
+        assert_eq!(permission.1, PermissionMode::DangerFullAccess);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_interact_is_exposed_only_when_explicitly_allowed() {
+        let root = temp_path("browser-interact-allowed");
+        fs::create_dir_all(&root).expect("workspace should exist");
+        let registry = browser_enabled_registry(&root);
+        let allowed = registry
+            .normalize_allowed_tools(&[String::from("BrowserInteract")])
+            .expect("allowlist should normalize")
+            .expect("allowlist should be present");
+
+        let names = registry
+            .definitions(Some(&allowed))
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == BROWSER_INTERACT_TOOL_NAME));
+
+        let permission = registry
+            .permission_specs(Some(&allowed))
+            .into_iter()
+            .find(|(name, _)| name == BROWSER_INTERACT_TOOL_NAME)
+            .expect("browser interact permission spec should exist");
+        assert_eq!(permission.1, PermissionMode::DangerFullAccess);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_observe_rejects_interaction_fields() {
+        let root = temp_path("browser-schema");
+        fs::create_dir_all(&root).expect("workspace should exist");
+        let registry = browser_enabled_registry(&root);
+
+        let error = registry
+            .execute(
+                BROWSER_OBSERVE_TOOL_NAME,
+                &json!({
+                    "url": "https://example.test",
+                    "click": { "selector": "#ship" }
+                }),
+            )
+            .expect_err("unknown interaction field should fail");
+        assert!(error.contains("BrowserObserve rejected unsupported request shape"));
+        assert!(error.contains("unknown field `click`"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_observe_supports_text_and_title_wait_conditions() {
+        let _guard = env_lock().lock().expect("env lock should not be poisoned");
+        let root = temp_path("browser-observe-waits");
+        let browser_dir = root.join("browser-bin");
+        fs::create_dir_all(&browser_dir).expect("browser dir should exist");
+        write_fake_browser_command(&browser_dir, "msedge");
+
+        let original_path = std::env::var_os("PATH");
+        let original_dir = std::env::current_dir().expect("current dir");
+        let mut path_entries = vec![browser_dir.clone()];
+        if let Some(existing) = &original_path {
+            path_entries.extend(std::env::split_paths(existing));
+        }
+        let joined_path = std::env::join_paths(path_entries).expect("PATH should join");
+        std::env::set_var("PATH", &joined_path);
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let registry = browser_enabled_registry(&root);
+        let text_result = registry.execute(
+            BROWSER_OBSERVE_TOOL_NAME,
+            &json!({
+                "url": "https://example.test",
+                "wait": { "kind": "text", "value": "Hello Browser" }
+            }),
+        );
+        let title_result = registry.execute(
+            BROWSER_OBSERVE_TOOL_NAME,
+            &json!({
+                "url": "https://example.test",
+                "wait": { "kind": "title_contains", "value": "Fake Browser" }
+            }),
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+
+        let text_output: Value =
+            serde_json::from_str(&text_result.expect("text wait should succeed"))
+                .expect("text wait json");
+        assert_eq!(text_output["wait"]["kind"], "text");
+        assert_eq!(text_output["wait"]["status"], "satisfied");
+        assert_eq!(text_output["wait"]["expected"], "Hello Browser");
+        assert_eq!(text_output["load_outcome"], "loaded_after_wait_budget");
+
+        let title_output: Value =
+            serde_json::from_str(&title_result.expect("title wait should succeed"))
+                .expect("title wait json");
+        assert_eq!(title_output["wait"]["kind"], "title_contains");
+        assert_eq!(title_output["wait"]["status"], "satisfied");
+        assert_eq!(title_output["wait"]["expected"], "Fake Browser");
+        assert_eq!(title_output["title"], "Fake Browser");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_observe_reports_wait_shape_errors_explicitly() {
+        let root = temp_path("browser-wait-shape-errors");
+        fs::create_dir_all(&root).expect("workspace should exist");
+        let registry = browser_enabled_registry(&root);
+
+        let selector_error = registry
+            .execute(
+                BROWSER_OBSERVE_TOOL_NAME,
+                &json!({
+                    "url": "https://example.test",
+                    "wait": { "kind": "selector", "value": "#ship" }
+                }),
+            )
+            .expect_err("unsupported selector wait should fail");
+        assert!(selector_error.contains("wait.kind=selector is not supported"));
+
+        let missing_value_error = registry
+            .execute(
+                BROWSER_OBSERVE_TOOL_NAME,
+                &json!({
+                    "url": "https://example.test",
+                    "wait": { "kind": "text" }
+                }),
+            )
+            .expect_err("text wait without value should fail");
+        assert!(missing_value_error.contains("wait.kind=text requires a non-empty `value`"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_interact_reports_action_and_wait_shape_errors_explicitly() {
+        let root = temp_path("browser-interact-shape-errors");
+        fs::create_dir_all(&root).expect("workspace should exist");
+        let registry = browser_enabled_registry(&root);
+
+        let action_error = registry
+            .execute(
+                BROWSER_INTERACT_TOOL_NAME,
+                &json!({
+                    "url": "https://example.test",
+                    "action": { "kind": "type", "selector": "#email" }
+                }),
+            )
+            .expect_err("unsupported interaction kind should fail");
+        assert!(action_error.contains("action.kind=type is not supported"));
+
+        let wait_error = registry
+            .execute(
+                BROWSER_INTERACT_TOOL_NAME,
+                &json!({
+                    "url": "https://example.test",
+                    "action": { "kind": "click", "selector": "#sign-in" },
+                    "wait": { "kind": "network_idle" }
+                }),
+            )
+            .expect_err("unsupported interact wait should fail");
+        assert!(wait_error.contains("wait.kind=network_idle is not supported"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_tool_wait_schema_enums_match_slice_supported_kinds() {
+        let observe_spec = browser_observe_tool_spec();
+        let observe_wait_kinds = observe_spec.input_schema["properties"]["wait"]["properties"]
+            ["kind"]["enum"]
+            .as_array()
+            .expect("observe enum array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(observe_wait_kinds, BROWSER_OBSERVE_SUPPORTED_WAIT_KINDS);
+
+        let interact_spec = browser_interact_tool_spec();
+        let interact_wait_kinds = interact_spec.input_schema["properties"]["wait"]["properties"]
+            ["kind"]["enum"]
+            .as_array()
+            .expect("interact enum array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(interact_wait_kinds, BROWSER_INTERACT_SUPPORTED_WAIT_KINDS);
+    }
+
+    #[test]
+    fn browser_observe_runs_with_fake_browser_and_bounded_artifact_path() {
+        let _guard = env_lock().lock().expect("env lock should not be poisoned");
+        let root = temp_path("browser-observe");
+        let browser_dir = root.join("browser-bin");
+        fs::create_dir_all(&browser_dir).expect("browser dir should exist");
+        write_fake_browser_command(&browser_dir, "msedge");
+
+        let original_path = std::env::var_os("PATH");
+        let original_dir = std::env::current_dir().expect("current dir");
+        let mut path_entries = vec![browser_dir.clone()];
+        if let Some(existing) = &original_path {
+            path_entries.extend(std::env::split_paths(existing));
+        }
+        let joined_path = std::env::join_paths(path_entries).expect("PATH should join");
+        std::env::set_var("PATH", &joined_path);
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let registry = browser_enabled_registry(&root);
+        let execution = registry.execute(
+            BROWSER_OBSERVE_TOOL_NAME,
+            &json!({
+                "url": "https://example.test",
+                "wait": { "kind": "network_idle" },
+                "capture_visible_text": true,
+                "screenshot": { "capture": true, "format": "png" }
+            }),
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+
+        let result = execution.expect("BrowserObserve should succeed");
+
+        let output: Value = serde_json::from_str(&result).expect("browser output json");
+        assert_eq!(output["requested_url"], "https://example.test");
+        assert_eq!(output["title"], "Fake Browser");
+        assert_eq!(output["final_url"], Value::Null);
+        assert_eq!(output["load_outcome"], "loaded_after_network_idle_budget");
+        assert_eq!(output["wait"]["kind"], "network_idle");
+        assert_eq!(output["wait"]["status"], "satisfied");
+        assert!(output["visible_text"]
+            .as_str()
+            .expect("visible text")
+            .contains("Hello Browser"));
+        let relative_path = output["screenshot"]["relative_path"]
+            .as_str()
+            .expect("relative path");
+        assert!(relative_path.starts_with(".openyak/artifacts/browser/"));
+        assert_eq!(output["screenshot"]["file_name"], "observe.png");
+        assert_eq!(output["screenshot"]["media_type"], "image/png");
+        assert_eq!(
+            output["browser_runtime"]["capture_backend"],
+            "headless_cli_dump_dom"
+        );
+        assert!(output["timings_ms"]["total"].as_u64().is_some());
+        let artifact_path = root.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        assert!(artifact_path.is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_interact_runs_with_fake_browser_and_bounded_artifact_path() {
+        let _guard = env_lock().lock().expect("env lock should not be poisoned");
+        let root = temp_path("browser-interact");
+        let browser_dir = root.join("browser-bin");
+        fs::create_dir_all(&browser_dir).expect("browser dir should exist");
+        write_fake_browser_interact_command(&browser_dir, "msedge");
+        let server = FakeBrowserInteractServer::start("https://example.test/login");
+
+        let original_port = std::env::var_os("OPENYAK_FAKE_BROWSER_PORT");
+        let original_path = std::env::var_os("PATH");
+        let original_dir = std::env::current_dir().expect("current dir");
+        let mut path_entries = vec![browser_dir.clone()];
+        if let Some(existing) = &original_path {
+            path_entries.extend(std::env::split_paths(existing));
+        }
+        let joined_path = std::env::join_paths(path_entries).expect("PATH should join");
+        std::env::set_var("OPENYAK_FAKE_BROWSER_PORT", server.port.to_string());
+        std::env::set_var("PATH", &joined_path);
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let registry = browser_enabled_registry(&root);
+        let execution = registry.execute(
+            BROWSER_INTERACT_TOOL_NAME,
+            &json!({
+                "url": "https://example.test/login",
+                "action": { "kind": "click", "selector": "#sign-in" },
+                "wait": { "kind": "url_contains", "value": "/dashboard" },
+                "capture_visible_text": true,
+                "screenshot": { "capture": true, "format": "png" }
+            }),
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_port {
+            Some(value) => std::env::set_var("OPENYAK_FAKE_BROWSER_PORT", value),
+            None => std::env::remove_var("OPENYAK_FAKE_BROWSER_PORT"),
+        }
+        match original_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+
+        let result = execution.expect("BrowserInteract should succeed");
+        let output: Value = serde_json::from_str(&result).expect("browser interact output json");
+        assert_eq!(output["requested_url"], "https://example.test/login");
+        assert_eq!(output["final_url"], "https://example.test/dashboard");
+        assert_eq!(output["title"], "Dashboard");
+        assert_eq!(output["action"]["kind"], "click");
+        assert_eq!(output["action"]["selector"], "#sign-in");
+        assert_eq!(output["action"]["status"], "performed");
+        assert_eq!(output["wait"]["kind"], "url_contains");
+        assert_eq!(output["wait"]["status"], "satisfied");
+        assert_eq!(output["wait"]["expected"], "/dashboard");
+        assert!(output["visible_text"]
+            .as_str()
+            .expect("visible text")
+            .contains("Welcome back"));
+        assert_eq!(
+            output["browser_runtime"]["capture_backend"],
+            "headless_cdp_single_call"
+        );
+        let relative_path = output["screenshot"]["relative_path"]
+            .as_str()
+            .expect("relative path");
+        assert!(relative_path.starts_with(".openyak/artifacts/browser/"));
+        assert_eq!(output["screenshot"]["file_name"], "interact.png");
+        let artifact_path = root.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        assert!(artifact_path.is_file());
+        assert_eq!(fs::read(&artifact_path).expect("artifact bytes"), b"hello");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_observe_labels_screenshot_failures_by_phase() {
+        let _guard = env_lock().lock().expect("env lock should not be poisoned");
+        let root = temp_path("browser-observe-screenshot-failure");
+        let browser_dir = root.join("browser-bin");
+        fs::create_dir_all(&browser_dir).expect("browser dir should exist");
+        write_screenshot_failing_browser_command(&browser_dir, "msedge");
+
+        let original_path = std::env::var_os("PATH");
+        let original_dir = std::env::current_dir().expect("current dir");
+        let mut path_entries = vec![browser_dir.clone()];
+        if let Some(existing) = &original_path {
+            path_entries.extend(std::env::split_paths(existing));
+        }
+        let joined_path = std::env::join_paths(path_entries).expect("PATH should join");
+        std::env::set_var("PATH", &joined_path);
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let registry = browser_enabled_registry(&root);
+        let execution = registry.execute(
+            BROWSER_OBSERVE_TOOL_NAME,
+            &json!({
+                "url": "https://example.test",
+                "screenshot": { "capture": true, "format": "png" }
+            }),
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+
+        let error = execution.expect_err("screenshot capture should fail");
+        assert!(error.contains("BrowserObserve screenshot capture failed with status 9"));
+        assert!(error.contains("screenshot failure"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6756,7 +9625,6 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        #[cfg(not(windows))]
         let dir = {
             let dir = std::env::temp_dir().join(format!(
                 "openyak-pwsh-bin-{}",
@@ -6769,18 +9637,16 @@ mod tests {
             let script = stub_powershell_path(&dir);
             write_stub_powershell(&script);
             let original_path = std::env::var_os("PATH");
-            let mut path_entries = vec![dir.clone()];
-            if let Some(value) = original_path.as_ref() {
-                path_entries.extend(std::env::split_paths(value));
-            }
-            let combined_path = std::env::join_paths(path_entries).expect("join PATH");
-            std::env::set_var("PATH", &combined_path);
+            std::env::set_var("PATH", dir.display().to_string());
             (dir, original_path)
         };
 
+        // Keep this test focused on PowerShell tool behavior instead of
+        // failing on colder Windows shell startup jitter.
+        let timeout_ms = if cfg!(windows) { 5_000 } else { 1_000 };
         let result = execute_tool(
             "PowerShell",
-            &json!({"command": "Write-Output hello", "timeout": 1000}),
+            &json!({"command": "Write-Output hello", "timeout": timeout_ms}),
         )
         .expect("PowerShell should succeed");
 
@@ -6790,7 +9656,6 @@ mod tests {
         )
         .expect("PowerShell background should succeed");
 
-        #[cfg(not(windows))]
         {
             let (dir, original_path) = dir;
             match original_path {
@@ -6801,14 +9666,13 @@ mod tests {
         }
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        #[cfg(windows)]
-        assert!(output["stdout"]
-            .as_str()
-            .expect("stdout")
-            .replace("\r\n", "\n")
-            .contains("hello"));
-        #[cfg(not(windows))]
-        assert_eq!(output["stdout"], "stub:Write-Output hello");
+        assert_eq!(
+            output["stdout"]
+                .as_str()
+                .expect("stdout")
+                .replace("\r\n", "\n"),
+            "stub:Write-Output hello\n"
+        );
         let stderr = output["stderr"].as_str().expect("stderr");
         assert!(!stderr.contains("PowerShell executable not found"));
 
@@ -6853,6 +9717,11 @@ mod tests {
         dir.join("pwsh")
     }
 
+    #[cfg(windows)]
+    fn stub_powershell_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("pwsh.cmd")
+    }
+
     #[cfg(not(windows))]
     fn write_stub_powershell(path: &std::path::Path) {
         std::fs::write(
@@ -6865,6 +9734,15 @@ mod tests {
             .arg(path)
             .status()
             .expect("chmod");
+    }
+
+    #[cfg(windows)]
+    fn write_stub_powershell(path: &std::path::Path) {
+        std::fs::write(
+            path,
+            "@echo off\r\nsetlocal EnableDelayedExpansion\r\n:loop\r\nif \"%~1\"==\"\" exit /b 1\r\nset \"ARG=%~1\"\r\nif /I \"!ARG!\"==\"-Command\" (\r\n  shift\r\n  goto emit\r\n)\r\nshift\r\ngoto loop\r\n:emit\r\necho stub:%~1\r\nexit /b 0\r\n",
+        )
+        .expect("write script");
     }
 
     #[test]
@@ -7412,6 +10290,55 @@ mod tests {
         assert!(names.contains(&"ListMcpServers"));
         assert!(names.contains(&"ListMcpTools"));
         assert!(names.contains(&"MCP"));
+    }
+
+    #[test]
+    fn foundation_surface_inventory_stays_aligned_with_current_families() {
+        let surfaces = foundation_surfaces();
+        assert_eq!(surfaces.len(), 5);
+        assert_eq!(surfaces[0].key, "task");
+        assert_eq!(surfaces[1].key, "team");
+        assert_eq!(surfaces[2].key, "cron");
+        assert_eq!(surfaces[3].key, "lsp");
+        assert_eq!(surfaces[4].key, "mcp");
+
+        let task = foundation_surface("task").expect("task surface");
+        assert_eq!(
+            task.tool_names,
+            &[
+                "TaskCreate",
+                "TaskGet",
+                "TaskList",
+                "TaskStop",
+                "TaskUpdate",
+                "TaskOutput",
+                "TaskWait",
+            ]
+        );
+        assert_eq!(
+            task.backing_model,
+            "process_local_v1 current-runtime registry"
+        );
+
+        let lsp = foundation_surface("lsp").expect("lsp surface");
+        assert_eq!(lsp.tool_names, &["LSP"]);
+        assert!(lsp
+            .boundary_note
+            .contains("not a standalone openyak lsp host"));
+
+        let mcp = foundation_surface("mcp").expect("mcp surface");
+        assert_eq!(
+            mcp.tool_names,
+            &[
+                "ListMcpServers",
+                "ListMcpTools",
+                "ListMcpResources",
+                "ReadMcpResource",
+                "McpAuth",
+                "MCP",
+            ]
+        );
+        assert!(mcp.adjacent_scope.expect("mcp scope note").contains("MB5"));
     }
 
     #[test]
@@ -8053,5 +10980,84 @@ mod tests {
             .expect_err("dangerous bash command should be denied");
         assert!(workspace_write_error.contains("danger-full-access"));
         assert!(workspace_write_error.contains("destructive shell pattern"));
+    }
+
+    #[test]
+    fn bash_tool_profile_blocks_disable_sandbox_widening_before_execution() {
+        let enforcer = full_access_enforcer("bash");
+        let error = execute_tool_with_enforcer(
+            Some(&enforcer),
+            Some(&strict_bash_policy(
+                FilesystemIsolationMode::WorkspaceOnly,
+                false,
+                &["logs"],
+            )),
+            None,
+            "bash",
+            &json!({
+                "command": "printf hi",
+                "dangerouslyDisableSandbox": true
+            }),
+        )
+        .expect_err("tool profile should block disabling the sandbox");
+
+        assert!(error.contains("cannot disable the active tool-profile sandbox policy"));
+    }
+
+    #[test]
+    fn bash_tool_profile_allows_narrowing_mount_subset() {
+        let enforcer = full_access_enforcer("bash");
+        let input = BashCommandInput {
+            command: "printf hi".to_string(),
+            timeout: None,
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(true),
+            isolate_network: None,
+            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            allowed_mounts: Some(vec!["logs".to_string()]),
+        };
+
+        let result = maybe_enforce_permission_check(
+            Some(&enforcer),
+            Some(&strict_bash_policy(
+                FilesystemIsolationMode::WorkspaceOnly,
+                false,
+                &["logs", "tmp/cache"],
+            )),
+            "bash",
+            Some(&input),
+            &json!({
+                "command": "printf hi",
+                "allowedMounts": ["logs"]
+            }),
+        );
+
+        assert!(result.is_ok(), "subset mounts should remain allowed");
+    }
+
+    #[test]
+    fn powershell_permission_checks_ignore_bash_tool_profile_rules() {
+        let enforcer = full_access_enforcer("PowerShell");
+        let result = maybe_enforce_permission_check(
+            Some(&enforcer),
+            Some(&strict_bash_policy(
+                FilesystemIsolationMode::AllowList,
+                true,
+                &["logs"],
+            )),
+            "PowerShell",
+            None,
+            &json!({
+                "command": "Write-Output hello",
+                "dangerouslyDisableSandbox": true
+            }),
+        );
+
+        assert!(
+            result.is_ok(),
+            "PowerShell should remain governed by permission mode only in this slice"
+        );
     }
 }

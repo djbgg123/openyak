@@ -35,6 +35,11 @@ impl PermissionMode {
             }
         }
     }
+
+    #[must_use]
+    pub fn encompasses(self, required_mode: Self) -> bool {
+        self.auto_allows(required_mode)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

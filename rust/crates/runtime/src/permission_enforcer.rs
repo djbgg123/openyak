@@ -6,6 +6,7 @@
 use crate::bash_validation::{validate_bash_command, BashCommandValidation};
 use crate::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome")]
@@ -121,21 +122,72 @@ impl PermissionEnforcer {
     }
 }
 
-/// Simple workspace boundary check via string prefix.
+/// Workspace boundary check that keeps canonical root semantics for missing targets.
 fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
-    let normalized = if path.starts_with('/') {
-        path.to_owned()
+    let workspace_root = Path::new(workspace_root);
+    let canonical_root = normalize_comparable_path(
+        &workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_root.to_path_buf()),
+    );
+    let candidate = normalize_comparable_path(&resolve_write_target_path(path, workspace_root));
+    candidate == canonical_root || candidate.starts_with(&canonical_root)
+}
+
+fn resolve_write_target_path(path: &str, workspace_root: &Path) -> PathBuf {
+    let candidate = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
     } else {
-        format!("{workspace_root}/{path}")
+        workspace_root.join(path)
     };
 
-    let root = if workspace_root.ends_with('/') {
-        workspace_root.to_owned()
-    } else {
-        format!("{workspace_root}/")
-    };
+    if let Ok(canonical) = candidate.canonicalize() {
+        return canonical;
+    }
 
-    normalized.starts_with(&root) || normalized == workspace_root.trim_end_matches('/')
+    if let Some(parent) = candidate.parent() {
+        let canonical_parent = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        if let Some(name) = candidate.file_name() {
+            return canonical_parent.join(name);
+        }
+    }
+
+    candidate
+}
+
+#[cfg(windows)]
+fn normalize_comparable_path(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let mut normalized = PathBuf::new();
+
+    if let Some(Component::Prefix(prefix)) = components.next() {
+        match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => normalized.push(format!("{}:", char::from(drive))),
+            Prefix::VerbatimUNC(server, share) => {
+                normalized.push(format!(
+                    r"\\{}\{}",
+                    server.to_string_lossy(),
+                    share.to_string_lossy()
+                ));
+            }
+            _ => normalized.push(prefix.as_os_str()),
+        }
+    }
+
+    for component in components {
+        normalized.push(component.as_os_str());
+    }
+
+    normalized
+}
+
+#[cfg(not(windows))]
+fn normalize_comparable_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 /// Conservative helper: would read-only mode allow this command?
@@ -150,10 +202,22 @@ fn is_read_only_command(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_enforcer(mode: PermissionMode) -> PermissionEnforcer {
         let policy = PermissionPolicy::new(mode);
         PermissionEnforcer::new(policy)
+    }
+
+    fn temp_workspace(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("openyak-permissions-{name}-{unique}"));
+        fs::create_dir_all(&root).expect("temp workspace should create");
+        root
     }
 
     #[test]
@@ -222,14 +286,28 @@ mod tests {
     #[test]
     fn workspace_write_allows_within_workspace() {
         let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
-        let result = enforcer.check_file_write("/workspace/src/main.rs", "/workspace");
+        let workspace = temp_workspace("within");
+        let result = enforcer.check_file_write(
+            workspace.join("src/main.rs").to_string_lossy().as_ref(),
+            workspace.to_string_lossy().as_ref(),
+        );
+        let _ = fs::remove_dir_all(&workspace);
         assert_eq!(result, EnforcementResult::Allowed);
     }
 
     #[test]
     fn workspace_write_denies_outside_workspace() {
         let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
-        let result = enforcer.check_file_write("/etc/passwd", "/workspace");
+        let workspace = temp_workspace("outside");
+        let outside = workspace
+            .parent()
+            .expect("temp dir parent")
+            .join("outside.txt");
+        let result = enforcer.check_file_write(
+            outside.to_string_lossy().as_ref(),
+            workspace.to_string_lossy().as_ref(),
+        );
+        let _ = fs::remove_dir_all(&workspace);
         assert!(matches!(result, EnforcementResult::Denied { .. }));
     }
 
@@ -277,10 +355,35 @@ mod tests {
 
     #[test]
     fn workspace_boundary_check() {
-        assert!(is_within_workspace("/workspace/src/main.rs", "/workspace"));
-        assert!(is_within_workspace("/workspace", "/workspace"));
-        assert!(!is_within_workspace("/etc/passwd", "/workspace"));
-        assert!(!is_within_workspace("/workspacex/hack", "/workspace"));
+        let workspace = temp_workspace("boundary");
+        let sibling = workspace.parent().expect("temp dir parent").join(format!(
+            "{}-sibling",
+            workspace
+                .file_name()
+                .expect("workspace name")
+                .to_string_lossy()
+        ));
+        fs::create_dir_all(&sibling).expect("sibling dir should create");
+
+        assert!(is_within_workspace(
+            workspace.join("src/main.rs").to_string_lossy().as_ref(),
+            workspace.to_string_lossy().as_ref()
+        ));
+        assert!(is_within_workspace(
+            workspace.to_string_lossy().as_ref(),
+            workspace.to_string_lossy().as_ref()
+        ));
+        assert!(!is_within_workspace(
+            sibling.join("hack.txt").to_string_lossy().as_ref(),
+            workspace.to_string_lossy().as_ref()
+        ));
+        assert!(!is_within_workspace(
+            format!("..{}outside.txt", std::path::MAIN_SEPARATOR).as_str(),
+            workspace.to_string_lossy().as_ref()
+        ));
+
+        let _ = fs::remove_dir_all(&workspace);
+        let _ = fs::remove_dir_all(&sibling);
     }
 
     #[test]
@@ -359,11 +462,25 @@ mod tests {
     fn workspace_write_relative_path_resolved() {
         // given
         let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
+        let workspace = temp_workspace("relative");
 
         // when
-        let result = enforcer.check_file_write("src/main.rs", "/workspace");
+        let result = enforcer.check_file_write("src/main.rs", workspace.to_string_lossy().as_ref());
 
         // then
+        let _ = fs::remove_dir_all(&workspace);
+        assert_eq!(result, EnforcementResult::Allowed);
+    }
+
+    #[test]
+    fn workspace_write_allows_nested_relative_path_with_missing_parent_dirs() {
+        let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
+        let workspace = temp_workspace("relative-nested");
+
+        let result =
+            enforcer.check_file_write("generated/output.txt", workspace.to_string_lossy().as_ref());
+
+        let _ = fs::remove_dir_all(&workspace);
         assert_eq!(result, EnforcementResult::Allowed);
     }
 
@@ -371,24 +488,50 @@ mod tests {
     fn workspace_root_with_trailing_slash() {
         // given
         let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
+        let workspace = temp_workspace("trailing");
+        let workspace_with_sep = format!(
+            "{}{}",
+            workspace.to_string_lossy(),
+            std::path::MAIN_SEPARATOR
+        );
 
         // when
-        let result = enforcer.check_file_write("/workspace/src/main.rs", "/workspace/");
+        let result = enforcer.check_file_write(
+            workspace.join("src/main.rs").to_string_lossy().as_ref(),
+            &workspace_with_sep,
+        );
 
         // then
+        let _ = fs::remove_dir_all(&workspace);
         assert_eq!(result, EnforcementResult::Allowed);
     }
 
     #[test]
     fn workspace_root_equality() {
         // given
-        let root = "/workspace/";
+        let root = temp_workspace("root-equality");
 
         // when
-        let equal_to_root = is_within_workspace("/workspace", root);
+        let equal_to_root = is_within_workspace(
+            root.to_string_lossy().as_ref(),
+            root.to_string_lossy().as_ref(),
+        );
 
         // then
+        let _ = fs::remove_dir_all(&root);
         assert!(equal_to_root);
+    }
+
+    #[test]
+    fn workspace_write_denies_relative_traversal_outside_workspace() {
+        let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
+        let workspace = temp_workspace("traversal");
+        let escape = format!("..{}outside.txt", std::path::MAIN_SEPARATOR);
+
+        let result = enforcer.check_file_write(&escape, workspace.to_string_lossy().as_ref());
+
+        let _ = fs::remove_dir_all(&workspace);
+        assert!(matches!(result, EnforcementResult::Denied { .. }));
     }
 
     #[test]

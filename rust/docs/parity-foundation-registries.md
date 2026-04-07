@@ -12,6 +12,7 @@
 
 - 先把 foundation registry contract 冻结，再继续做 operator-facing surface。
 - 先补状态模型和可观测接口，再决定是否扩到更重的控制面。
+- 现在已经有 `openyak foundations [family]` / `openyak /foundations [family]` 作为只读 discovery surface，用于解释当前五族的 shipped boundary。
 - `openyak server` 当前只提供窄化的本地 thread/session surface；更宽的 user-facing server / control-plane surfacing 仍放在后续 milestone。
 
 ## Registry V1 contract（已冻结）

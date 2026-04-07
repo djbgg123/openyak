@@ -67,6 +67,18 @@ pub struct BashCommandOutput {
 }
 
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
+    let cwd = env::current_dir()?;
+    let config = ConfigLoader::default_for(&cwd).load().map_or_else(
+        |_| SandboxConfig::default(),
+        |runtime_config| runtime_config.sandbox().clone(),
+    );
+    execute_bash_with_config(input, &config)
+}
+
+pub fn execute_bash_with_config(
+    input: BashCommandInput,
+    sandbox_config: &SandboxConfig,
+) -> io::Result<BashCommandOutput> {
     if let BashCommandValidation::Deny(denial) = crate::bash_validation::validate_bash_command(
         &input.command,
         PermissionMode::DangerFullAccess,
@@ -75,7 +87,7 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     }
 
     let cwd = env::current_dir()?;
-    let sandbox_status = sandbox_status_for_input(&input, &cwd);
+    let sandbox_status = sandbox_status_for_input(&input, &cwd, sandbox_config);
 
     if input.run_in_background.unwrap_or(false) {
         let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false);
@@ -173,11 +185,11 @@ async fn execute_bash_async(
     })
 }
 
-fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
-    let config = ConfigLoader::default_for(cwd).load().map_or_else(
-        |_| SandboxConfig::default(),
-        |runtime_config| runtime_config.sandbox().clone(),
-    );
+fn sandbox_status_for_input(
+    input: &BashCommandInput,
+    cwd: &std::path::Path,
+    config: &SandboxConfig,
+) -> SandboxStatus {
     let request = config.resolve_request(
         input.dangerously_disable_sandbox.map(|disabled| !disabled),
         input.namespace_restrictions,

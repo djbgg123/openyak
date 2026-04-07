@@ -26,9 +26,10 @@ mod skill_registry;
 mod skills;
 mod task_registry;
 mod team_cron_registry;
+mod tool_profile;
 mod usage;
 
-pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
+pub use bash::{execute_bash, execute_bash_with_config, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use compact::{
     compact_session, estimate_session_tokens, format_compact_summary,
@@ -39,9 +40,9 @@ pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
-    OAuthConfigOverride, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
-    RuntimeHookConfig, RuntimePluginConfig, RuntimeSkillConfig, ScopedMcpServerConfig,
-    OPENYAK_SETTINGS_SCHEMA_NAME,
+    OAuthConfigOverride, ResolvedPermissionMode, RuntimeBrowserControlConfig, RuntimeConfig,
+    RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, RuntimeSkillConfig,
+    ScopedMcpServerConfig, OPENYAK_SETTINGS_SCHEMA_NAME,
 };
 pub use conversation::{
     ApiClient, ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, StaticToolExecutor,
@@ -127,6 +128,9 @@ pub use skills::{
 };
 pub use task_registry::{Task, TaskMessage, TaskRegistry, TaskStatus};
 pub use team_cron_registry::{CronEntry, CronRegistry, Team, TeamRegistry, TeamStatus};
+pub use tool_profile::{
+    resolved_permission_mode_to_permission_mode, ToolProfileBashPolicy, ToolProfileConfig,
+};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };

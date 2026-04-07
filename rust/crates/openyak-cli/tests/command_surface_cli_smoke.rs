@@ -30,8 +30,10 @@ fn openyak_root_and_subcommand_help_cover_verified_surface() {
         "openyak init",
         "openyak onboard",
         "openyak doctor",
+        "openyak foundations",
         "openyak package-release",
         "openyak server",
+        "--tool-profile NAME",
     ] {
         assert!(
             root_help.contains(marker),
@@ -40,7 +42,10 @@ fn openyak_root_and_subcommand_help_cover_verified_surface() {
     }
 
     for (args, expected) in [
-        (vec!["prompt", "--help"], "Usage: openyak prompt <text>"),
+        (
+            vec!["prompt", "--help"],
+            "Usage: openyak prompt [--tool-profile NAME] <text>",
+        ),
         (
             vec!["dump-manifests", "--help"],
             "Usage: openyak dump-manifests",
@@ -61,6 +66,10 @@ fn openyak_root_and_subcommand_help_cover_verified_surface() {
         (vec!["onboard", "--help"], "Usage: openyak onboard"),
         (vec!["doctor", "--help"], "Usage: openyak doctor"),
         (
+            vec!["foundations", "--help"],
+            "Usage: openyak foundations [task|team|cron|lsp|mcp]",
+        ),
+        (
             vec!["package-release", "--help"],
             "Usage: openyak package-release",
         ),
@@ -72,6 +81,36 @@ fn openyak_root_and_subcommand_help_cover_verified_surface() {
             "expected `{expected}` in help output, got:\n{output}"
         );
     }
+    assert!(
+        root_help.contains(
+            "hidden BrowserObserve/BrowserInteract still require browserControl.enabled=true"
+        ),
+        "{root_help}"
+    );
+    assert!(
+        root_help.contains(
+            "openyak --permission-mode danger-full-access --allowedTools BrowserObserve prompt"
+        ),
+        "{root_help}"
+    );
+    assert!(
+        root_help.contains(
+            "openyak --permission-mode danger-full-access --allowedTools BrowserInteract prompt"
+        ),
+        "{root_help}"
+    );
+
+    let prompt_help = sandbox.run_success(&["prompt", "--help"]);
+    assert!(
+        prompt_help.contains("Use --tool-profile to apply a named local tool-profile ceiling"),
+        "{prompt_help}"
+    );
+    assert!(
+        prompt_help.contains(
+            "Hidden optional browser tools such as BrowserObserve and BrowserInteract still require browserControl.enabled=true plus explicit --allowedTools BrowserObserve or --allowedTools BrowserInteract"
+        ),
+        "{prompt_help}"
+    );
 }
 
 #[test]
@@ -124,6 +163,18 @@ fn openyak_direct_commands_match_verified_smoke_paths() {
     assert!(sandbox.workspace.join("OPENYAK.md").is_file());
     assert!(sandbox.workspace.join(".openyak.json").is_file());
     assert!(sandbox.workspace.join(".openyak").is_dir());
+
+    let foundations = sandbox.run_success(&["foundations"]);
+    assert!(foundations.contains("Foundations"), "{foundations}");
+    assert!(foundations.contains("TaskCreate"), "{foundations}");
+    assert!(foundations.contains("process_local_v1"), "{foundations}");
+
+    let foundations_task = sandbox.run_success(&["foundations", "task"]);
+    assert!(
+        foundations_task.contains("Family           task"),
+        "{foundations_task}"
+    );
+    assert!(foundations_task.contains("TaskWait"), "{foundations_task}");
 }
 
 #[test]
@@ -221,6 +272,7 @@ fn openyak_skills_lifecycle_uses_packaged_registry_with_temp_config_home() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn openyak_direct_slash_entry_and_resume_safe_commands_work_from_persisted_session() {
     let _guard = env_lock();
     let sandbox = CliSandbox::new("openyak-resume-flow");
@@ -230,6 +282,22 @@ fn openyak_direct_slash_entry_and_resume_safe_commands_work_from_persisted_sessi
 
     let slash_skills = sandbox.run_success(&["/skills"]);
     assert!(slash_skills.contains("No skills found."), "{slash_skills}");
+
+    let slash_foundations = sandbox.run_success(&["/foundations"]);
+    assert!(
+        slash_foundations.contains("Foundations"),
+        "{slash_foundations}"
+    );
+    assert!(
+        slash_foundations.contains("TaskCreate"),
+        "{slash_foundations}"
+    );
+
+    let slash_foundations_task = sandbox.run_success(&["/foundations", "task"]);
+    assert!(
+        slash_foundations_task.contains("Family           task"),
+        "{slash_foundations_task}"
+    );
 
     let slash_skills_help = sandbox.run_success(&["/skills", "help"]);
     assert!(
@@ -264,6 +332,8 @@ fn openyak_direct_slash_entry_and_resume_safe_commands_work_from_persisted_sessi
         "/config".to_string(),
         "env".to_string(),
         "/memory".to_string(),
+        "/foundations".to_string(),
+        "mcp".to_string(),
         "/version".to_string(),
         "/agents".to_string(),
         "/skills".to_string(),
@@ -284,6 +354,11 @@ fn openyak_direct_slash_entry_and_resume_safe_commands_work_from_persisted_sessi
         "{resume_output}"
     );
     assert!(resume_output.contains("Memory"), "{resume_output}");
+    assert!(
+        resume_output.contains("Family           mcp"),
+        "{resume_output}"
+    );
+    assert!(resume_output.contains("ListMcpServers"), "{resume_output}");
     assert!(resume_output.contains("openyak"), "{resume_output}");
     assert!(
         resume_output.contains("No agents found."),

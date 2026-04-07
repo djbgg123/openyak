@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 
 use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
+use crate::tool_profile::{ToolProfileBashPolicy, ToolProfileConfig};
 use serde_json::{Map as JsonMap, Value as JsonSerdeValue};
 
 pub const OPENYAK_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
+const DEFAULT_BROWSER_ARTIFACTS_DIR: &str = ".openyak/artifacts/browser";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigSource {
@@ -50,12 +52,20 @@ pub struct RuntimeSkillConfig {
     registry_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeBrowserControlConfig {
+    enabled: bool,
+    artifacts_dir: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeFeatureConfig {
     hooks: RuntimeHookConfig,
     plugins: RuntimePluginConfig,
     skills: RuntimeSkillConfig,
     mcp: McpConfigCollection,
+    tool_profiles: BTreeMap<String, ToolProfileConfig>,
+    browser_control: RuntimeBrowserControlConfig,
     oauth: Option<OAuthConfig>,
     oauth_override: Option<OAuthConfigOverride>,
     model: Option<String>,
@@ -235,6 +245,15 @@ impl From<std::io::Error> for ConfigError {
     }
 }
 
+impl Default for RuntimeBrowserControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            artifacts_dir: PathBuf::from(DEFAULT_BROWSER_ARTIFACTS_DIR),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigLoader {
     cwd: PathBuf,
@@ -323,6 +342,8 @@ impl ConfigLoader {
             mcp: McpConfigCollection {
                 servers: mcp_servers,
             },
+            tool_profiles: parse_optional_tool_profiles(&merged_value)?,
+            browser_control: parse_optional_browser_control(&merged_value, &self.cwd)?,
             oauth: oauth_override
                 .as_ref()
                 .and_then(OAuthConfigOverride::resolved),
@@ -415,6 +436,16 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn tool_profiles(&self) -> &BTreeMap<String, ToolProfileConfig> {
+        &self.feature_config.tool_profiles
+    }
+
+    #[must_use]
+    pub fn browser_control(&self) -> &RuntimeBrowserControlConfig {
+        &self.feature_config.browser_control
+    }
+
+    #[must_use]
     pub fn oauth_override(&self) -> Option<&OAuthConfigOverride> {
         self.feature_config.oauth_override.as_ref()
     }
@@ -472,6 +503,16 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn mcp(&self) -> &McpConfigCollection {
         &self.mcp
+    }
+
+    #[must_use]
+    pub fn tool_profiles(&self) -> &BTreeMap<String, ToolProfileConfig> {
+        &self.tool_profiles
+    }
+
+    #[must_use]
+    pub fn browser_control(&self) -> &RuntimeBrowserControlConfig {
+        &self.browser_control
     }
 
     #[must_use]
@@ -543,6 +584,26 @@ impl RuntimeSkillConfig {
     #[must_use]
     pub fn registry_path(&self) -> Option<&str> {
         self.registry_path.as_deref()
+    }
+}
+
+impl RuntimeBrowserControlConfig {
+    #[must_use]
+    pub fn new(enabled: bool, artifacts_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            enabled,
+            artifacts_dir: artifacts_dir.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub fn artifacts_dir(&self) -> &Path {
+        &self.artifacts_dir
     }
 }
 
@@ -765,6 +826,110 @@ fn parse_optional_skill_config(root: &JsonValue) -> Result<RuntimeSkillConfig, C
     })
 }
 
+fn parse_optional_tool_profiles(
+    root: &JsonValue,
+) -> Result<BTreeMap<String, ToolProfileConfig>, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(profiles_value) = object.get("toolProfiles") else {
+        return Ok(BTreeMap::new());
+    };
+    let profiles = expect_object(profiles_value, "merged settings.toolProfiles")?;
+    let mut parsed = BTreeMap::new();
+
+    for (profile_id, profile_value) in profiles {
+        let context = format!("merged settings.toolProfiles.{profile_id}");
+        let profile = expect_object(profile_value, &context)?;
+        let permission_mode = optional_string(profile, "permissionMode", &context)?
+            .ok_or_else(|| ConfigError::Parse(format!("{context}: missing field permissionMode")))
+            .and_then(|value| {
+                parse_permission_mode_label(value, &format!("{context}.permissionMode"))
+            })?;
+        let allowed_tools = optional_string_array(profile, "allowedTools", &context)?
+            .ok_or_else(|| ConfigError::Parse(format!("{context}: missing field allowedTools")))?;
+        let bash_policy = parse_optional_tool_profile_bash_policy(profile, &context)?;
+        parsed.insert(
+            profile_id.clone(),
+            ToolProfileConfig {
+                description: optional_string(profile, "description", &context)?.map(str::to_string),
+                permission_mode,
+                allowed_tools,
+                bash_policy,
+            },
+        );
+    }
+
+    Ok(parsed)
+}
+
+fn parse_optional_browser_control(
+    root: &JsonValue,
+    workspace_root: &Path,
+) -> Result<RuntimeBrowserControlConfig, ConfigError> {
+    let default_config = default_browser_control_config(workspace_root)?;
+    let Some(object) = root.as_object() else {
+        return Ok(default_config);
+    };
+    let Some(browser_value) = object.get("browserControl") else {
+        return Ok(default_config);
+    };
+    let browser = expect_object(browser_value, "merged settings.browserControl")?;
+    let enabled =
+        optional_bool(browser, "enabled", "merged settings.browserControl")?.unwrap_or(false);
+    let artifacts_dir = optional_string(browser, "artifactsDir", "merged settings.browserControl")?
+        .map_or(Ok(default_config.artifacts_dir().to_path_buf()), |value| {
+            resolve_workspace_bound_path(
+                workspace_root,
+                value,
+                "merged settings.browserControl.artifactsDir",
+            )
+        })?;
+
+    Ok(RuntimeBrowserControlConfig {
+        enabled,
+        artifacts_dir,
+    })
+}
+
+fn default_browser_control_config(
+    workspace_root: &Path,
+) -> Result<RuntimeBrowserControlConfig, ConfigError> {
+    Ok(RuntimeBrowserControlConfig::new(
+        false,
+        resolve_workspace_bound_path(
+            workspace_root,
+            DEFAULT_BROWSER_ARTIFACTS_DIR,
+            "merged settings.browserControl.artifactsDir",
+        )?,
+    ))
+}
+
+fn parse_optional_tool_profile_bash_policy(
+    profile: &BTreeMap<String, JsonValue>,
+    context: &str,
+) -> Result<Option<ToolProfileBashPolicy>, ConfigError> {
+    let Some(policy_value) = profile.get("bashPolicy") else {
+        return Ok(None);
+    };
+    let policy_context = format!("{context}.bashPolicy");
+    let policy = expect_object(policy_value, &policy_context)?;
+    let sandbox_context = format!("{policy_context}.sandbox");
+    let sandbox = policy
+        .get("sandbox")
+        .ok_or_else(|| ConfigError::Parse(format!("{policy_context}: missing field sandbox")))
+        .and_then(|value| parse_sandbox_config_value(value, &sandbox_context))?;
+    Ok(Some(ToolProfileBashPolicy {
+        sandbox,
+        allow_dangerously_disable_sandbox: optional_bool(
+            policy,
+            "allowDangerouslyDisableSandbox",
+            &policy_context,
+        )?
+        .unwrap_or(false),
+    }))
+}
+
 fn parse_optional_permission_mode(
     root: &JsonValue,
 ) -> Result<Option<ResolvedPermissionMode>, ConfigError> {
@@ -806,22 +971,84 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
     let Some(sandbox_value) = object.get("sandbox") else {
         return Ok(SandboxConfig::default());
     };
-    let sandbox = expect_object(sandbox_value, "merged settings.sandbox")?;
-    let filesystem_mode = optional_string(sandbox, "filesystemMode", "merged settings.sandbox")?
-        .map(parse_filesystem_mode_label)
-        .transpose()?;
-    Ok(SandboxConfig {
-        enabled: optional_bool(sandbox, "enabled", "merged settings.sandbox")?,
-        namespace_restrictions: optional_bool(
-            sandbox,
-            "namespaceRestrictions",
-            "merged settings.sandbox",
-        )?,
-        network_isolation: optional_bool(sandbox, "networkIsolation", "merged settings.sandbox")?,
-        filesystem_mode,
-        allowed_mounts: optional_string_array(sandbox, "allowedMounts", "merged settings.sandbox")?
-            .unwrap_or_default(),
-    })
+    parse_sandbox_config_value(sandbox_value, "merged settings.sandbox")
+}
+
+fn resolve_workspace_bound_path(
+    workspace_root: &Path,
+    value: &str,
+    context: &str,
+) -> Result<PathBuf, ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::Parse(format!(
+            "{context}: path must not be empty"
+        )));
+    }
+
+    let path = PathBuf::from(value);
+    let joined = if path.is_absolute() {
+        path
+    } else {
+        workspace_root.join(path)
+    };
+    let normalized_workspace = normalize_virtual_path(workspace_root);
+    let normalized_path = normalize_virtual_path(&joined);
+    if !normalized_path.starts_with(&normalized_workspace) {
+        return Err(ConfigError::Parse(format!(
+            "{context}: resolved path must stay inside the workspace root {}",
+            workspace_root.display()
+        )));
+    }
+    let canonical_workspace = workspace_root.canonicalize().map_err(|error| {
+        ConfigError::Parse(format!(
+            "{context}: failed to canonicalize workspace root {}: {error}",
+            workspace_root.display()
+        ))
+    })?;
+    let existing_ancestor = deepest_existing_ancestor(&normalized_path).ok_or_else(|| {
+        ConfigError::Parse(format!(
+            "{context}: could not resolve an existing ancestor under workspace root {}",
+            workspace_root.display()
+        ))
+    })?;
+    let canonical_ancestor = existing_ancestor.canonicalize().map_err(|error| {
+        ConfigError::Parse(format!(
+            "{context}: failed to canonicalize existing ancestor {}: {error}",
+            existing_ancestor.display()
+        ))
+    })?;
+    if !canonical_ancestor.starts_with(&canonical_workspace) {
+        return Err(ConfigError::Parse(format!(
+            "{context}: resolved path must stay inside the workspace root {}",
+            workspace_root.display()
+        )));
+    }
+    Ok(normalized_path)
+}
+
+fn deepest_existing_ancestor(path: &Path) -> Option<&Path> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn normalize_virtual_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
@@ -833,6 +1060,24 @@ fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, C
             "merged settings.sandbox.filesystemMode: unsupported filesystem mode {other}"
         ))),
     }
+}
+
+fn parse_sandbox_config_value(
+    value: &JsonValue,
+    context: &str,
+) -> Result<SandboxConfig, ConfigError> {
+    let sandbox = expect_object(value, context)?;
+    let filesystem_mode = optional_string(sandbox, "filesystemMode", context)?
+        .map(parse_filesystem_mode_label)
+        .transpose()?;
+    Ok(SandboxConfig {
+        enabled: optional_bool(sandbox, "enabled", context)?,
+        namespace_restrictions: optional_bool(sandbox, "namespaceRestrictions", context)?,
+        network_isolation: optional_bool(sandbox, "networkIsolation", context)?,
+        filesystem_mode,
+        allowed_mounts: optional_string_array(sandbox, "allowedMounts", context)?
+            .unwrap_or_default(),
+    })
 }
 
 fn parse_optional_oauth_override_config(
@@ -1103,6 +1348,7 @@ mod tests {
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
     use std::fs;
+    use std::io;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> std::path::PathBuf {
@@ -1111,6 +1357,17 @@ mod tests {
             .expect("time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("runtime-config-{nanos}"))
+    }
+
+    fn create_test_dir_symlink(link: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link)
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
     }
 
     #[test]
@@ -1242,6 +1499,224 @@ mod tests {
             Some(FilesystemIsolationMode::AllowList)
         );
         assert_eq!(loaded.sandbox().allowed_mounts, vec!["logs", "tmp/cache"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn browser_control_defaults_to_disabled_with_workspace_bounded_artifacts_dir() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".openyak");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(!loaded.browser_control().enabled());
+        assert_eq!(
+            loaded.browser_control().artifacts_dir(),
+            &cwd.join(".openyak").join("artifacts").join("browser")
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_browser_control_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".openyak");
+        fs::create_dir_all(cwd.join(".openyak")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            cwd.join(".openyak").join("settings.local.json"),
+            r#"{
+              "browserControl": {
+                "enabled": true,
+                "artifactsDir": "tmp/browser-output"
+              }
+            }"#,
+        )
+        .expect("write local settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(loaded.browser_control().enabled());
+        assert_eq!(
+            loaded.browser_control().artifacts_dir(),
+            &cwd.join("tmp").join("browser-output")
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_browser_control_artifacts_dir_outside_workspace() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".openyak");
+        fs::create_dir_all(cwd.join(".openyak")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            cwd.join(".openyak").join("settings.local.json"),
+            r#"{
+              "browserControl": {
+                "enabled": true,
+                "artifactsDir": "../escape"
+              }
+            }"#,
+        )
+        .expect("write local settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+        assert!(error
+            .to_string()
+            .contains("resolved path must stay inside the workspace root"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_browser_control_artifacts_dir_through_symlinked_parent() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".openyak");
+        let outside = root.join("outside-artifacts");
+        fs::create_dir_all(cwd.join(".openyak")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&outside).expect("outside dir");
+
+        let symlink_path = cwd.join("linked-artifacts");
+        match create_test_dir_symlink(&symlink_path, &outside) {
+            Ok(()) => {}
+            Err(_error) if cfg!(windows) => {
+                let _ = fs::remove_dir_all(root);
+                return;
+            }
+            Err(error) => panic!("create test symlink: {error}"),
+        }
+
+        fs::write(
+            cwd.join(".openyak").join("settings.local.json"),
+            r#"{
+              "browserControl": {
+                "enabled": true,
+                "artifactsDir": "linked-artifacts/browser-output"
+              }
+            }"#,
+        )
+        .expect("write local settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+        assert!(error
+            .to_string()
+            .contains("resolved path must stay inside the workspace root"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_malformed_browser_control_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".openyak");
+        fs::create_dir_all(cwd.join(".openyak")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            cwd.join(".openyak").join("settings.local.json"),
+            r#"{
+              "browserControl": true
+            }"#,
+        )
+        .expect("write local settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+        assert!(error
+            .to_string()
+            .contains("merged settings.browserControl: expected JSON object"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_tool_profiles_and_bash_policy() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".openyak");
+        fs::create_dir_all(cwd.join(".openyak")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            cwd.join(".openyak").join("settings.local.json"),
+            r#"{
+              "toolProfiles": {
+                "audit": {
+                  "description": "Local audit profile",
+                  "permissionMode": "workspace-write",
+                  "allowedTools": ["read_file", "glob_search", "bash"],
+                  "bashPolicy": {
+                    "sandbox": {
+                      "enabled": true,
+                      "namespaceRestrictions": true,
+                      "networkIsolation": true,
+                      "filesystemMode": "workspace-only",
+                      "allowedMounts": ["logs", "tmp/cache"]
+                    },
+                    "allowDangerouslyDisableSandbox": false
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("write local settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let profile = loaded
+            .tool_profiles()
+            .get("audit")
+            .expect("tool profile should exist");
+
+        assert_eq!(profile.description.as_deref(), Some("Local audit profile"));
+        assert_eq!(
+            profile.permission_mode,
+            ResolvedPermissionMode::WorkspaceWrite
+        );
+        assert_eq!(
+            profile.allowed_tools,
+            vec!["read_file", "glob_search", "bash"]
+        );
+        let bash_policy = profile
+            .bash_policy
+            .as_ref()
+            .expect("bash policy should exist");
+        assert_eq!(bash_policy.sandbox.enabled, Some(true));
+        assert_eq!(bash_policy.sandbox.namespace_restrictions, Some(true));
+        assert_eq!(bash_policy.sandbox.network_isolation, Some(true));
+        assert_eq!(
+            bash_policy.sandbox.filesystem_mode,
+            Some(FilesystemIsolationMode::WorkspaceOnly)
+        );
+        assert_eq!(
+            bash_policy.sandbox.allowed_mounts,
+            vec!["logs", "tmp/cache"]
+        );
+        assert!(!bash_policy.allow_dangerously_disable_sandbox);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

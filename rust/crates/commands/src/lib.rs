@@ -305,6 +305,14 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         category: SlashCommandCategory::Automation,
     },
     SlashCommandSpec {
+        name: "foundations",
+        aliases: &[],
+        summary: "Explain shipped Task/Team/Cron/LSP/MCP foundations",
+        argument_hint: Some("[family]"),
+        resume_supported: true,
+        category: SlashCommandCategory::Automation,
+    },
+    SlashCommandSpec {
         name: "skills",
         aliases: &[],
         summary: "List or manage local skills",
@@ -368,6 +376,9 @@ pub enum SlashCommand {
         section: Option<String>,
     },
     Memory,
+    Foundations {
+        family: Option<String>,
+    },
     Init,
     Diff,
     Version,
@@ -454,6 +465,9 @@ impl SlashCommand {
                 section: parts.next().map(ToOwned::to_owned),
             },
             "memory" => Self::Memory,
+            "foundations" => Self::Foundations {
+                family: remainder_after_command(trimmed, command),
+            },
             "init" => Self::Init,
             "diff" => Self::Diff,
             "version" => Self::Version,
@@ -2302,6 +2316,7 @@ pub fn handle_slash_command(
         | SlashCommand::Resume { .. }
         | SlashCommand::Config { .. }
         | SlashCommand::Memory
+        | SlashCommand::Foundations { .. }
         | SlashCommand::Init
         | SlashCommand::Diff
         | SlashCommand::Version
@@ -2619,6 +2634,16 @@ mod tests {
             })
         );
         assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory));
+        assert_eq!(
+            SlashCommand::parse("/foundations"),
+            Some(SlashCommand::Foundations { family: None })
+        );
+        assert_eq!(
+            SlashCommand::parse("/foundations mcp"),
+            Some(SlashCommand::Foundations {
+                family: Some("mcp".to_string())
+            })
+        );
         assert_eq!(SlashCommand::parse("/init"), Some(SlashCommand::Init));
         assert_eq!(SlashCommand::parse("/diff"), Some(SlashCommand::Diff));
         assert_eq!(SlashCommand::parse("/version"), Some(SlashCommand::Version));
@@ -2695,6 +2720,7 @@ mod tests {
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
         assert!(help.contains("/memory"));
+        assert!(help.contains("/foundations [family]"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
         assert!(help.contains("/version"));
@@ -2705,9 +2731,10 @@ mod tests {
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents"));
+        assert!(help.contains("/foundations [family]"));
         assert!(help.contains("/skills"));
-        assert_eq!(slash_command_specs().len(), 29);
-        assert_eq!(resume_supported_slash_commands().len(), 13);
+        assert_eq!(slash_command_specs().len(), 30);
+        assert_eq!(resume_supported_slash_commands().len(), 14);
     }
 
     #[test]
@@ -2815,6 +2842,9 @@ mod tests {
         assert!(handle_slash_command("/config", &session, CompactionConfig::default()).is_none());
         assert!(
             handle_slash_command("/config env", &session, CompactionConfig::default()).is_none()
+        );
+        assert!(
+            handle_slash_command("/foundations", &session, CompactionConfig::default()).is_none()
         );
         assert!(handle_slash_command("/diff", &session, CompactionConfig::default()).is_none());
         assert!(handle_slash_command("/version", &session, CompactionConfig::default()).is_none());

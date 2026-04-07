@@ -42,17 +42,25 @@ use runtime::{
     ConversationRuntime, MessageRole, OAuthAuthorizationRequest, OAuthConfig,
     OAuthTokenExchangeRequest, PendingUserInputRequest, PermissionMode, PermissionPolicy,
     ProjectContext, RuntimeError, Session, SessionAccountingStatus, TokenUsage, ToolError,
-    ToolExecutor, UsageTracker, UserInputOutcome, UserInputPrompter, UserInputRequest,
-    UserInputResponse,
+    ToolExecutor, ToolProfileBashPolicy, UsageTracker, UserInputOutcome, UserInputPrompter,
+    UserInputRequest, UserInputResponse,
 };
 use serde_json::json;
-use tools::{mvp_tool_specs, GlobalToolRegistry};
+use tools::{
+    foundation_surface, foundation_surfaces, mvp_tool_specs, FoundationSurface, GlobalToolRegistry,
+};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_SERVER_BIND: &str = "127.0.0.1:3000";
 const DEFAULT_RELEASE_OUTPUT_DIR: &str = "dist";
 const REQUEST_USER_INPUT_TOOL_NAME: &str = "openyak_request_user_input";
 const REQUEST_USER_INPUT_PROMPT: &str = "answer> ";
+const BROWSER_OBSERVE_TOOL_NAME: &str = "BrowserObserve";
+const BROWSER_INTERACT_TOOL_NAME: &str = "BrowserInteract";
+
+fn is_hidden_browser_tool_name(name: &str) -> bool {
+    matches!(name, BROWSER_OBSERVE_TOOL_NAME | BROWSER_INTERACT_TOOL_NAME)
+}
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -69,6 +77,37 @@ const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const THREAD_SERVER_INFO_FILENAME: &str = "thread-server.json";
 
 type AllowedToolSet = BTreeSet<String>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct RequestedExecutionPolicy {
+    permission_mode: Option<PermissionMode>,
+    allowed_tools: Option<AllowedToolSet>,
+    tool_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveToolProfile {
+    id: String,
+    permission_mode: PermissionMode,
+    allowed_tools: AllowedToolSet,
+    bash_policy: Option<ToolProfileBashPolicy>,
+}
+
+impl ActiveToolProfile {
+    #[must_use]
+    fn bash_policy_summary(&self) -> Option<String> {
+        self.bash_policy
+            .as_ref()
+            .map(ToolProfileBashPolicy::summary)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveCliPolicy {
+    permission_mode: PermissionMode,
+    allowed_tools: Option<AllowedToolSet>,
+    active_tool_profile: Option<ActiveToolProfile>,
+}
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -294,12 +333,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             prompt,
             model,
             output_format,
-            allowed_tools,
-            permission_mode,
+            requested_policy,
         } => {
             let cwd = env::current_dir()?;
             let model = resolve_effective_model(model.as_deref(), &cwd)?;
-            LiveCli::new(model, true, allowed_tools, permission_mode)?
+            let effective_policy = resolve_requested_execution_policy(&cwd, requested_policy)?;
+            LiveCli::new(model, true, effective_policy)?
                 .run_turn_with_output(&prompt, output_format)?;
         }
         CliAction::Login => run_login()?,
@@ -310,18 +349,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
         } => onboard::run_onboard(model.as_deref(), output_format)?,
         CliAction::Doctor => run_doctor()?,
+        CliAction::Foundations { family } => print_foundations(family.as_deref())?,
         CliAction::PackageRelease { binary, output_dir } => {
             run_package_release(binary.as_deref(), &output_dir)?;
         }
         CliAction::Server { bind } => run_server(&bind)?,
         CliAction::Repl {
             model,
-            allowed_tools,
-            permission_mode,
+            requested_policy,
         } => {
             let cwd = env::current_dir()?;
             let model = resolve_effective_model(model.as_deref(), &cwd)?;
-            run_repl(model, allowed_tools, permission_mode)?;
+            let effective_policy = resolve_requested_execution_policy(&cwd, requested_policy)?;
+            run_repl(model, effective_policy)?;
         }
         CliAction::Help(topic) => print_help(topic),
     }
@@ -351,8 +391,7 @@ enum CliAction {
         prompt: String,
         model: Option<String>,
         output_format: CliOutputFormat,
-        allowed_tools: Option<AllowedToolSet>,
-        permission_mode: PermissionMode,
+        requested_policy: RequestedExecutionPolicy,
     },
     Login,
     Logout,
@@ -362,6 +401,9 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Doctor,
+    Foundations {
+        family: Option<String>,
+    },
     PackageRelease {
         binary: Option<PathBuf>,
         output_dir: PathBuf,
@@ -371,8 +413,7 @@ enum CliAction {
     },
     Repl {
         model: Option<String>,
-        allowed_tools: Option<AllowedToolSet>,
-        permission_mode: PermissionMode,
+        requested_policy: RequestedExecutionPolicy,
     },
     // prompt-mode formatting is only supported for non-interactive runs
     Help(HelpTopic),
@@ -389,6 +430,7 @@ enum HelpTopic {
     Init,
     Onboard,
     Doctor,
+    Foundations,
     PackageRelease,
     Server,
     Prompt,
@@ -416,9 +458,10 @@ impl CliOutputFormat {
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model = None;
     let mut output_format = CliOutputFormat::Text;
-    let mut permission_mode = default_permission_mode();
+    let mut requested_permission_mode = None;
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
+    let mut tool_profile = None;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -455,7 +498,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --permission-mode".to_string())?;
-                permission_mode = parse_permission_mode_arg(value)?;
+                requested_permission_mode = Some(parse_permission_mode_arg(value)?);
                 index += 2;
             }
             flag if flag.starts_with("--output-format=") => {
@@ -463,11 +506,47 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             flag if flag.starts_with("--permission-mode=") => {
-                permission_mode = parse_permission_mode_arg(&flag[18..])?;
+                requested_permission_mode = Some(parse_permission_mode_arg(&flag[18..])?);
                 index += 1;
             }
             "--dangerously-skip-permissions" => {
-                permission_mode = PermissionMode::DangerFullAccess;
+                requested_permission_mode = Some(PermissionMode::DangerFullAccess);
+                index += 1;
+            }
+            "--tool-profile" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --tool-profile".to_string())?;
+                if value.trim().is_empty() {
+                    return Err("missing value for --tool-profile".to_string());
+                }
+                tool_profile = Some(value.trim().to_string());
+                index += 2;
+            }
+            flag if flag.starts_with("--tool-profile=") => {
+                let value = flag[15..].trim();
+                if value.is_empty() {
+                    return Err("missing value for --tool-profile".to_string());
+                }
+                tool_profile = Some(value.to_string());
+                index += 1;
+            }
+            "--toolProfile" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --toolProfile".to_string())?;
+                if value.trim().is_empty() {
+                    return Err("missing value for --toolProfile".to_string());
+                }
+                tool_profile = Some(value.trim().to_string());
+                index += 2;
+            }
+            flag if flag.starts_with("--toolProfile=") => {
+                let value = flag[14..].trim();
+                if value.is_empty() {
+                    return Err("missing value for --toolProfile".to_string());
+                }
+                tool_profile = Some(value.to_string());
                 index += 1;
             }
             "-p" => {
@@ -487,8 +566,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     prompt,
                     model,
                     output_format,
-                    allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
-                    permission_mode,
+                    requested_policy: RequestedExecutionPolicy {
+                        permission_mode: requested_permission_mode,
+                        allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
+                        tool_profile,
+                    },
                 });
             }
             "--print" => {
@@ -530,8 +612,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if rest.is_empty() {
         return Ok(CliAction::Repl {
             model,
-            allowed_tools,
-            permission_mode,
+            requested_policy: RequestedExecutionPolicy {
+                permission_mode: requested_permission_mode,
+                allowed_tools,
+                tool_profile,
+            },
         });
     }
     if matches!(rest.first().map(String::as_str), Some("--help" | "-h")) {
@@ -565,6 +650,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "init" => Ok(CliAction::Init),
         "onboard" => parse_onboard_args(&rest[1..], model, output_format),
         "doctor" => parse_doctor_args(&rest[1..]),
+        "foundations" => parse_foundations_args(&rest[1..]),
         "package-release" => parse_package_release_args(&rest[1..]),
         "server" => parse_server_args(&rest[1..]),
         "prompt" => {
@@ -583,8 +669,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 prompt,
                 model,
                 output_format,
-                allowed_tools,
-                permission_mode,
+                requested_policy: RequestedExecutionPolicy {
+                    permission_mode: requested_permission_mode,
+                    allowed_tools,
+                    tool_profile,
+                },
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(&rest),
@@ -592,8 +681,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             prompt: rest.join(" "),
             model,
             output_format,
-            allowed_tools,
-            permission_mode,
+            requested_policy: RequestedExecutionPolicy {
+                permission_mode: requested_permission_mode,
+                allowed_tools,
+                tool_profile,
+            },
         }),
     }
 }
@@ -602,6 +694,51 @@ fn join_optional_args(args: &[String]) -> Option<String> {
     let joined = args.join(" ");
     let trimmed = joined.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn foundations_family_names() -> String {
+    foundation_surfaces()
+        .iter()
+        .map(|surface| surface.key)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn unknown_foundations_family_error(family: &str) -> String {
+    format!(
+        "unknown foundations family: {family} (expected one of: {})",
+        foundations_family_names()
+    )
+}
+
+fn canonical_foundations_family(family: &str) -> Result<String, String> {
+    let normalized = family.trim().to_ascii_lowercase();
+    foundation_surface(&normalized)
+        .map(|surface| surface.key.to_string())
+        .ok_or_else(|| unknown_foundations_family_error(family))
+}
+
+fn require_foundation_surface(family: &str) -> Result<&'static FoundationSurface, String> {
+    foundation_surface(family).ok_or_else(|| unknown_foundations_family_error(family))
+}
+
+fn parse_foundations_args(args: &[String]) -> Result<CliAction, String> {
+    if args.is_empty() {
+        return Ok(CliAction::Foundations { family: None });
+    }
+    if is_help_args(args) {
+        return Ok(CliAction::Help(HelpTopic::Foundations));
+    }
+    if args.len() != 1 {
+        return Err(format!(
+            "unexpected foundations arguments: {}",
+            args.join(" ")
+        ));
+    }
+    let family = canonical_foundations_family(&args[0])?;
+    Ok(CliAction::Foundations {
+        family: Some(family),
+    })
 }
 
 fn parse_server_args(args: &[String]) -> Result<CliAction, String> {
@@ -711,6 +848,12 @@ fn parse_direct_slash_cli_action(rest: &[String]) -> Result<CliAction, String> {
         Some(SlashCommand::Help) => Ok(CliAction::Help(HelpTopic::Root)),
         Some(SlashCommand::Agents { args }) => Ok(CliAction::Agents { args }),
         Some(SlashCommand::Skills { args }) => Ok(CliAction::Skills { args }),
+        Some(SlashCommand::Foundations { family }) => Ok(CliAction::Foundations {
+            family: family
+                .as_deref()
+                .map(canonical_foundations_family)
+                .transpose()?,
+        }),
         Some(command) => Err(format_direct_slash_command_error(
             match &command {
                 SlashCommand::Unknown(name) => format!("/{name}"),
@@ -763,15 +906,32 @@ fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, 
     }
 }
 
+fn normalize_profile_allowed_tools(
+    tool_registry: &GlobalToolRegistry,
+    values: &[String],
+) -> Result<AllowedToolSet, String> {
+    if values.is_empty() {
+        return Ok(AllowedToolSet::new());
+    }
+    tool_registry
+        .normalize_allowed_tools(values)?
+        .ok_or_else(|| "tool profile allowedTools unexpectedly resolved to none".to_string())
+}
+
 fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
     let cwd = env::current_dir().map_err(|error| error.to_string())?;
-    let loader = ConfigLoader::default_for(&cwd);
+    tool_registry_for_cwd(&cwd)
+}
+
+fn tool_registry_for_cwd(cwd: &Path) -> Result<GlobalToolRegistry, String> {
+    let loader = ConfigLoader::default_for(cwd);
     let runtime_config = loader.load().map_err(|error| error.to_string())?;
-    let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+    let plugin_manager = build_plugin_manager(cwd, &loader, &runtime_config);
     let plugin_tools = plugin_manager
         .aggregated_tools()
         .map_err(|error| error.to_string())?;
-    GlobalToolRegistry::with_plugin_tools(plugin_tools)
+    GlobalToolRegistry::with_plugin_tools(plugin_tools)?
+        .with_browser_control(runtime_config.browser_control().clone())
 }
 
 fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
@@ -799,6 +959,93 @@ fn default_permission_mode() -> PermissionMode {
         .as_deref()
         .and_then(normalize_permission_mode)
         .map_or(PermissionMode::DangerFullAccess, permission_mode_from_label)
+}
+
+fn resolve_requested_execution_policy(
+    cwd: &Path,
+    requested: RequestedExecutionPolicy,
+) -> Result<EffectiveCliPolicy, String> {
+    let tool_registry = tool_registry_for_cwd(cwd)?;
+    let loader = ConfigLoader::default_for(cwd);
+    let runtime_config = loader.load().map_err(|error| error.to_string())?;
+
+    let Some(profile_id) = requested.tool_profile.as_deref() else {
+        return Ok(EffectiveCliPolicy {
+            permission_mode: requested
+                .permission_mode
+                .unwrap_or_else(default_permission_mode),
+            allowed_tools: requested.allowed_tools,
+            active_tool_profile: None,
+        });
+    };
+
+    let available = runtime_config
+        .tool_profiles()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let profile = runtime_config
+        .tool_profiles()
+        .get(profile_id)
+        .ok_or_else(|| {
+            format!("unknown tool profile: {profile_id} (expected one of: {available})")
+        })?;
+    let profile_mode = profile.permission_mode();
+    let explicit_mode = requested.permission_mode.unwrap_or(profile_mode);
+    if !profile_mode.encompasses(explicit_mode) {
+        return Err(format!(
+            "tool profile `{profile_id}` does not allow --permission-mode {} above its {} ceiling",
+            explicit_mode.as_str(),
+            profile_mode.as_str()
+        ));
+    }
+
+    let profile_allowed_tools =
+        normalize_profile_allowed_tools(&tool_registry, &profile.allowed_tools)?;
+    for (tool_name, required_permission) in
+        tool_registry.permission_specs(Some(&profile_allowed_tools))
+    {
+        if !profile_mode.encompasses(required_permission) {
+            return Err(format!(
+                "tool profile `{profile_id}` cannot enable `{tool_name}` because it requires {} while the profile ceiling is {}",
+                required_permission.as_str(),
+                profile_mode.as_str()
+            ));
+        }
+    }
+
+    let effective_allowed_tools = if let Some(explicit_allowed_tools) = requested.allowed_tools {
+        let outside_ceiling = explicit_allowed_tools
+            .difference(&profile_allowed_tools)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !outside_ceiling.is_empty() {
+            return Err(format!(
+                "tool profile `{profile_id}` does not allow requested tools: {}",
+                outside_ceiling.join(", ")
+            ));
+        }
+        Some(
+            profile_allowed_tools
+                .intersection(&explicit_allowed_tools)
+                .cloned()
+                .collect(),
+        )
+    } else {
+        Some(profile_allowed_tools.clone())
+    };
+
+    Ok(EffectiveCliPolicy {
+        permission_mode: explicit_mode,
+        allowed_tools: effective_allowed_tools,
+        active_tool_profile: Some(ActiveToolProfile {
+            id: profile_id.to_string(),
+            permission_mode: profile_mode,
+            allowed_tools: profile_allowed_tools,
+            bash_policy: profile.bash_policy.clone(),
+        }),
+    })
 }
 
 fn request_user_input_tool_definition() -> ToolDefinition {
@@ -1060,6 +1307,65 @@ fn print_bootstrap_plan() {
     for phase in runtime::BootstrapPlan::openyak_default().phases() {
         println!("- {phase:?}");
     }
+}
+
+fn print_foundations(family: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "{}",
+        render_foundations_report(family).map_err(io::Error::other)?
+    );
+    Ok(())
+}
+
+fn render_foundations_report(family: Option<&str>) -> Result<String, String> {
+    match family {
+        None => Ok(render_foundations_inventory()),
+        Some(family) => render_foundation_detail(family),
+    }
+}
+
+fn render_foundations_inventory() -> String {
+    let mut lines = vec![
+        "Foundations".to_string(),
+        "  Surface          read-only operator discovery".to_string(),
+        "  Direct CLI       openyak foundations [task|team|cron|lsp|mcp]".to_string(),
+        "  Slash            /foundations [family]".to_string(),
+        "  Scope            current Task / Team / Cron / LSP / MCP families only".to_string(),
+        "  Note             this surface explains current boundaries; it does not create a new control plane".to_string(),
+    ];
+
+    for surface in foundation_surfaces() {
+        lines.push(String::new());
+        lines.push(surface.key.to_ascii_uppercase());
+        lines.push(format!("  Access           {}", surface.access_type));
+        lines.push(format!("  Backing          {}", surface.backing_model));
+        lines.push(format!(
+            "  Tools            {}",
+            surface.tool_names.join(", ")
+        ));
+        lines.push(format!("  Boundary         {}", surface.boundary_note));
+    }
+
+    lines.join("\n")
+}
+
+fn render_foundation_detail(family: &str) -> Result<String, String> {
+    let surface = require_foundation_surface(family)?;
+
+    let mut lines = vec![
+        "Foundations".to_string(),
+        format!("  Family           {}", surface.key),
+        format!("  Summary          {}", surface.summary),
+        format!("  Access           {}", surface.access_type),
+        format!("  Backing          {}", surface.backing_model),
+        format!("  Tools            {}", surface.tool_names.join(", ")),
+        format!("  Boundary         {}", surface.boundary_note),
+        format!("  Not promised     {}", surface.not_promised),
+    ];
+    if let Some(adjacent_scope) = surface.adjacent_scope {
+        lines.push(format!("  Adjacent scope   {adjacent_scope}"));
+    }
+    Ok(lines.join("\n"))
 }
 
 pub(crate) fn configured_oauth_config(
@@ -2269,6 +2575,7 @@ fn run_resume_command(
                     },
                     default_permission_mode().as_str(),
                     None,
+                    None,
                     &status_context_for_mode(Some(session_path), true)?,
                 )),
             })
@@ -2287,6 +2594,10 @@ fn run_resume_command(
         SlashCommand::Memory => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_memory_report()?),
+        }),
+        SlashCommand::Foundations { family } => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_foundations_report(family.as_deref()).map_err(io::Error::other)?),
         }),
         SlashCommand::Init => Ok(ResumeCommandOutcome {
             session: session.clone(),
@@ -2348,10 +2659,9 @@ fn run_resume_command(
 
 fn run_repl(
     model: String,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
+    effective_policy: EffectiveCliPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(model, true, effective_policy)?;
     let mut editor = input::LineEditor::new("> ", slash_command_completion_candidates());
     println!("{}", cli.startup_banner());
 
@@ -2404,6 +2714,7 @@ struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    active_tool_profile: Option<ActiveToolProfile>,
     plan_restore_mode: Option<PermissionMode>,
     system_prompt: Vec<String>,
     runtime: ConversationRuntime<DefaultRuntimeClient, CliToolExecutor>,
@@ -2414,8 +2725,7 @@ impl LiveCli {
     fn new(
         model: String,
         enable_tools: bool,
-        allowed_tools: Option<AllowedToolSet>,
-        permission_mode: PermissionMode,
+        effective_policy: EffectiveCliPolicy,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt(&model)?;
         let session = create_managed_session_handle()?;
@@ -2425,14 +2735,16 @@ impl LiveCli {
             system_prompt.clone(),
             enable_tools,
             true,
-            allowed_tools.clone(),
-            permission_mode,
+            effective_policy.allowed_tools.clone(),
+            effective_policy.permission_mode,
+            effective_policy.active_tool_profile.clone(),
             None,
         )?;
         let cli = Self {
             model,
-            allowed_tools,
-            permission_mode,
+            allowed_tools: effective_policy.allowed_tools,
+            permission_mode: effective_policy.permission_mode,
+            active_tool_profile: effective_policy.active_tool_profile,
             plan_restore_mode: None,
             system_prompt,
             runtime,
@@ -2482,6 +2794,16 @@ impl LiveCli {
             format!("  Directory        {cwd_display}"),
             format!("  Model            {}", self.model),
             format!("  Permissions      {}", self.permission_mode.as_str()),
+            self.active_tool_profile.as_ref().map_or_else(
+                || "  Tool profile     none".to_string(),
+                |profile| {
+                    format!(
+                        "  Tool profile     {} · ceiling {}",
+                        profile.id,
+                        profile.permission_mode.as_str()
+                    )
+                },
+            ),
             format!("  Session          {}", self.session.id),
             format!(
                 "  Quick start      {}",
@@ -2575,6 +2897,7 @@ impl LiveCli {
             false,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.active_tool_profile.clone(),
             None,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
@@ -2674,6 +2997,13 @@ impl LiveCli {
             }
             SlashCommand::Memory => {
                 Self::print_memory()?;
+                false
+            }
+            SlashCommand::Foundations { family } => {
+                println!(
+                    "{}",
+                    render_foundations_report(family.as_deref()).map_err(io::Error::other)?
+                );
                 false
             }
             SlashCommand::Init => {
@@ -2777,6 +3107,7 @@ impl LiveCli {
                     estimated_tokens: self.runtime.estimated_tokens(),
                 },
                 self.permission_mode.as_str(),
+                self.active_tool_profile.as_ref(),
                 self.plan_restore_mode.map(PermissionMode::as_str),
                 &context,
             )
@@ -2821,6 +3152,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.active_tool_profile.clone(),
             None,
         )?;
         self.model.clone_from(&model);
@@ -2863,13 +3195,26 @@ impl LiveCli {
             return Ok(false);
         }
 
+        let requested_mode = permission_mode_from_label(normalized);
+        if let Some(profile) = self.active_tool_profile.as_ref() {
+            if !profile.permission_mode.encompasses(requested_mode) {
+                println!(
+                    "Permissions\n  Result           blocked\n  Reason           tool profile `{}` caps this run at {}\n  Requested        {}\n  Next             choose read-only or workspace-write within the profile ceiling",
+                    profile.id,
+                    profile.permission_mode.as_str(),
+                    requested_mode.as_str(),
+                );
+                return Ok(false);
+            }
+        }
+
         if normalized == self.permission_mode.as_str() {
             println!("{}", format_permissions_report(normalized, None));
             return Ok(false);
         }
 
         let previous = self.permission_mode.as_str().to_string();
-        self.rebuild_runtime_for_permission_mode(permission_mode_from_label(normalized))?;
+        self.rebuild_runtime_for_permission_mode(requested_mode)?;
         println!(
             "{}",
             format_permissions_switch_report(&previous, normalized)
@@ -2943,6 +3288,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.active_tool_profile.clone(),
             None,
         )?;
         Ok(())
@@ -2965,6 +3311,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.active_tool_profile.clone(),
             None,
         )?;
         println!(
@@ -3003,6 +3350,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.active_tool_profile.clone(),
             None,
         )?;
         self.session = handle;
@@ -3089,6 +3437,7 @@ impl LiveCli {
                     true,
                     self.allowed_tools.clone(),
                     self.permission_mode,
+                    self.active_tool_profile.clone(),
                     None,
                 )?;
                 self.session = handle;
@@ -3134,6 +3483,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.active_tool_profile.clone(),
             None,
         )?;
         self.persist_session()
@@ -3150,6 +3500,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.active_tool_profile.clone(),
             None,
         )?;
         self.persist_session()?;
@@ -3172,6 +3523,7 @@ impl LiveCli {
             false,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.active_tool_profile.clone(),
             progress,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
@@ -3713,6 +4065,7 @@ fn format_status_report(
     model: &str,
     usage: StatusUsage,
     permission_mode: &str,
+    active_tool_profile: Option<&ActiveToolProfile>,
     plan_restore_mode: Option<&str>,
     context: &StatusContext,
 ) -> String {
@@ -3724,11 +4077,26 @@ fn format_status_report(
     let planning = plan_restore_mode.map_or_else(String::new, |restore_mode| {
         format!("\n  Planning         active · restores {restore_mode} · /plan exit")
     });
+    let tool_profile_lines = active_tool_profile.map_or_else(String::new, |profile| {
+        let mut lines = vec![
+            format!("  Tool profile     {}", profile.id),
+            format!("  Profile ceiling  {}", profile.permission_mode.as_str()),
+            format!(
+                "  Tool ceiling     {}",
+                summarize_allowed_tools(&profile.allowed_tools)
+            ),
+        ];
+        if let Some(summary) = profile.bash_policy_summary() {
+            lines.push(format!("  Bash policy      {summary}"));
+        }
+        format!("\n{}", lines.join("\n"))
+    });
     [
         format!(
             "Session
   Model            {model}
   Permissions      {permission_mode}
+{tool_profile_lines}
 {planning}
   Activity         {} messages · {} turns
   Tokens           est {} · latest {} · total {}",
@@ -3781,6 +4149,16 @@ Next
 
 ",
     )
+}
+
+fn summarize_allowed_tools(allowed_tools: &AllowedToolSet) -> String {
+    let mut names = allowed_tools.iter().cloned().collect::<Vec<_>>();
+    if names.len() <= 6 {
+        return names.join(", ");
+    }
+    let remaining = names.len() - 6;
+    names.truncate(6);
+    format!("{} + {remaining} more", names.join(", "))
 }
 
 fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
@@ -4379,7 +4757,8 @@ fn build_runtime_plugin_state(
         runtime_config.feature_config().clone(),
         plugin_manager.aggregated_hooks()?,
     );
-    let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_manager.aggregated_tools()?)?;
+    let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_manager.aggregated_tools()?)?
+        .with_browser_control(runtime_config.browser_control().clone())?;
     Ok((feature_config, tool_registry))
 }
 
@@ -4743,6 +5122,33 @@ fn describe_tool_progress(name: &str, input: &str) -> String {
                 .unwrap_or(".");
             format!("grep `{pattern}` in {scope}")
         }
+        BROWSER_OBSERVE_TOOL_NAME => parsed
+            .get("url")
+            .and_then(|value| value.as_str())
+            .map_or_else(
+                || "observing browser page".to_string(),
+                |url| format!("observe {}", truncate_for_summary(url, 100)),
+            ),
+        BROWSER_INTERACT_TOOL_NAME => {
+            let selector = parsed
+                .get("action")
+                .and_then(|value| value.get("selector"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            parsed
+                .get("url")
+                .and_then(|value| value.as_str())
+                .map_or_else(
+                    || format!("click {selector}"),
+                    |url| {
+                        format!(
+                            "click {} on {}",
+                            truncate_for_summary(selector, 60),
+                            truncate_for_summary(url, 100)
+                        )
+                    },
+                )
+        }
         "web_search" | "WebSearch" => parsed
             .get("query")
             .and_then(|value| value.as_str())
@@ -4771,12 +5177,19 @@ fn build_runtime(
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    active_tool_profile: Option<ActiveToolProfile>,
     progress_reporter: Option<InternalPromptProgressReporter>,
 ) -> Result<ConversationRuntime<DefaultRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     let (feature_config, mut tool_registry) = build_runtime_plugin_state()?;
-    let policy = permission_policy(permission_mode, &tool_registry);
+    let policy = permission_policy(permission_mode, &tool_registry, allowed_tools.as_ref());
     tool_registry = tool_registry.with_enforcer(runtime::PermissionEnforcer::new(policy.clone()));
+    if let Some(bash_policy) = active_tool_profile
+        .as_ref()
+        .and_then(|profile| profile.bash_policy.clone())
+    {
+        tool_registry = tool_registry.with_bash_policy(bash_policy);
+    }
     Ok(ConversationRuntime::new_with_features(
         session,
         DefaultRuntimeClient::new(
@@ -5275,6 +5688,29 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
         }
         "glob_search" | "Glob" => format_search_start("🔎 Glob", &parsed),
         "grep_search" | "Grep" => format_search_start("🔎 Grep", &parsed),
+        BROWSER_OBSERVE_TOOL_NAME => parsed
+            .get("url")
+            .and_then(|value| value.as_str())
+            .map_or_else(
+                || "observing browser page".to_string(),
+                |url| format!("Inspect {}", truncate_for_summary(url, 120)),
+            ),
+        BROWSER_INTERACT_TOOL_NAME => {
+            let selector = parsed
+                .get("action")
+                .and_then(|value| value.get("selector"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            let url = parsed
+                .get("url")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            format!(
+                "Click {}\n\x1b[2mon {}\x1b[0m",
+                truncate_for_summary(selector, 80),
+                truncate_for_summary(url, 120)
+            )
+        }
         "web_search" | "WebSearch" => parsed
             .get("query")
             .and_then(|value| value.as_str())
@@ -5313,6 +5749,8 @@ fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
         "edit_file" | "Edit" => format_edit_result(icon, &parsed),
         "glob_search" | "Glob" => format_glob_result(icon, &parsed),
         "grep_search" | "Grep" => format_grep_result(icon, &parsed),
+        BROWSER_OBSERVE_TOOL_NAME => format_browser_observe_result(icon, &parsed),
+        BROWSER_INTERACT_TOOL_NAME => format_browser_interact_result(icon, &parsed),
         _ => format_generic_tool_result(icon, name, &parsed),
     }
 }
@@ -5581,6 +6019,236 @@ fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
     }
 }
 
+fn format_browser_observe_result(icon: &str, parsed: &serde_json::Value) -> String {
+    let requested_url = parsed
+        .get("requested_url")
+        .and_then(|value| value.as_str())
+        .unwrap_or("?");
+    let title = parsed.get("title").and_then(|value| value.as_str());
+    let load_outcome = parsed
+        .get("load_outcome")
+        .and_then(|value| value.as_str())
+        .unwrap_or("loaded");
+    let wait = parsed.get("wait").unwrap_or(&serde_json::Value::Null);
+    let wait_kind = wait
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or("load");
+    let wait_detail = wait
+        .get("detail")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let wait_expected = wait
+        .get("expected")
+        .and_then(|value| value.as_str())
+        .map(|expected| format!(" · expected {}", truncate_for_summary(expected, 60)))
+        .unwrap_or_default();
+    let visible_text = parsed.get("visible_text").and_then(|value| value.as_str());
+    let visible_text_truncated = parsed
+        .get("visible_text_truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let screenshot = parsed.get("screenshot").unwrap_or(&serde_json::Value::Null);
+    let screenshot_line = screenshot
+        .get("relative_path")
+        .and_then(|value| value.as_str())
+        .map(|path| {
+            let media_type = screenshot
+                .get("media_type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("artifact");
+            let bytes = screenshot
+                .get("bytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            format!(
+                "Screenshot       {} ({media_type}, {bytes} bytes)",
+                truncate_for_summary(path, 120)
+            )
+        });
+    let total_ms = parsed
+        .get("timings_ms")
+        .and_then(|value| value.get("total"))
+        .and_then(serde_json::Value::as_u64);
+    let warnings = parsed
+        .get("warnings")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(|warning| truncate_for_summary(warning, 120))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut lines = vec![
+        format!("{icon} \x1b[38;5;245m{BROWSER_OBSERVE_TOOL_NAME}\x1b[0m"),
+        format!(
+            "Observe          {}",
+            truncate_for_summary(requested_url, 140)
+        ),
+        format!(
+            "Wait             {wait_kind} · {}{wait_expected}",
+            truncate_for_summary(wait_detail, 120)
+        ),
+        format!("Outcome          {load_outcome}"),
+    ];
+
+    if let Some(title) = title {
+        lines.push(format!(
+            "Title            {}",
+            truncate_for_summary(title, 140)
+        ));
+    }
+    if let Some(visible_text) = visible_text {
+        let detail = truncate_for_summary(first_visible_line(visible_text), 140);
+        let suffix = if visible_text_truncated {
+            " (truncated)"
+        } else {
+            ""
+        };
+        lines.push(format!("Visible text     {detail}{suffix}"));
+    }
+    if let Some(line) = screenshot_line {
+        lines.push(line);
+    }
+    if let Some(total_ms) = total_ms {
+        lines.push(format!("Timing           {total_ms} ms total"));
+    }
+    if !warnings.is_empty() {
+        lines.push(format!("Warnings         {}", warnings.join(" · ")));
+    }
+
+    lines.join("\n")
+}
+
+#[allow(clippy::too_many_lines)]
+fn format_browser_interact_result(icon: &str, parsed: &serde_json::Value) -> String {
+    let requested_url = parsed
+        .get("requested_url")
+        .and_then(|value| value.as_str())
+        .unwrap_or("?");
+    let final_url = parsed.get("final_url").and_then(|value| value.as_str());
+    let title = parsed.get("title").and_then(|value| value.as_str());
+    let action = parsed.get("action").unwrap_or(&serde_json::Value::Null);
+    let action_selector = action
+        .get("selector")
+        .and_then(|value| value.as_str())
+        .unwrap_or("?");
+    let action_detail = action
+        .get("detail")
+        .and_then(|value| value.as_str())
+        .unwrap_or("selector click");
+    let load_outcome = parsed
+        .get("load_outcome")
+        .and_then(|value| value.as_str())
+        .unwrap_or("captured_after_click");
+    let wait = parsed.get("wait").unwrap_or(&serde_json::Value::Null);
+    let wait_kind = wait
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or("load");
+    let wait_detail = wait
+        .get("detail")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let wait_expected = wait
+        .get("expected")
+        .and_then(|value| value.as_str())
+        .map(|expected| format!(" · expected {}", truncate_for_summary(expected, 60)))
+        .unwrap_or_default();
+    let visible_text = parsed.get("visible_text").and_then(|value| value.as_str());
+    let visible_text_truncated = parsed
+        .get("visible_text_truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let screenshot = parsed.get("screenshot").unwrap_or(&serde_json::Value::Null);
+    let screenshot_line = screenshot
+        .get("relative_path")
+        .and_then(|value| value.as_str())
+        .map(|path| {
+            let media_type = screenshot
+                .get("media_type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("artifact");
+            let bytes = screenshot
+                .get("bytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            format!(
+                "Screenshot       {} ({media_type}, {bytes} bytes)",
+                truncate_for_summary(path, 120)
+            )
+        });
+    let total_ms = parsed
+        .get("timings_ms")
+        .and_then(|value| value.get("total"))
+        .and_then(serde_json::Value::as_u64);
+    let warnings = parsed
+        .get("warnings")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(|warning| truncate_for_summary(warning, 120))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut lines = vec![
+        format!("{icon} \x1b[38;5;245m{BROWSER_INTERACT_TOOL_NAME}\x1b[0m"),
+        format!(
+            "Open             {}",
+            truncate_for_summary(requested_url, 140)
+        ),
+        format!(
+            "Action           click {} · {}",
+            truncate_for_summary(action_selector, 80),
+            truncate_for_summary(action_detail, 120)
+        ),
+        format!(
+            "Wait             {wait_kind} · {}{wait_expected}",
+            truncate_for_summary(wait_detail, 120)
+        ),
+        format!("Outcome          {load_outcome}"),
+    ];
+
+    if let Some(final_url) = final_url {
+        lines.push(format!(
+            "Final URL        {}",
+            truncate_for_summary(final_url, 140)
+        ));
+    }
+    if let Some(title) = title {
+        lines.push(format!(
+            "Title            {}",
+            truncate_for_summary(title, 140)
+        ));
+    }
+    if let Some(visible_text) = visible_text {
+        let detail = truncate_for_summary(first_visible_line(visible_text), 140);
+        let suffix = if visible_text_truncated {
+            " (truncated)"
+        } else {
+            ""
+        };
+        lines.push(format!("Visible text     {detail}{suffix}"));
+    }
+    if let Some(line) = screenshot_line {
+        lines.push(line);
+    }
+    if let Some(total_ms) = total_ms {
+        lines.push(format!("Timing           {total_ms} ms total"));
+    }
+    if !warnings.is_empty() {
+        lines.push(format!("Warnings         {}", warnings.join(" · ")));
+    }
+
+    lines.join("\n")
+}
+
 fn format_generic_tool_result(icon: &str, name: &str, parsed: &serde_json::Value) -> String {
     let rendered_output = match parsed {
         serde_json::Value::String(text) => text.clone(),
@@ -5781,9 +6449,14 @@ impl ToolExecutor for CliToolExecutor {
             .as_ref()
             .is_some_and(|allowed| !allowed.contains(tool_name))
         {
-            return Err(ToolError::new(format!(
-                "tool `{tool_name}` is not enabled by the current --allowedTools setting"
-            )));
+            let message = if is_hidden_browser_tool_name(tool_name) {
+                format!(
+                    "tool `{tool_name}` is not enabled by the current --allowedTools setting; browser tools remain hidden until you explicitly pass --allowedTools {tool_name} with browserControl.enabled=true"
+                )
+            } else {
+                format!("tool `{tool_name}` is not enabled by the current --allowedTools setting")
+            };
+            return Err(ToolError::new(message));
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
@@ -5810,13 +6483,20 @@ impl ToolExecutor for CliToolExecutor {
     }
 }
 
-fn permission_policy(mode: PermissionMode, tool_registry: &GlobalToolRegistry) -> PermissionPolicy {
-    tool_registry.permission_specs(None).into_iter().fold(
-        PermissionPolicy::new(mode),
-        |policy, (name, required_permission)| {
-            policy.with_tool_requirement(name, required_permission)
-        },
-    )
+fn permission_policy(
+    mode: PermissionMode,
+    tool_registry: &GlobalToolRegistry,
+    allowed_tools: Option<&AllowedToolSet>,
+) -> PermissionPolicy {
+    tool_registry
+        .permission_specs(allowed_tools)
+        .into_iter()
+        .fold(
+            PermissionPolicy::new(mode),
+            |policy, (name, required_permission)| {
+                policy.with_tool_requirement(name, required_permission)
+            },
+        )
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
@@ -5993,6 +6673,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  openyak foundations [family]            Explain shipped Task/Team/Cron/LSP/MCP foundations"
+    )?;
+    writeln!(
+        out,
         "  openyak package-release [--output-dir PATH] [--binary PATH]  Stage a release artifact directory"
     )?;
     writeln!(
@@ -6019,7 +6703,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --allowedTools TOOLS                  Restrict enabled tools (repeatable; comma-separated aliases supported)"
+        "  --allowedTools TOOLS                  Restrict enabled tools (repeatable; comma-separated aliases supported; hidden BrowserObserve/BrowserInteract still require browserControl.enabled=true)"
+    )?;
+    writeln!(
+        out,
+        "  --tool-profile NAME                  Apply a named local tool profile as the ceiling for this run"
     )?;
     writeln!(
         out,
@@ -6050,14 +6738,28 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  openyak --permission-mode danger-full-access --allowedTools BrowserObserve prompt \"inspect the rendered login screen\""
+    )?;
+    writeln!(
+        out,
+        "  openyak --permission-mode danger-full-access --allowedTools BrowserInteract prompt \"click '#sign-in' on the rendered login screen\""
+    )?;
+    writeln!(
+        out,
+        "  openyak --tool-profile audit prompt \"summarize Cargo.toml\""
+    )?;
+    writeln!(
+        out,
         "  openyak --resume session.json /status /diff /export notes.txt"
     )?;
     writeln!(out, "  openyak agents")?;
     writeln!(out, "  openyak /skills")?;
+    writeln!(out, "  openyak /foundations")?;
     writeln!(out, "  openyak login")?;
     writeln!(out, "  openyak init")?;
     writeln!(out, "  openyak onboard")?;
     writeln!(out, "  openyak doctor")?;
+    writeln!(out, "  openyak foundations")?;
     writeln!(out, "  openyak package-release --output-dir dist")?;
     writeln!(out, "  openyak server --bind 127.0.0.1:0")?;
     Ok(())
@@ -6097,6 +6799,9 @@ fn render_help_topic(topic: HelpTopic) -> &'static str {
         HelpTopic::Doctor => {
             "Usage: openyak doctor\n\nRun local read-only health checks for config loading, OAuth setup, active model auth bootstrap, and GitHub CLI availability."
         }
+        HelpTopic::Foundations => {
+            "Usage: openyak foundations [task|team|cron|lsp|mcp]\n\nShow the shipped read-only foundation families for the current CLI mainline.\nThis surface explains tool membership and current boundaries for Task / Team / Cron / LSP / MCP without implying durable registries, a standalone LSP host, or a broader control plane."
+        }
         HelpTopic::PackageRelease => {
             "Usage: openyak package-release [--output-dir PATH] [--binary PATH]\n\nStage a release artifact directory containing the packaged openyak binary plus generated install metadata.\nBy default the command packages the currently running openyak executable into ./dist."
         }
@@ -6104,7 +6809,7 @@ fn render_help_topic(topic: HelpTopic) -> &'static str {
             "Usage: openyak server [--bind HOST:PORT]\n\nRun the local HTTP/SSE thread server backed by the `server` crate.\nThe server exposes the local `/v1/threads` protocol plus legacy `/sessions` compatibility routes, persists thread state in the workspace `.openyak/state.sqlite3` SQLite store, prints the actual bound address on startup, and keeps serving until interrupted."
         }
         HelpTopic::Prompt => {
-            "Usage: openyak prompt <text>\n       openyak -p <text>\n\nRun one non-interactive prompt and exit.\nIf the model requests structured follow-up input, this mode fails explicitly instead of guessing a reply."
+            "Usage: openyak prompt [--tool-profile NAME] <text>\n       openyak -p [--tool-profile NAME] <text>\n\nRun one non-interactive prompt and exit.\nUse --tool-profile to apply a named local tool-profile ceiling for this process only.\nHidden optional browser tools such as BrowserObserve and BrowserInteract still require browserControl.enabled=true plus explicit --allowedTools BrowserObserve or --allowedTools BrowserInteract.\nIf the model requests structured follow-up input, this mode fails explicitly instead of guessing a reply."
         }
     }
 }
@@ -6123,15 +6828,17 @@ mod tests {
         initialize_repo, load_session_from_reference, normalize_permission_mode, parse_args,
         parse_commit_push_pr_draft, parse_git_status_metadata, parse_manual_oauth_callback_input,
         parse_user_input_submission, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_git_command_requires_repo,
-        render_help_topic, render_last_tool_debug_report, render_memory_report, render_repl_help,
-        render_unknown_repl_command, resolve_effective_model, resolve_model_alias,
-        response_to_events, resume_supported_slash_commands, run_resume_command, sessions_dir,
+        render_config_report, render_diff_report, render_foundations_report,
+        render_git_command_requires_repo, render_help_topic, render_last_tool_debug_report,
+        render_memory_report, render_repl_help, render_unknown_repl_command,
+        resolve_effective_model, resolve_model_alias, response_to_events,
+        resume_supported_slash_commands, run_resume_command, sessions_dir,
         slash_command_completion_candidates, stage_release_artifact, status_context,
         status_context_or_fallback_for_cwd, summarize_command_stderr, CliAction, CliOutputFormat,
         CliUserInputPrompter, DefaultRuntimeClient, DoctorCheckStatus, HelpTopic,
         InternalPromptProgressEvent, InternalPromptProgressState, SlashCommand, StatusUsage,
-        ThreadServerInfoGuard, DEFAULT_MODEL, DEFAULT_RELEASE_OUTPUT_DIR, DEFAULT_SERVER_BIND,
+        ThreadServerInfoGuard, BROWSER_INTERACT_TOOL_NAME, BROWSER_OBSERVE_TOOL_NAME,
+        DEFAULT_MODEL, DEFAULT_RELEASE_OUTPUT_DIR, DEFAULT_SERVER_BIND,
         REQUEST_USER_INPUT_TOOL_NAME, THREAD_SERVER_INFO_FILENAME, VERSION,
     };
     use api::{InputContentBlock, MessageResponse, OutputContentBlock, ProviderKind, Usage};
@@ -6230,6 +6937,20 @@ mod tests {
         ))
     }
 
+    fn write_local_settings(root: &Path, contents: &str) {
+        fs::create_dir_all(root.join(".openyak")).expect("config dir should exist");
+        fs::write(root.join(".openyak").join("settings.local.json"), contents)
+            .expect("local settings should write");
+    }
+
+    fn isolated_profile_workspace(prefix: &str) -> (EnvVarGuard, EnvVarGuard, PathBuf) {
+        let openyak_home = EnvVarGuard::set("OPENYAK_CONFIG_HOME", None);
+        let codex_home = EnvVarGuard::set("CODEX_HOME", None);
+        let root = unique_temp_dir(prefix);
+        fs::create_dir_all(&root).expect("workspace should exist");
+        (openyak_home, codex_home, root)
+    }
+
     fn write_fake_command(dir: &Path, name: &str) -> PathBuf {
         let path = if cfg!(windows) {
             dir.join(format!("{name}.cmd"))
@@ -6259,9 +6980,50 @@ mod tests {
             .unwrap_or_else(|| panic!("doctor check `{name}` should exist"))
     }
 
+    fn requested_policy(
+        permission_mode: Option<PermissionMode>,
+        allowed_tools: Option<&[&str]>,
+        tool_profile: Option<&str>,
+    ) -> super::RequestedExecutionPolicy {
+        super::RequestedExecutionPolicy {
+            permission_mode,
+            allowed_tools: allowed_tools.map(|tools| {
+                tools
+                    .iter()
+                    .map(|tool| (*tool).to_string())
+                    .collect::<std::collections::BTreeSet<_>>()
+            }),
+            tool_profile: tool_profile.map(str::to_string),
+        }
+    }
+
+    fn active_tool_profile(
+        id: &str,
+        permission_mode: PermissionMode,
+        allowed_tools: &[&str],
+    ) -> super::ActiveToolProfile {
+        super::ActiveToolProfile {
+            id: id.to_string(),
+            permission_mode,
+            allowed_tools: allowed_tools
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            bash_policy: None,
+        }
+    }
+
     fn test_live_cli(permission_mode: PermissionMode) -> super::LiveCli {
-        super::LiveCli::new("sonnet".to_string(), false, None, permission_mode)
-            .expect("test live cli should initialize")
+        super::LiveCli::new(
+            "sonnet".to_string(),
+            false,
+            super::EffectiveCliPolicy {
+                permission_mode,
+                allowed_tools: None,
+                active_tool_profile: None,
+            },
+        )
+        .expect("test live cli should initialize")
     }
 
     fn write_saved_session(name: &str) -> PathBuf {
@@ -6280,8 +7042,7 @@ mod tests {
             parse_args(&[]).expect("args should parse"),
             CliAction::Repl {
                 model: None,
-                allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                requested_policy: requested_policy(None, None, None),
             }
         );
     }
@@ -6299,8 +7060,7 @@ mod tests {
                 prompt: "hello world".to_string(),
                 model: None,
                 output_format: CliOutputFormat::Text,
-                allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                requested_policy: requested_policy(None, None, None),
             }
         );
     }
@@ -6320,8 +7080,7 @@ mod tests {
                 prompt: "explain this".to_string(),
                 model: Some("custom-opus".to_string()),
                 output_format: CliOutputFormat::Json,
-                allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                requested_policy: requested_policy(None, None, None),
             }
         );
     }
@@ -6340,8 +7099,7 @@ mod tests {
                 prompt: "explain this".to_string(),
                 model: Some("claude-opus-4-6".to_string()),
                 output_format: CliOutputFormat::Text,
-                allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                requested_policy: requested_policy(None, None, None),
             }
         );
     }
@@ -6513,8 +7271,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Repl {
                 model: None,
-                allowed_tools: None,
-                permission_mode: PermissionMode::ReadOnly,
+                requested_policy: requested_policy(Some(PermissionMode::ReadOnly), None, None),
             }
         );
     }
@@ -6530,15 +7287,50 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Repl {
                 model: None,
-                allowed_tools: Some(
-                    ["glob_search", "read_file", "write_file"]
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect()
+                requested_policy: requested_policy(
+                    None,
+                    Some(&["glob_search", "read_file", "write_file"]),
+                    None,
                 ),
-                permission_mode: PermissionMode::DangerFullAccess,
             }
         );
+    }
+
+    #[test]
+    fn parses_tool_profile_flags_for_repl_and_prompt() {
+        assert_eq!(
+            parse_args(&["--tool-profile=audit".to_string()]).expect("repl args should parse"),
+            CliAction::Repl {
+                model: None,
+                requested_policy: requested_policy(None, None, Some("audit")),
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "--toolProfile".to_string(),
+                "audit".to_string(),
+                "prompt".to_string(),
+                "hello".to_string(),
+            ])
+            .expect("prompt args should parse"),
+            CliAction::Prompt {
+                prompt: "hello".to_string(),
+                model: None,
+                output_format: CliOutputFormat::Text,
+                requested_policy: requested_policy(None, None, Some("audit")),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_missing_tool_profile_value() {
+        let dashed = parse_args(&["--tool-profile".to_string()])
+            .expect_err("missing --tool-profile value should fail");
+        assert!(dashed.contains("missing value for --tool-profile"));
+
+        let camel = parse_args(&["--toolProfile".to_string()])
+            .expect_err("missing --toolProfile value should fail");
+        assert!(camel.contains("missing value for --toolProfile"));
     }
 
     #[test]
@@ -6551,6 +7343,16 @@ mod tests {
             parse_args(&["-p".to_string(), "--help".to_string()]).expect("args should parse"),
             CliAction::Help(HelpTopic::Prompt)
         );
+    }
+
+    #[test]
+    fn prompt_help_mentions_hidden_browser_tool_gates() {
+        let help = render_help_topic(HelpTopic::Prompt);
+        assert!(help.contains("BrowserObserve"));
+        assert!(help.contains("BrowserInteract"));
+        assert!(help.contains("browserControl.enabled=true"));
+        assert!(help.contains("--allowedTools BrowserObserve"));
+        assert!(help.contains("--allowedTools BrowserInteract"));
     }
 
     #[test]
@@ -6632,6 +7434,11 @@ mod tests {
             CliAction::Help(HelpTopic::Doctor)
         );
         assert_eq!(
+            parse_args(&["foundations".to_string(), "--help".to_string()])
+                .expect("foundations help should parse"),
+            CliAction::Help(HelpTopic::Foundations)
+        );
+        assert_eq!(
             parse_args(&["package-release".to_string(), "--help".to_string()])
                 .expect("package-release help should parse"),
             CliAction::Help(HelpTopic::PackageRelease)
@@ -6645,7 +7452,9 @@ mod tests {
 
     #[test]
     fn help_topics_render_targeted_usage() {
-        assert!(render_help_topic(HelpTopic::Prompt).contains("Usage: openyak prompt <text>"));
+        assert!(render_help_topic(HelpTopic::Prompt)
+            .contains("Usage: openyak prompt [--tool-profile NAME] <text>"));
+        assert!(render_help_topic(HelpTopic::Prompt).contains("--tool-profile"));
         assert!(render_help_topic(HelpTopic::Prompt).contains("fails explicitly"));
         assert!(render_help_topic(HelpTopic::Login).contains("Usage: openyak login"));
         assert!(
@@ -6654,10 +7463,32 @@ mod tests {
         assert!(render_help_topic(HelpTopic::Onboard).contains("Usage: openyak onboard"));
         assert!(render_help_topic(HelpTopic::Onboard).contains("interactive onboarding wizard"));
         assert!(render_help_topic(HelpTopic::Doctor).contains("Usage: openyak doctor"));
+        assert!(render_help_topic(HelpTopic::Foundations).contains("Usage: openyak foundations"));
+        assert!(
+            render_help_topic(HelpTopic::Foundations).contains("Task / Team / Cron / LSP / MCP")
+        );
         assert!(
             render_help_topic(HelpTopic::PackageRelease).contains("Usage: openyak package-release")
         );
         assert!(render_help_topic(HelpTopic::Server).contains("Usage: openyak server"));
+    }
+
+    #[test]
+    fn foundations_reports_inventory_and_detail_truthfully() {
+        let inventory = render_foundations_report(None).expect("inventory report should render");
+        assert!(inventory.contains("openyak foundations [task|team|cron|lsp|mcp]"));
+        assert!(inventory.contains("TaskCreate"));
+        assert!(inventory.contains("process_local_v1"));
+        assert!(inventory.contains("registry-backed"));
+
+        let detail = render_foundations_report(Some("mcp")).expect("mcp detail should render");
+        assert!(detail.contains("Family           mcp"));
+        assert!(detail.contains("ListMcpServers"));
+        assert!(detail.contains("MB5"));
+
+        let error =
+            render_foundations_report(Some("unknown")).expect_err("unknown family should fail");
+        assert!(error.contains("unknown foundations family"));
     }
 
     #[test]
@@ -6695,6 +7526,17 @@ mod tests {
         assert_eq!(
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),
             CliAction::Doctor
+        );
+        assert_eq!(
+            parse_args(&["foundations".to_string()]).expect("foundations should parse"),
+            CliAction::Foundations { family: None }
+        );
+        assert_eq!(
+            parse_args(&["foundations".to_string(), "mcp".to_string()])
+                .expect("foundations with family should parse"),
+            CliAction::Foundations {
+                family: Some("mcp".to_string())
+            }
         );
         assert_eq!(
             parse_args(&["agents".to_string()]).expect("agents should parse"),
@@ -6748,7 +7590,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_direct_agents_and_skills_slash_commands() {
+    fn parses_direct_agents_skills_and_foundations_slash_commands() {
         assert_eq!(
             parse_args(&["/agents".to_string()]).expect("/agents should parse"),
             CliAction::Agents { args: None }
@@ -6764,10 +7606,28 @@ mod tests {
                 args: Some("help".to_string())
             }
         );
+        assert_eq!(
+            parse_args(&["/foundations".to_string()]).expect("/foundations should parse"),
+            CliAction::Foundations { family: None }
+        );
+        assert_eq!(
+            parse_args(&["/foundations".to_string(), "task".to_string()])
+                .expect("/foundations task should parse"),
+            CliAction::Foundations {
+                family: Some("task".to_string())
+            }
+        );
         let error = parse_args(&["/status".to_string()])
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("Direct slash command unavailable"));
         assert!(error.contains("/status"));
+    }
+
+    #[test]
+    fn rejects_unknown_foundations_family() {
+        let error = parse_args(&["foundations".to_string(), "unknown".to_string()])
+            .expect_err("unknown foundations family should fail");
+        assert!(error.contains("unknown foundations family: unknown"));
     }
 
     #[test]
@@ -6962,8 +7822,77 @@ mod tests {
     }
 
     #[test]
+    fn tool_registry_for_cwd_wires_browser_control_as_hidden_optional_builtin() {
+        let _guard = env_lock();
+        let root = unique_temp_dir("openyak-cli-browser-registry");
+        fs::create_dir_all(&root).expect("workspace should exist");
+        write_local_settings(
+            &root,
+            r#"{
+  "browserControl": {
+    "enabled": true
+  }
+}"#,
+        );
+
+        let registry = super::tool_registry_for_cwd(&root).expect("tool registry should build");
+        let default_names = registry
+            .definitions(None)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(!default_names.iter().any(|name| name == "BrowserObserve"));
+        assert!(!default_names.iter().any(|name| name == "BrowserInteract"));
+
+        let allowed = registry
+            .normalize_allowed_tools(&[
+                String::from("BrowserObserve"),
+                String::from("BrowserInteract"),
+            ])
+            .expect("allowlist should normalize")
+            .expect("allowlist should exist");
+        let allowed_names = registry
+            .definitions(Some(&allowed))
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(allowed_names.iter().any(|name| name == "BrowserObserve"));
+        assert!(allowed_names.iter().any(|name| name == "BrowserInteract"));
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn build_runtime_plugin_state_preserves_browser_control_feature_config() {
+        let _guard = env_lock();
+        let root = unique_temp_dir("openyak-cli-browser-state");
+        fs::create_dir_all(&root).expect("workspace should exist");
+        write_local_settings(
+            &root,
+            r#"{
+  "browserControl": {
+    "enabled": true
+  }
+}"#,
+        );
+
+        let cwd_guard = CurrentDirGuard::set(&root);
+        let (feature_config, registry) =
+            super::build_runtime_plugin_state().expect("runtime plugin state should build");
+
+        assert!(feature_config.browser_control().enabled());
+        assert!(registry
+            .normalize_allowed_tools(&[String::from("BrowserObserve")])
+            .is_ok());
+
+        drop(cwd_guard);
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
     fn permission_policy_uses_plugin_tool_permissions() {
-        let policy = permission_policy(PermissionMode::ReadOnly, &registry_with_plugin_tool());
+        let policy =
+            permission_policy(PermissionMode::ReadOnly, &registry_with_plugin_tool(), None);
         let required = policy.required_mode_for("plugin_echo");
         assert_eq!(required, PermissionMode::WorkspaceWrite);
     }
@@ -7016,6 +7945,7 @@ mod tests {
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
         assert!(help.contains("/memory"));
+        assert!(help.contains("/foundations [family]"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
         assert!(help.contains("/version"));
@@ -7058,8 +7988,20 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "status", "compact", "clear", "cost", "config", "memory", "init", "diff",
-                "version", "export", "agents", "skills",
+                "help",
+                "status",
+                "compact",
+                "clear",
+                "cost",
+                "config",
+                "memory",
+                "init",
+                "diff",
+                "version",
+                "export",
+                "agents",
+                "foundations",
+                "skills",
             ]
         );
     }
@@ -7466,11 +8408,13 @@ mod tests {
         let help = String::from_utf8(help).expect("help should be utf8");
         assert!(help.contains("openyak init"));
         assert!(help.contains("openyak onboard"));
+        assert!(help.contains("openyak foundations"));
         assert!(help.contains("openyak package-release"));
         assert!(help.contains("openyak server"));
         assert!(help.contains("openyak agents"));
         assert!(help.contains("openyak skills"));
         assert!(help.contains("openyak /skills"));
+        assert!(help.contains("openyak /foundations"));
         assert!(help.contains("/plan [exit]"));
     }
 
@@ -7716,6 +8660,7 @@ mod tests {
             },
             "workspace-write",
             None,
+            None,
             &super::StatusContext {
                 cwd: PathBuf::from("/tmp/project"),
                 session_path: Some(PathBuf::from("session.json")),
@@ -7753,6 +8698,7 @@ mod tests {
                 estimated_tokens: 128,
             },
             "read-only",
+            None,
             Some("workspace-write"),
             &super::StatusContext {
                 cwd: PathBuf::from("/tmp/project"),
@@ -7782,6 +8728,7 @@ mod tests {
             },
             "danger-full-access",
             None,
+            None,
             &super::StatusContext {
                 cwd: PathBuf::from("/tmp/project"),
                 session_path: Some(PathBuf::from("session.json")),
@@ -7795,6 +8742,107 @@ mod tests {
         );
         assert!(status.contains("/export [file]"));
         assert!(!status.contains("/session list"));
+    }
+
+    #[test]
+    fn status_line_surfaces_active_tool_profile() {
+        let status = format_status_report(
+            "sonnet",
+            StatusUsage {
+                message_count: 1,
+                turns: 1,
+                latest: runtime::TokenUsage::default(),
+                cumulative: runtime::TokenUsage::default(),
+                estimated_tokens: 12,
+            },
+            "read-only",
+            Some(&active_tool_profile(
+                "audit",
+                PermissionMode::ReadOnly,
+                &["read_file", "glob_search"],
+            )),
+            None,
+            &super::StatusContext {
+                cwd: PathBuf::from("/tmp/project"),
+                session_path: Some(PathBuf::from("session.json")),
+                loaded_config_files: 1,
+                discovered_config_files: 1,
+                memory_file_count: 0,
+                project_root: Some(PathBuf::from("/tmp")),
+                git_branch: Some("main".to_string()),
+                resume_mode: false,
+            },
+        );
+        assert!(status.contains("Tool profile     audit"));
+        assert!(status.contains("Profile ceiling  read-only"));
+        assert!(status.contains("Tool ceiling     glob_search, read_file"));
+    }
+
+    #[test]
+    fn startup_banner_surfaces_active_tool_profile() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-startup-profile");
+        fs::create_dir_all(&root).expect("root should exist");
+        {
+            let _cwd = CurrentDirGuard::set(&root);
+            let cli = super::LiveCli::new(
+                "sonnet".to_string(),
+                false,
+                super::EffectiveCliPolicy {
+                    permission_mode: PermissionMode::ReadOnly,
+                    allowed_tools: Some(
+                        ["read_file", "glob_search"]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                    ),
+                    active_tool_profile: Some(active_tool_profile(
+                        "audit",
+                        PermissionMode::ReadOnly,
+                        &["read_file", "glob_search"],
+                    )),
+                },
+            )
+            .expect("test live cli should initialize");
+
+            let banner = cli.startup_banner();
+            assert!(banner.contains("Tool profile     audit · ceiling read-only"));
+        }
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn active_tool_profile_is_not_persisted_into_session_json() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-session-profile-boundary");
+        fs::create_dir_all(&root).expect("root should exist");
+        {
+            let _cwd = CurrentDirGuard::set(&root);
+            let cli = super::LiveCli::new(
+                "sonnet".to_string(),
+                false,
+                super::EffectiveCliPolicy {
+                    permission_mode: PermissionMode::ReadOnly,
+                    allowed_tools: Some(["read_file"].into_iter().map(str::to_string).collect()),
+                    active_tool_profile: Some(active_tool_profile(
+                        "audit",
+                        PermissionMode::ReadOnly,
+                        &["read_file"],
+                    )),
+                },
+            )
+            .expect("test live cli should initialize");
+
+            cli.persist_session()
+                .expect("session should persist without tool-profile fields");
+            let saved = fs::read_to_string(&cli.session.path).expect("session file should read");
+            assert!(!saved.contains("tool_profile"));
+            assert!(!saved.contains("toolProfile"));
+            assert!(!saved.contains("\"audit\""));
+        }
+
+        crate::cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -7859,6 +8907,206 @@ mod tests {
         let model =
             resolve_effective_model(Some("gpt-5.3-codex"), &root).expect("model should resolve");
         assert_eq!(model, "gpt-5.3-codex");
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn resolve_requested_execution_policy_keeps_no_profile_behavior() {
+        let _lock = env_lock();
+        let (_openyak_home, _codex_home, root) =
+            isolated_profile_workspace("openyak-cli-no-profile-policy");
+
+        let resolved = super::resolve_requested_execution_policy(
+            &root,
+            requested_policy(
+                Some(PermissionMode::WorkspaceWrite),
+                Some(&["read_file", "glob_search"]),
+                None,
+            ),
+        )
+        .expect("policy should resolve without a profile");
+
+        assert_eq!(resolved.permission_mode, PermissionMode::WorkspaceWrite);
+        assert_eq!(
+            resolved.allowed_tools,
+            Some(
+                ["glob_search", "read_file"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            )
+        );
+        assert!(resolved.active_tool_profile.is_none());
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn resolve_requested_execution_policy_rejects_unknown_profile() {
+        let _lock = env_lock();
+        let (_openyak_home, _codex_home, root) =
+            isolated_profile_workspace("openyak-cli-unknown-profile");
+
+        let error = super::resolve_requested_execution_policy(
+            &root,
+            requested_policy(None, None, Some("audit")),
+        )
+        .expect_err("unknown profile should fail");
+
+        assert!(error.contains("unknown tool profile: audit"));
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn resolve_requested_execution_policy_rejects_permission_widening_above_profile_ceiling() {
+        let _lock = env_lock();
+        let (_openyak_home, _codex_home, root) =
+            isolated_profile_workspace("openyak-cli-profile-ceiling");
+        write_local_settings(
+            &root,
+            r#"{
+  "toolProfiles": {
+    "audit": {
+      "permissionMode": "read-only",
+      "allowedTools": ["read_file", "glob_search"]
+    }
+  }
+}"#,
+        );
+
+        let error = super::resolve_requested_execution_policy(
+            &root,
+            requested_policy(Some(PermissionMode::DangerFullAccess), None, Some("audit")),
+        )
+        .expect_err("widening above the profile ceiling should fail");
+
+        assert!(error.contains("does not allow --permission-mode danger-full-access"));
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn resolve_requested_execution_policy_rejects_allowed_tools_outside_profile_ceiling() {
+        let _lock = env_lock();
+        let (_openyak_home, _codex_home, root) =
+            isolated_profile_workspace("openyak-cli-profile-tools-ceiling");
+        write_local_settings(
+            &root,
+            r#"{
+  "toolProfiles": {
+    "audit": {
+      "permissionMode": "read-only",
+      "allowedTools": ["read_file", "glob_search"]
+    }
+  }
+}"#,
+        );
+
+        let error = super::resolve_requested_execution_policy(
+            &root,
+            requested_policy(None, Some(&["read_file", "write_file"]), Some("audit")),
+        )
+        .expect_err("tools outside the profile should fail");
+
+        assert!(error.contains("does not allow requested tools: write_file"));
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn resolve_requested_execution_policy_rejects_profile_tools_that_exceed_their_ceiling() {
+        let _lock = env_lock();
+        let (_openyak_home, _codex_home, root) =
+            isolated_profile_workspace("openyak-cli-profile-invalid-tool");
+        write_local_settings(
+            &root,
+            r#"{
+  "toolProfiles": {
+    "broken": {
+      "permissionMode": "read-only",
+      "allowedTools": ["write_file"]
+    }
+  }
+}"#,
+        );
+
+        let error = super::resolve_requested_execution_policy(
+            &root,
+            requested_policy(None, None, Some("broken")),
+        )
+        .expect_err("profile tools above the ceiling should fail");
+
+        assert!(error.contains("cannot enable `write_file`"));
+        assert!(error.contains("profile ceiling is read-only"));
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn resolve_requested_execution_policy_surfaces_profile_details_and_narrows_allowed_tools() {
+        let _lock = env_lock();
+        let (_openyak_home, _codex_home, root) =
+            isolated_profile_workspace("openyak-cli-profile-success");
+        write_local_settings(
+            &root,
+            r#"{
+  "toolProfiles": {
+    "audit": {
+      "description": "Local audit mode",
+      "permissionMode": "danger-full-access",
+      "allowedTools": ["read_file", "glob_search", "bash"],
+      "bashPolicy": {
+        "sandbox": {
+          "enabled": true,
+          "filesystemMode": "workspace-only"
+        }
+      }
+    }
+  }
+}"#,
+        );
+
+        let resolved = super::resolve_requested_execution_policy(
+            &root,
+            requested_policy(
+                Some(PermissionMode::ReadOnly),
+                Some(&["read_file", "bash"]),
+                Some("audit"),
+            ),
+        )
+        .expect("profile policy should resolve");
+
+        assert_eq!(resolved.permission_mode, PermissionMode::ReadOnly);
+        assert_eq!(
+            resolved.allowed_tools,
+            Some(
+                ["bash", "read_file"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            )
+        );
+        let active_profile = resolved
+            .active_tool_profile
+            .expect("active tool profile should exist");
+        assert_eq!(active_profile.id, "audit");
+        assert_eq!(
+            active_profile.allowed_tools,
+            ["bash", "glob_search", "read_file"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        assert_eq!(
+            active_profile.permission_mode,
+            PermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            active_profile.bash_policy_summary().as_deref(),
+            Some("bash-only · sandbox on · fs workspace-only · disable denied")
+        );
 
         crate::cleanup_temp_dir(&root);
     }
@@ -8164,6 +9412,112 @@ mod tests {
     }
 
     #[test]
+    fn tool_rendering_formats_browser_observe_results() {
+        let output = json!({
+            "requested_url": "https://example.test/login",
+            "final_url": null,
+            "title": "Login Wall",
+            "load_outcome": "loaded_after_wait_budget",
+            "wait": {
+                "kind": "text",
+                "status": "satisfied",
+                "detail": "captured DOM contained the required text fragment",
+                "expected": "Sign in"
+            },
+            "visible_text": "Sign in to continue",
+            "visible_text_truncated": false,
+            "screenshot": {
+                "relative_path": ".openyak/artifacts/browser/call-1/observe.png",
+                "file_name": "observe.png",
+                "format": "png",
+                "media_type": "image/png",
+                "bytes": 512
+            },
+            "browser_runtime": {
+                "executable": "msedge",
+                "mode": "headless_cli",
+                "capture_backend": "headless_cli_dump_dom"
+            },
+            "timings_ms": {
+                "observation": 120,
+                "screenshot": 40,
+                "total": 160
+            },
+            "warnings": [
+                "slice 1B does not surface post-navigation final_url; requested_url is returned separately"
+            ]
+        })
+        .to_string();
+
+        let rendered = format_tool_result(BROWSER_OBSERVE_TOOL_NAME, &output, false);
+
+        assert!(rendered.contains("BrowserObserve"));
+        assert!(rendered.contains("https://example.test/login"));
+        assert!(rendered.contains("Wait             text"));
+        assert!(rendered.contains("expected Sign in"));
+        assert!(rendered.contains("Screenshot       .openyak/artifacts/browser/call-1/observe.png"));
+        assert!(rendered.contains("Timing           160 ms total"));
+        assert!(rendered.contains("Warnings"));
+    }
+
+    #[test]
+    fn tool_rendering_formats_browser_interact_results() {
+        let output = json!({
+            "requested_url": "https://example.test/login",
+            "final_url": "https://example.test/dashboard",
+            "title": "Dashboard",
+            "action": {
+                "kind": "click",
+                "selector": "#sign-in",
+                "status": "performed",
+                "detail": "clicked <button> selector with label Sign in"
+            },
+            "load_outcome": "clicked_after_wait_budget",
+            "wait": {
+                "kind": "url_contains",
+                "status": "satisfied",
+                "detail": "captured final URL contained the required fragment after the selector click",
+                "expected": "/dashboard"
+            },
+            "visible_text": "Welcome back",
+            "visible_text_truncated": false,
+            "screenshot": {
+                "relative_path": ".openyak/artifacts/browser/call-2/interact.png",
+                "file_name": "interact.png",
+                "format": "png",
+                "media_type": "image/png",
+                "bytes": 1024
+            },
+            "browser_runtime": {
+                "executable": "msedge",
+                "mode": "headless_cdp",
+                "capture_backend": "headless_cdp_single_call"
+            },
+            "timings_ms": {
+                "interaction": 180,
+                "screenshot": 50,
+                "total": 230
+            },
+            "warnings": [
+                "slice 2A supports one selector-backed click per call; durable browser sessions and /v1/threads browser support remain unavailable"
+            ]
+        })
+        .to_string();
+
+        let rendered = format_tool_result(BROWSER_INTERACT_TOOL_NAME, &output, false);
+
+        assert!(rendered.contains("BrowserInteract"));
+        assert!(rendered.contains("Action           click #sign-in"));
+        assert!(rendered.contains("Final URL        https://example.test/dashboard"));
+        assert!(rendered.contains("Wait             url_contains"));
+        assert!(rendered.contains("expected /dashboard"));
+        assert!(
+            rendered.contains("Screenshot       .openyak/artifacts/browser/call-2/interact.png")
+        );
+        assert!(rendered.contains("Timing           230 ms total"));
+    }
+
+    #[test]
     fn tool_rendering_truncates_generic_long_output_for_display_only() {
         let items = (0..120)
             .map(|index| format!("payload {index:03}"))
@@ -8263,6 +9617,51 @@ mod tests {
             describe_tool_progress("grep_search", r#"{"pattern":"ultraplan","path":"rust"}"#),
             "grep `ultraplan` in rust"
         );
+        assert_eq!(
+            describe_tool_progress(
+                BROWSER_OBSERVE_TOOL_NAME,
+                r#"{"url":"https://example.test/dashboard"}"#
+            ),
+            "observe https://example.test/dashboard"
+        );
+        assert_eq!(
+            describe_tool_progress(
+                BROWSER_INTERACT_TOOL_NAME,
+                r##"{"url":"https://example.test/login","action":{"kind":"click","selector":"#sign-in"}}"##
+            ),
+            "click #sign-in on https://example.test/login"
+        );
+    }
+
+    #[test]
+    fn cli_tool_executor_surfaces_browser_tool_allowlist_guidance() {
+        let mut executor = super::CliToolExecutor::new(
+            Some(["read_file"].into_iter().map(str::to_string).collect()),
+            false,
+            GlobalToolRegistry::builtin(),
+        );
+
+        let error = runtime::ToolExecutor::execute(
+            &mut executor,
+            BROWSER_OBSERVE_TOOL_NAME,
+            r#"{"url":"https://example.test"}"#,
+        )
+        .expect_err("BrowserObserve should be rejected when not explicitly allowed");
+
+        assert!(error.to_string().contains(
+            "browser tools remain hidden until you explicitly pass --allowedTools BrowserObserve with browserControl.enabled=true"
+        ));
+
+        let interact_error = runtime::ToolExecutor::execute(
+            &mut executor,
+            BROWSER_INTERACT_TOOL_NAME,
+            r##"{"url":"https://example.test","action":{"kind":"click","selector":"#go"}}"##,
+        )
+        .expect_err("BrowserInteract should be rejected when not explicitly allowed");
+
+        assert!(interact_error.to_string().contains(
+            "browser tools remain hidden until you explicitly pass --allowedTools BrowserInteract with browserControl.enabled=true"
+        ));
     }
 
     #[test]
