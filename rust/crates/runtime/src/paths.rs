@@ -116,15 +116,10 @@ mod tests {
         env::set_var("USERPROFILE", r"C:\Users\tester");
 
         let locations = home_locations();
-        assert_eq!(locations.user_home, PathBuf::from(r"C:\Users\tester"));
-        assert_eq!(
-            locations.codex_home,
-            PathBuf::from(r"C:\Users\tester\.codex")
-        );
-        assert_eq!(
-            locations.openyak_home,
-            PathBuf::from(r"C:\Users\tester\.openyak")
-        );
+        let expected_user_home = PathBuf::from(r"C:\Users\tester");
+        assert_eq!(locations.user_home, expected_user_home);
+        assert_eq!(locations.codex_home, expected_user_home.join(".codex"));
+        assert_eq!(locations.openyak_home, expected_user_home.join(".openyak"));
 
         restore_env("HOME", original_home);
         restore_env("USERPROFILE", original_userprofile);
