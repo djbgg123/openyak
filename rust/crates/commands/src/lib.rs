@@ -3497,11 +3497,11 @@ mod tests {
         write_fake_gh(&fake_bin, &gh_log, "https://example.com/pr/123");
 
         let previous_path = env::var_os("PATH");
-        let mut new_path = fake_bin.display().to_string();
+        let mut path_entries = vec![fake_bin.clone()];
         if let Some(path) = &previous_path {
-            new_path.push(':');
-            new_path.push_str(&path.to_string_lossy());
+            path_entries.extend(env::split_paths(path));
         }
+        let new_path = env::join_paths(path_entries).expect("path should join");
         env::set_var("PATH", &new_path);
         let previous_safeuser = env::var_os("SAFEUSER");
         env::set_var("SAFEUSER", "tester");
@@ -3547,6 +3547,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn commit_push_pr_skips_without_creating_branch_when_nothing_changed() {
+        let _guard = env_lock();
         let repo = init_git_repo("commit-push-pr-skip");
         let remote = temp_dir("commit-push-pr-skip-remote");
         run_command(&remote, "git", &["init", "--bare"]);
@@ -3567,11 +3568,11 @@ mod tests {
         write_fake_gh(&fake_bin, &gh_log, "https://example.com/pr/unused");
 
         let previous_path = env::var_os("PATH");
-        let mut new_path = fake_bin.display().to_string();
+        let mut path_entries = vec![fake_bin.clone()];
         if let Some(path) = &previous_path {
-            new_path.push(':');
-            new_path.push_str(&path.to_string_lossy());
+            path_entries.extend(env::split_paths(path));
         }
+        let new_path = env::join_paths(path_entries).expect("path should join");
         env::set_var("PATH", &new_path);
         let previous_safeuser = env::var_os("SAFEUSER");
         env::set_var("SAFEUSER", "tester");

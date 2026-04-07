@@ -7992,8 +7992,13 @@ mod tests {
 
     #[test]
     fn init_template_mentions_detected_rust_workspace() {
-        let rendered = crate::init::render_init_openyak_md(std::path::Path::new("."));
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("repo root should resolve from crate manifest dir");
+        let rendered = crate::init::render_init_openyak_md(repo_root);
         assert!(rendered.contains("# OPENYAK.md"));
+        assert!(rendered.contains("Run Rust verification from `rust/`:"));
         assert!(rendered.contains("cargo clippy --workspace --all-targets -- -D warnings"));
     }
 
