@@ -5545,6 +5545,9 @@ mod tests {
 
     #[test]
     fn web_search_extracts_and_filters_results() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.contains("GET /search?q=rust+web+search "));
             HttpResponse::html(
@@ -5559,6 +5562,7 @@ mod tests {
             )
         }));
 
+        let original_base = std::env::var_os("OPENYAK_WEB_SEARCH_BASE_URL");
         std::env::set_var(
             "OPENYAK_WEB_SEARCH_BASE_URL",
             format!("http://{}/search", server.addr()),
@@ -5572,7 +5576,10 @@ mod tests {
             }),
         )
         .expect("WebSearch should succeed");
-        std::env::remove_var("OPENYAK_WEB_SEARCH_BASE_URL");
+        match original_base {
+            Some(value) => std::env::set_var("OPENYAK_WEB_SEARCH_BASE_URL", value),
+            None => std::env::remove_var("OPENYAK_WEB_SEARCH_BASE_URL"),
+        }
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["query"], "rust web search");

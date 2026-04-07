@@ -3549,8 +3549,7 @@ mod tests {
     fn commit_push_pr_skips_without_creating_branch_when_nothing_changed() {
         let _guard = env_lock();
         let repo = init_git_repo("commit-push-pr-skip");
-        let remote = temp_dir("commit-push-pr-skip-remote");
-        run_command(&remote, "git", &["init", "--bare"]);
+        let remote = init_bare_repo("commit-push-pr-skip-remote");
         run_command(
             &repo,
             "git",
