@@ -23,7 +23,7 @@ use runtime::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-pub use state_store::StateStoreError;
+pub use state_store::{resolve_workspace_state_root, StateStoreError};
 use state_store::{PersistedThreadRecord, SqliteThreadStore};
 use tokio::sync::broadcast;
 use tools::{GlobalToolRegistry, ProviderRuntimeClient};

@@ -6,7 +6,7 @@ Current package metadata:
 
 - version: `0.0.0a1`
 - requires Python `>=3.10`
-- verified against local `openyak` CLI `v0.1.0` on `2026-04-08`
+- verified against local `openyak` CLI `v0.1.0` on `2026-04-09`
 
 ## Scope
 
@@ -68,6 +68,7 @@ The backing CLI help currently defines `openyak server` as a local HTTP/SSE thre
 - exposes `/v1/threads`
 - keeps legacy `/sessions` compatibility routes
 - persists thread state in workspace `.openyak/state.sqlite3`
+- only supports loopback binds such as `127.0.0.1:0`
 
 ## Quickstart
 
@@ -191,4 +192,4 @@ python -m mypy
 python -m build
 ```
 
-These commands were rerun successfully on `2026-04-08` during the latest repo-wide documentation refresh and full command-by-command CLI verification.
+These commands were rerun successfully on `2026-04-09` during the latest repo-wide documentation refresh and full command-by-command CLI verification.

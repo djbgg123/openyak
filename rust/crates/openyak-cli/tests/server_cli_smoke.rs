@@ -125,6 +125,27 @@ fn openyak_server_surfaces_thread_routes() {
     );
 }
 
+#[test]
+fn openyak_server_rejects_non_loopback_bind() {
+    let workspace = unique_temp_dir("openyak-server-non-loopback");
+    std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+    let output = Command::new(common::openyak_binary())
+        .args(["server", "--bind", "0.0.0.0:0"])
+        .current_dir(&workspace)
+        .output()
+        .expect("openyak server should run");
+
+    assert!(!output.status.success(), "non-loopback bind should fail");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(
+        stderr.contains("must resolve to a loopback address"),
+        "{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     let nanos = SystemTime::now()

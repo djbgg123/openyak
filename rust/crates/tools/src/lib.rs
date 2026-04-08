@@ -3266,20 +3266,43 @@ fn discover_session_server_url() -> Result<String, String> {
         }
     }
 
-    let path = std::env::current_dir()
-        .map_err(|error| error.to_string())?
-        .join(".openyak")
-        .join(THREAD_SERVER_INFO_FILENAME);
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    for path in thread_server_info_candidates(&cwd) {
+        if let Some(base_url) = read_session_server_url_from_info(&path)? {
+            return Ok(base_url);
+        }
+    }
+
+    Err(format!(
+        "thread sessions require a discoverable running local openyak server; start `openyak server --bind 127.0.0.1:0` in this workspace or set {SESSION_SERVER_URL_ENV}"
+    ))
+}
+
+fn thread_server_info_candidates(cwd: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![cwd.join(".openyak").join(THREAD_SERVER_INFO_FILENAME)];
+    if let Ok(canonical_cwd) = cwd.canonicalize() {
+        let canonical_path = canonical_cwd
+            .join(".openyak")
+            .join(THREAD_SERVER_INFO_FILENAME);
+        if !candidates
+            .iter()
+            .any(|candidate| candidate == &canonical_path)
+        {
+            candidates.push(canonical_path);
+        }
+    }
+    candidates
+}
+
+fn read_session_server_url_from_info(path: &Path) -> Result<Option<String>, String> {
     if !path.is_file() {
-        return Err(format!(
-            "thread sessions require a discoverable running local openyak server; start `openyak server --bind 127.0.0.1:0` in this workspace or set {SESSION_SERVER_URL_ENV}"
-        ));
+        return Ok(None);
     }
 
     let info: SessionServerInfo =
-        serde_json::from_str(&std::fs::read_to_string(&path).map_err(|error| error.to_string())?)
+        serde_json::from_str(&std::fs::read_to_string(path).map_err(|error| error.to_string())?)
             .map_err(|error| format!("failed to parse `{}`: {error}", path.display()))?;
-    validate_local_session_server_url(&info.base_url)
+    validate_local_session_server_url(&info.base_url).map(Some)
 }
 
 fn validate_local_session_server_url(value: &str) -> Result<String, String> {
@@ -6990,22 +7013,104 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
     if input.code.trim().is_empty() {
         return Err(String::from("code must not be empty"));
     }
-    let _ = input.timeout_ms;
     let runtime = resolve_repl_runtime(&input.language)?;
+    let timeout_ms = input.timeout_ms;
     let started = Instant::now();
-    let output = Command::new(runtime.program)
+    let mut process = Command::new(runtime.program);
+    process
         .args(&runtime.args)
         .arg(&input.code)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let (output, timed_out) = run_command_with_optional_timeout(&mut process, timeout_ms)
         .map_err(|error| error.to_string())?;
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stderr = if timed_out {
+        let suffix = format!(
+            "Command exceeded timeout of {} ms",
+            timeout_ms.expect("timed out runs should have a timeout")
+        );
+        if stderr.trim().is_empty() {
+            suffix
+        } else {
+            format!("{}\n{suffix}", stderr.trim_end())
+        }
+    } else {
+        stderr
+    };
 
     Ok(ReplOutput {
         language: input.language,
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        exit_code: output.status.code().unwrap_or(1),
+        stderr,
+        exit_code: if timed_out {
+            124
+        } else {
+            output.status.code().unwrap_or(1)
+        },
         duration_ms: started.elapsed().as_millis(),
     })
+}
+
+fn run_command_with_optional_timeout(
+    process: &mut Command,
+    timeout_ms: Option<u64>,
+) -> std::io::Result<(std::process::Output, bool)> {
+    if let Some(timeout_ms) = timeout_ms {
+        let mut child = process.spawn()?;
+        let stdout_reader = spawn_pipe_reader(child.stdout.take());
+        let stderr_reader = spawn_pipe_reader(child.stderr.take());
+        let started = Instant::now();
+        let mut timed_out = false;
+        loop {
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            if started.elapsed() >= Duration::from_millis(timeout_ms) {
+                let _ = child.kill();
+                timed_out = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = child.wait()?;
+        let stdout = join_pipe_reader(stdout_reader)?;
+        let stderr = join_pipe_reader(stderr_reader)?;
+        return Ok((
+            std::process::Output {
+                status,
+                stdout,
+                stderr,
+            },
+            timed_out,
+        ));
+    }
+
+    process.output().map(|output| (output, false))
+}
+
+fn spawn_pipe_reader<R>(reader: Option<R>) -> Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>
+where
+    R: Read + Send + 'static,
+{
+    reader.map(|mut reader| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })
+    })
+}
+
+fn join_pipe_reader(
+    reader: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> std::io::Result<Vec<u8>> {
+    match reader {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| std::io::Error::other("failed to join REPL pipe reader"))?,
+        None => Ok(Vec::new()),
+    }
 }
 
 struct ReplRuntime {
@@ -7535,10 +7640,10 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, browser_interact_tool_spec,
-        browser_observe_tool_spec, execute_agent_with_spawn, execute_tool,
-        execute_tool_with_enforcer, final_assistant_text, foundation_surface, foundation_surfaces,
-        global_cron_registry, global_lsp_registry, global_mcp_registry, global_task_registry,
-        global_team_registry, maybe_enforce_permission_check, mvp_tool_specs,
+        browser_observe_tool_spec, discover_session_server_url, execute_agent_with_spawn,
+        execute_tool, execute_tool_with_enforcer, final_assistant_text, foundation_surface,
+        foundation_surfaces, global_cron_registry, global_lsp_registry, global_mcp_registry,
+        global_task_registry, global_team_registry, maybe_enforce_permission_check, mvp_tool_specs,
         persist_agent_terminal_state, push_output_block, AgentInput, AgentJob, AgentOutput,
         GlobalToolRegistry, SubagentToolExecutor, BROWSER_INTERACT_SUPPORTED_WAIT_KINDS,
         BROWSER_INTERACT_TOOL_NAME, BROWSER_OBSERVE_SUPPORTED_WAIT_KINDS,
@@ -9621,6 +9726,43 @@ mod tests {
     }
 
     #[test]
+    fn repl_timeout_is_enforced() {
+        let result = execute_tool(
+            "REPL",
+            &json!({
+                "language": "python",
+                "code": "import time; time.sleep(5)",
+                "timeout_ms": 100
+            }),
+        )
+        .expect("REPL should return structured timeout output");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["language"], "python");
+        assert_eq!(output["exitCode"], 124);
+        assert!(output["stderr"]
+            .as_str()
+            .expect("stderr")
+            .contains("Command exceeded timeout of 100 ms"));
+    }
+
+    #[test]
+    fn repl_timeout_allows_large_stdout_to_finish() {
+        let result = execute_tool(
+            "REPL",
+            &json!({
+                "language": "python",
+                "code": "import sys; sys.stdout.write('x' * 200000); sys.stdout.flush()",
+                "timeout_ms": 2000
+            }),
+        )
+        .expect("REPL should complete before timing out");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["language"], "python");
+        assert_eq!(output["exitCode"], 0);
+        assert!(output["stdout"].as_str().expect("stdout").len() >= 200_000);
+    }
+
+    #[test]
     fn powershell_runs_via_stub_shell() {
         let _guard = env_lock()
             .lock()
@@ -9894,6 +10036,20 @@ mod tests {
             .expect("server info json"),
         )
         .expect("write thread server info");
+    }
+
+    fn create_test_dir_symlink(
+        link: &std::path::Path,
+        target: &std::path::Path,
+    ) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link)
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
     }
 
     #[test]
@@ -10268,6 +10424,49 @@ mod tests {
             None => std::env::remove_var(SESSION_SERVER_URL_ENV),
         }
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn session_tools_discover_server_info_from_canonical_workspace_path() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace = temp_path("session-tools-symlink-workspace");
+        let workspace_link = temp_path("session-tools-symlink-link");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+
+        match create_test_dir_symlink(&workspace_link, &workspace) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) =>
+            {
+                let _ = std::fs::remove_dir_all(&workspace);
+                return;
+            }
+            Err(error) => panic!("symlink creation should not fail unexpectedly: {error}"),
+        }
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        let original_session_server = std::env::var(SESSION_SERVER_URL_ENV).ok();
+        std::env::set_current_dir(&workspace_link).expect("set symlink cwd");
+        std::env::remove_var(SESSION_SERVER_URL_ENV);
+        write_thread_server_info(
+            &workspace,
+            "127.0.0.1:4242".parse().expect("socket address"),
+        );
+
+        let discovered = discover_session_server_url()
+            .expect("canonical workspace thread server info should be discovered");
+        assert_eq!(discovered, "http://127.0.0.1:4242");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_session_server {
+            Some(value) => std::env::set_var(SESSION_SERVER_URL_ENV, value),
+            None => std::env::remove_var(SESSION_SERVER_URL_ENV),
+        }
+        let _ = std::fs::remove_dir_all(&workspace_link);
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]

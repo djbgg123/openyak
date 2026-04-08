@@ -29,6 +29,53 @@ impl Display for StateStoreError {
 
 impl std::error::Error for StateStoreError {}
 
+pub fn resolve_workspace_state_root(workspace_root: &Path) -> Result<PathBuf, StateStoreError> {
+    let canonical_workspace = workspace_root.canonicalize().map_err(|error| {
+        StateStoreError::new(format!(
+            "failed to resolve server workspace `{}`: {error}",
+            workspace_root.display()
+        ))
+    })?;
+    let state_root = canonical_workspace.join(".openyak");
+    if state_root.exists() {
+        let metadata = fs::symlink_metadata(&state_root).map_err(|error| {
+            StateStoreError::new(format!(
+                "failed to inspect durable state directory `{}`: {error}",
+                state_root.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(StateStoreError::new(format!(
+                "durable state directory `{}` must not be a symlink",
+                state_root.display()
+            )));
+        }
+    } else {
+        fs::create_dir_all(&state_root).map_err(|error| {
+            StateStoreError::new(format!(
+                "failed to create durable state directory `{}`: {error}",
+                state_root.display()
+            ))
+        })?;
+    }
+
+    let canonical_state_root = state_root.canonicalize().map_err(|error| {
+        StateStoreError::new(format!(
+            "failed to resolve durable state directory `{}`: {error}",
+            state_root.display()
+        ))
+    })?;
+    if !canonical_state_root.starts_with(&canonical_workspace) {
+        return Err(StateStoreError::new(format!(
+            "durable state directory `{}` escapes workspace `{}`",
+            canonical_state_root.display(),
+            canonical_workspace.display()
+        )));
+    }
+
+    Ok(canonical_state_root)
+}
+
 #[derive(Debug, Clone)]
 pub struct PersistedThreadRecord {
     pub thread_id: String,
@@ -53,14 +100,7 @@ pub struct SqliteThreadStore {
 
 impl SqliteThreadStore {
     pub fn open(workspace_root: &Path) -> Result<Self, StateStoreError> {
-        let openyak_dir = workspace_root.join(".openyak");
-        fs::create_dir_all(&openyak_dir).map_err(|error| {
-            StateStoreError::new(format!(
-                "failed to create durable state directory `{}`: {error}",
-                openyak_dir.display()
-            ))
-        })?;
-
+        let openyak_dir = resolve_workspace_state_root(workspace_root)?;
         let path = openyak_dir.join(STATE_DB_FILENAME);
         let connection = Connection::open(&path).map_err(|error| {
             StateStoreError::new(format!(
@@ -241,5 +281,77 @@ impl SqliteThreadStore {
                 self.path.display()
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_workspace_state_root;
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{prefix}-{nanos}-{counter}"))
+    }
+
+    fn create_test_dir_symlink(link: &Path, target: &Path) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link)
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+    }
+
+    #[test]
+    fn resolve_workspace_state_root_creates_local_directory() {
+        let root = unique_temp_dir("server-state-root-local");
+        fs::create_dir_all(&root).expect("workspace should exist");
+
+        let resolved = resolve_workspace_state_root(&root).expect("state root should resolve");
+        assert_eq!(
+            resolved,
+            root.join(".openyak").canonicalize().expect("canonical")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_workspace_state_root_rejects_symlink_escape() {
+        let root = unique_temp_dir("server-state-root-symlink");
+        let outside = unique_temp_dir("server-state-root-outside");
+        fs::create_dir_all(&root).expect("workspace should exist");
+        fs::create_dir_all(&outside).expect("outside dir should exist");
+
+        let symlink_path = root.join(".openyak");
+        match create_test_dir_symlink(&symlink_path, &outside) {
+            Ok(()) => {
+                let error = resolve_workspace_state_root(&root)
+                    .expect_err("symlinked state root should be rejected");
+                assert!(error.to_string().contains("must not be a symlink"));
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) =>
+            {
+                // Some Windows environments disallow symlink creation without developer mode.
+            }
+            Err(error) => panic!("symlink creation should not fail unexpectedly: {error}"),
+        }
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
     }
 }

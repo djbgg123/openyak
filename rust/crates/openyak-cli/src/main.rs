@@ -8,7 +8,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -161,6 +161,7 @@ fn render_cli_error(problem: &str) -> String {
 }
 
 fn run_server(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
+    validate_server_bind_target(bind)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -197,8 +198,7 @@ fn write_thread_server_info(
     local_addr: std::net::SocketAddr,
 ) -> Result<ThreadServerInfoGuard, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let openyak_dir = cwd.join(".openyak");
-    fs::create_dir_all(&openyak_dir)?;
+    let openyak_dir = server::resolve_workspace_state_root(&cwd)?;
     let path = openyak_dir.join(THREAD_SERVER_INFO_FILENAME);
     let pid = std::process::id();
     fs::write(
@@ -219,6 +219,30 @@ fn thread_server_info_matches_pid(path: &Path, pid: u32) -> bool {
         return false;
     };
     info.get("pid").and_then(serde_json::Value::as_u64) == Some(u64::from(pid))
+}
+
+fn validate_server_bind_target(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let addresses = bind
+        .to_socket_addrs()
+        .map_err(|error| {
+            io::Error::other(format!(
+                "server --bind `{bind}` could not be resolved: {error}"
+            ))
+        })?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(io::Error::other(format!(
+            "server --bind `{bind}` did not resolve to any socket address"
+        ))
+        .into());
+    }
+    if addresses.iter().any(|address| !address.ip().is_loopback()) {
+        return Err(io::Error::other(format!(
+            "server --bind `{bind}` must resolve to a loopback address; non-loopback binds are not supported"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4731,6 +4755,7 @@ fn run_github_titled_body_create(
         .output()?;
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let _ = fs::remove_file(&body_path);
         return Ok(if stdout.is_empty() {
             "<unknown>".to_string()
         } else {
@@ -4748,13 +4773,33 @@ fn write_temp_text_file(
     extension: &str,
     contents: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let path = env::temp_dir().join(format!("{prefix}-{nanos}.{extension}"));
-    fs::write(&path, contents)?;
-    Ok(path)
+    let temp_dir = env::temp_dir();
+    let pid = std::process::id();
+    for attempt in 0..32_u32 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let path = temp_dir.join(format!("{prefix}-{pid}-{nanos}-{attempt}.{extension}"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(contents.as_bytes())?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("failed to allocate a unique temporary file for `{prefix}`"),
+    )
+    .into())
 }
 
 fn recent_user_context(session: &Session, limit: usize) -> String {
@@ -7013,7 +7058,7 @@ fn render_help_topic(topic: HelpTopic) -> &'static str {
             "Usage: openyak package-release [--output-dir PATH] [--binary PATH]\n\nStage a release artifact directory containing the packaged openyak binary plus generated install metadata.\nBy default the command packages the currently running openyak executable into ./dist."
         }
         HelpTopic::Server => {
-            "Usage: openyak server [--bind HOST:PORT]\n\nRun the local HTTP/SSE thread server backed by the `server` crate.\nThe server exposes the local `/v1/threads` protocol plus legacy `/sessions` compatibility routes, persists thread state in the workspace `.openyak/state.sqlite3` SQLite store, prints the actual bound address on startup, and keeps serving until interrupted."
+            "Usage: openyak server [--bind HOST:PORT]\n\nRun the local HTTP/SSE thread server backed by the `server` crate.\nThe server exposes the local `/v1/threads` protocol plus legacy `/sessions` compatibility routes, persists thread state in the workspace `.openyak/state.sqlite3` SQLite store, prints the actual bound address on startup, keeps serving until interrupted, and only supports loopback binds."
         }
         HelpTopic::Prompt => {
             "Usage: openyak prompt [--tool-profile NAME] <text>\n       openyak -p [--tool-profile NAME] <text>\n\nRun one non-interactive prompt and exit.\nUse --tool-profile to apply a named local tool-profile ceiling for this process only.\nHidden optional browser tools such as BrowserObserve and BrowserInteract still require browserControl.enabled=true plus explicit --allowedTools BrowserObserve or --allowedTools BrowserInteract.\nIf the model requests structured follow-up input, this mode fails explicitly instead of guessing a reply."
@@ -7042,12 +7087,13 @@ mod tests {
         resolve_effective_model, resolve_model_alias, response_to_events,
         resume_supported_slash_commands, run_github_titled_body_create, run_resume_command,
         sessions_dir, slash_command_completion_candidates, stage_release_artifact, status_context,
-        status_context_or_fallback_for_cwd, summarize_command_stderr, write_temp_text_file,
-        CliAction, CliOutputFormat, CliUserInputPrompter, ConfigLoader, DefaultRuntimeClient,
-        DoctorCheckStatus, HelpTopic, InternalPromptProgressEvent, InternalPromptProgressState,
-        SlashCommand, StatusUsage, ThreadServerInfoGuard, BROWSER_INTERACT_TOOL_NAME,
-        BROWSER_OBSERVE_TOOL_NAME, DEFAULT_MODEL, DEFAULT_RELEASE_OUTPUT_DIR, DEFAULT_SERVER_BIND,
-        REQUEST_USER_INPUT_TOOL_NAME, THREAD_SERVER_INFO_FILENAME, VERSION,
+        status_context_or_fallback_for_cwd, summarize_command_stderr, validate_server_bind_target,
+        write_temp_text_file, CliAction, CliOutputFormat, CliUserInputPrompter, ConfigLoader,
+        DefaultRuntimeClient, DoctorCheckStatus, HelpTopic, InternalPromptProgressEvent,
+        InternalPromptProgressState, SlashCommand, StatusUsage, ThreadServerInfoGuard,
+        BROWSER_INTERACT_TOOL_NAME, BROWSER_OBSERVE_TOOL_NAME, DEFAULT_MODEL,
+        DEFAULT_RELEASE_OUTPUT_DIR, DEFAULT_SERVER_BIND, REQUEST_USER_INPUT_TOOL_NAME,
+        THREAD_SERVER_INFO_FILENAME, VERSION,
     };
     use api::{InputContentBlock, MessageResponse, OutputContentBlock, ProviderKind, Usage};
     use plugins::{PluginHooks, PluginTool, PluginToolDefinition, PluginToolPermission};
@@ -7734,6 +7780,7 @@ mod tests {
             render_help_topic(HelpTopic::PackageRelease).contains("Usage: openyak package-release")
         );
         assert!(render_help_topic(HelpTopic::Server).contains("Usage: openyak server"));
+        assert!(render_help_topic(HelpTopic::Server).contains("loopback binds"));
     }
 
     #[test]
@@ -7860,6 +7907,20 @@ mod tests {
             CliAction::Server {
                 bind: "127.0.0.1:0".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn validate_server_bind_target_rejects_non_loopback_addresses() {
+        validate_server_bind_target("127.0.0.1:0").expect("loopback ipv4 should be allowed");
+        validate_server_bind_target("[::1]:0").expect("loopback ipv6 should be allowed");
+        let error =
+            validate_server_bind_target("0.0.0.0:0").expect_err("non-loopback bind should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("must resolve to a loopback address"),
+            "{error}"
         );
     }
 
@@ -10471,6 +10532,40 @@ mod tests {
         assert!(rendered.contains("gh pr create"), "{rendered}");
         assert!(rendered.contains("remote create failed"), "{rendered}");
         assert!(rendered.contains("Draft body file"), "{rendered}");
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn github_remote_create_success_cleans_temp_body_file() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-gh-create-success");
+        let cwd = root.join("workspace");
+        let bin_dir = root.join("bin");
+        let temp_dir = root.join("temp");
+        fs::create_dir_all(&cwd).expect("workspace should exist");
+        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+        let gh_path = write_fake_gh_command(&bin_dir, true, true);
+        let temp_dir_env = temp_dir.to_string_lossy().into_owned();
+        let _temp = EnvVarGuard::set("TEMP", Some(&temp_dir_env));
+        let _tmp = EnvVarGuard::set("TMP", Some(&temp_dir_env));
+
+        let url = run_github_titled_body_create(
+            "pr",
+            &gh_path,
+            &cwd,
+            "feat: test remote success",
+            "body",
+        )
+        .expect("gh create success should return a url");
+        assert_eq!(url, "https://example.com/test/123");
+
+        let leftovers = fs::read_dir(&temp_dir)
+            .expect("temp dir should be readable")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("temp dir entries should load");
+        assert!(leftovers.is_empty(), "{leftovers:?}");
 
         crate::cleanup_temp_dir(&root);
     }
