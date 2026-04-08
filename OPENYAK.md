@@ -110,8 +110,8 @@ skills 发现和解析必须复用共享实现，且同时支持：
 
 - 产品定位、能力边界、主实现归属：更新根目录文档与 [`rust/README.md`](./rust/README.md)。
 - 路径、环境变量、OAuth、skills、日期规则：同时更新根目录和 Rust 文档。
-- `openyak server` 的路由、持久化位置或 public boundary：同时更新根 README、Rust README 和 SDK README。
-- SDK 的包名、导入名、协议边界或验证方式：同步更新对应 SDK README。
+- `openyak server` 的路由、持久化位置或 public boundary：同时更新根 README、Rust README、Python SDK README 和 TypeScript SDK README。
+- SDK 的包名、导入名、协议边界或验证方式：同步更新对应的 Python SDK README 或 TypeScript SDK README。
 - `openyak init` 的脚手架产物：同步更新根 README，并保持 `OPENYAK.md` 口径一致。
 - release binary、packaged-use 或平台相关示例：至少同时覆盖类 Unix 与 Windows PowerShell 写法，不要让 README 只剩单平台命令。
 - 插件 manifest 的路径边界或权限语义：同步更新根 README、Rust README 和发布说明。
