@@ -120,6 +120,7 @@ cd ../..
 - `openyak login` 不再内置默认 OAuth 站点，OAuth 后端必须由你在 `settings.oauth` 中显式配置，并已支持 `manualRedirectUrl` 手动回调模式。
 - OAuth token 现在优先写系统凭据库；只有系统凭据库不可用时才回退到用户配置目录下的 `credentials.json`，并在支持的平台上以受限权限落盘。
 - `openyak doctor` 已提供本地只读的 config/auth/runtime 健康检查，可直接指出常见的设置缺口和修复方向。
+- `openyak doctor` 现在会尊重全局 `--model`；用 OpenAI-compatible 环境变量跑 `openyak --model <openai-family-model> doctor` 时，会检查与 prompt / REPL / GitHub workflow 相同的活动模型鉴权路径。
 - `openyak foundations [task|team|cron|lsp|mcp]` 与 `openyak /foundations [task|team|cron|lsp|mcp]` 已提供只读的 operator discovery surface，用于解释当前 Task / Team / Cron / LSP / MCP 五族的 tool membership 与边界，而不把它们伪装成更宽的控制面。
 - 当前还支持从本地 `toolProfiles` 配置中选择命名 tool profile，通过 `openyak --tool-profile <name> ...` 收窄当前 REPL 或单次 prompt 的 permission mode / allowed-tools ceiling；这一层仍然是 process-local、session transcript-only，且 sandbox 额外约束只对 `bash` 生效。
 - `/commit` 与 `/commit-push-pr` 已修复为不会被 `.openyak/settings.local.json`、`.openyak/sessions/` 这类本地文件阻塞。
@@ -255,6 +256,21 @@ gh auth login --web
 - 这些是 REPL slash command，不支持 `openyak /pr ...` 这种 direct slash CLI 入口；请先启动 `openyak`
 - 这三条链路不仅需要 `gh auth status` 成功，也需要当前活动模型具备可用鉴权，因为 `openyak` 会先起草 commit / PR / issue 文案，再调用 GitHub
 - `openyak doctor` 现在会同时检查 GitHub CLI 可解析性、`gh auth status` 和活动模型本地 auth bootstrap，适合作为只读预检
+
+`2026-04-08` 的一轮真实验收已经证明：只要给出 OpenAI-compatible gateway/API key，并显式选择 OpenAI-family model，当前实现就可以成功跑通 provider-backed `doctor` / `prompt` / 单轮 REPL，以及 disposable GitHub `/issue`、`/pr`、`/commit-push-pr`。
+
+```bash
+export OPENAI_BASE_URL="https://your-openai-compatible-gateway/v1"
+export OPENAI_API_KEY="..."
+cd rust
+cargo run --bin openyak -- --model gpt-5.3-codex doctor
+cargo run --bin openyak -- --model gpt-5.3-codex prompt "reply with the exact text: OPENYAK_PROMPT_OK"
+printf 'reply with the exact text: OPENYAK_REPL_OK\n/exit\n' | cargo run --bin openyak -- --model gpt-5.3-codex
+```
+
+- `openyak login` 仍然是独立的 OAuth 链路；即使 API key 已经足够让 prompt / REPL / GitHub workflow 成功，只要 `settings.oauth.clientId`、`authorizeUrl`、`tokenUrl` 没配齐，`openyak login` 仍会直接拒绝执行。
+- 推荐的 disposable GitHub 验收顺序是：临时私有仓库 `/issue` -> 手工 commit + push throwaway branch 后 `/pr` -> 回到 `main` 保留未提交改动后 `/commit-push-pr`。
+- 清理时优先执行 `gh repo delete OWNER/REPO --yes`。如果当前 `gh` token 缺少 `delete_repo` scope，先用 `gh issue close` / `gh pr close -d` 清掉 issue、PR 和远端分支，再运行 `gh auth refresh -h github.com -s delete_repo` 补齐删除权限后重试仓库删除。
 
 如果你想先做一次本地健康预检，可以直接运行：
 

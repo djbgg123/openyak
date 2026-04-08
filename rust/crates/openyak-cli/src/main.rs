@@ -350,7 +350,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             output_format,
         } => onboard::run_onboard(model.as_deref(), output_format)?,
-        CliAction::Doctor => run_doctor()?,
+        CliAction::Doctor { model } => run_doctor(model.as_deref())?,
         CliAction::Foundations { family } => print_foundations(family.as_deref())?,
         CliAction::PackageRelease { binary, output_dir } => {
             run_package_release(binary.as_deref(), &output_dir)?;
@@ -402,7 +402,9 @@ enum CliAction {
         model: Option<String>,
         output_format: CliOutputFormat,
     },
-    Doctor,
+    Doctor {
+        model: Option<String>,
+    },
     Foundations {
         family: Option<String>,
     },
@@ -651,7 +653,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "init" if is_help_args(&rest[1..]) => Ok(CliAction::Help(HelpTopic::Init)),
         "init" => Ok(CliAction::Init),
         "onboard" => parse_onboard_args(&rest[1..], model, output_format),
-        "doctor" => parse_doctor_args(&rest[1..]),
+        "doctor" => parse_doctor_args(&rest[1..], model),
         "foundations" => parse_foundations_args(&rest[1..]),
         "package-release" => parse_package_release_args(&rest[1..]),
         "server" => parse_server_args(&rest[1..]),
@@ -774,12 +776,12 @@ fn parse_server_args(args: &[String]) -> Result<CliAction, String> {
     Ok(CliAction::Server { bind })
 }
 
-fn parse_doctor_args(args: &[String]) -> Result<CliAction, String> {
+fn parse_doctor_args(args: &[String], model: Option<String>) -> Result<CliAction, String> {
     if args.is_empty() || is_help_args(args) {
         return Ok(if is_help_args(args) {
             CliAction::Help(HelpTopic::Doctor)
         } else {
-            CliAction::Doctor
+            CliAction::Doctor { model }
         });
     }
 
@@ -1565,10 +1567,10 @@ impl DoctorReport {
     }
 }
 
-fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
+fn run_doctor(requested_model: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
-    let report = collect_doctor_report_with_loader(&cwd, &loader);
+    let report = collect_doctor_report_with_loader(&cwd, &loader, requested_model);
     print!("{}", render_doctor_report(&report));
     if report.has_errors() {
         return Err(io::Error::other("openyak doctor found blocking issues").into());
@@ -1578,10 +1580,14 @@ fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
 
 pub(crate) fn collect_doctor_report(cwd: &Path) -> DoctorReport {
     let loader = ConfigLoader::default_for(cwd);
-    collect_doctor_report_with_loader(cwd, &loader)
+    collect_doctor_report_with_loader(cwd, &loader, None)
 }
 
-pub(crate) fn collect_doctor_report_with_loader(cwd: &Path, loader: &ConfigLoader) -> DoctorReport {
+pub(crate) fn collect_doctor_report_with_loader(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    requested_model: Option<&str>,
+) -> DoctorReport {
     let config_home = loader.config_home().to_path_buf();
     let credentials_path =
         credentials_path().unwrap_or_else(|_| config_home.join("credentials.json"));
@@ -1628,7 +1634,7 @@ pub(crate) fn collect_doctor_report_with_loader(cwd: &Path, loader: &ConfigLoade
     checks.push(doctor_saved_oauth_check());
 
     match config.as_ref() {
-        Some(config) => checks.push(doctor_active_model_auth_check(config)),
+        Some(config) => checks.push(doctor_active_model_auth_check(config, requested_model)),
         None => checks.push(doctor_skipped_check("active model auth")),
     }
 
@@ -1722,9 +1728,12 @@ pub(crate) fn doctor_token_is_expired(expires_at: Option<u64>) -> bool {
     })
 }
 
-fn doctor_active_model_auth_check(config: &runtime::RuntimeConfig) -> DoctorCheck {
-    let model = config
-        .model()
+fn doctor_active_model_auth_check(
+    config: &runtime::RuntimeConfig,
+    requested_model: Option<&str>,
+) -> DoctorCheck {
+    let model = requested_model
+        .or_else(|| config.model())
         .map_or(DEFAULT_MODEL, resolve_model_alias)
         .to_string();
     let provider = api::detect_provider_kind(&model);
@@ -6980,7 +6989,7 @@ fn render_help_topic(topic: HelpTopic) -> &'static str {
             "Usage: openyak onboard\n\nRun the explicit interactive onboarding wizard.\nThe flow is local-only, reuses `openyak init`, persisted user-model setup, provider-aware auth guidance, and `openyak doctor`, and exits safely without writes in non-interactive terminals."
         }
         HelpTopic::Doctor => {
-            "Usage: openyak doctor\n\nRun local read-only health checks for config loading, OAuth setup, active model auth bootstrap, and GitHub CLI availability/auth readiness."
+            "Usage: openyak doctor\n       openyak --model MODEL doctor\n\nRun local read-only health checks for config loading, OAuth setup, active model auth bootstrap, and GitHub CLI availability/auth readiness. Pass --model to verify the exact provider/auth path you plan to use for prompt, REPL, or GitHub workflows."
         }
         HelpTopic::Foundations => {
             "Usage: openyak foundations [task|team|cron|lsp|mcp]\n\nShow the shipped read-only foundation families for the current CLI mainline.\nThis surface explains tool membership and current boundaries for Task / Team / Cron / LSP / MCP without implying durable registries, a standalone LSP host, or a broader control plane."
@@ -7018,7 +7027,7 @@ mod tests {
         resume_supported_slash_commands, run_github_titled_body_create, run_resume_command,
         sessions_dir, slash_command_completion_candidates, stage_release_artifact, status_context,
         status_context_or_fallback_for_cwd, summarize_command_stderr, CliAction, CliOutputFormat,
-        CliUserInputPrompter, DefaultRuntimeClient, DoctorCheckStatus, HelpTopic,
+        CliUserInputPrompter, ConfigLoader, DefaultRuntimeClient, DoctorCheckStatus, HelpTopic,
         InternalPromptProgressEvent, InternalPromptProgressState, SlashCommand, StatusUsage,
         ThreadServerInfoGuard, BROWSER_INTERACT_TOOL_NAME, BROWSER_OBSERVE_TOOL_NAME,
         DEFAULT_MODEL, DEFAULT_RELEASE_OUTPUT_DIR, DEFAULT_SERVER_BIND,
@@ -7700,6 +7709,7 @@ mod tests {
         assert!(render_help_topic(HelpTopic::Onboard).contains("Usage: openyak onboard"));
         assert!(render_help_topic(HelpTopic::Onboard).contains("interactive onboarding wizard"));
         assert!(render_help_topic(HelpTopic::Doctor).contains("Usage: openyak doctor"));
+        assert!(render_help_topic(HelpTopic::Doctor).contains("--model MODEL doctor"));
         assert!(render_help_topic(HelpTopic::Foundations).contains("Usage: openyak foundations"));
         assert!(
             render_help_topic(HelpTopic::Foundations).contains("Task / Team / Cron / LSP / MCP")
@@ -7762,7 +7772,18 @@ mod tests {
         );
         assert_eq!(
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),
-            CliAction::Doctor
+            CliAction::Doctor { model: None }
+        );
+        assert_eq!(
+            parse_args(&[
+                "--model".to_string(),
+                "gpt-5.3-codex".to_string(),
+                "doctor".to_string(),
+            ])
+            .expect("doctor with model should parse"),
+            CliAction::Doctor {
+                model: Some("gpt-5.3-codex".to_string())
+            }
         );
         assert_eq!(
             parse_args(&["foundations".to_string()]).expect("foundations should parse"),
@@ -8869,6 +8890,44 @@ mod tests {
                 .as_deref()
                 .is_some_and(|hint| hint.contains("gh auth login --web")),
             "{github_check:?}"
+        );
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn doctor_report_uses_requested_model_override_for_auth_check() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-doctor-model-override");
+        let cwd = root.join("workspace");
+        let config_home = root.join("openyak-home");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&cwd).expect("workspace should exist");
+        fs::create_dir_all(&config_home).expect("config home should exist");
+        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        write_fake_command(&bin_dir, "gh");
+        let config_home_env = config_home.to_string_lossy().to_string();
+        let path_env = std::env::join_paths([bin_dir.as_path()])
+            .expect("path should join")
+            .to_string_lossy()
+            .to_string();
+        let _openyak_home = EnvVarGuard::set("OPENYAK_CONFIG_HOME", Some(&config_home_env));
+        let _path = EnvVarGuard::set("PATH", Some(&path_env));
+        let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+        let _openai_api_key = EnvVarGuard::set("OPENAI_API_KEY", Some("doctor-openai-test-key"));
+
+        let loader = ConfigLoader::default_for(&cwd);
+        let report = super::collect_doctor_report_with_loader(&cwd, &loader, Some("gpt-5.3-codex"));
+        let auth_check = doctor_check(&report, "active model auth");
+
+        assert_eq!(auth_check.status, DoctorCheckStatus::Ok, "{auth_check:?}");
+        assert!(
+            auth_check.summary.contains("gpt-5.3-codex"),
+            "{auth_check:?}"
+        );
+        assert!(
+            auth_check.summary.contains("openai-compatible"),
+            "{auth_check:?}"
         );
 
         crate::cleanup_temp_dir(&root);
