@@ -203,13 +203,17 @@ cargo run --bin openyak -- logout
 
 ### GitHub CLI
 
-如果要使用 `/pr`、`/issue`、`/commit-push-pr` 等链路，先完成：
+如果要在交互式 `openyak` 会话里使用 `/pr`、`/issue`、`/commit-push-pr` 等链路，先完成：
 
 ```bash
 gh auth login --web
 ```
 
 Windows 下的 `gh` 解析和浏览器启动已经统一走运行时 helper；如果链路失败，优先检查相应命令是否真的在系统环境中可解析。
+
+- 这些是 REPL slash command，不支持 `openyak /pr ...` 这种 direct slash CLI 入口；请先启动 `openyak`
+- 这三条链路同时依赖 `gh auth status` 和活动模型鉴权，因为 openyak 会先生成草稿，再联系 GitHub
+- `openyak doctor` 会把 GitHub CLI 可解析性、`gh auth status` 与活动模型本地 auth bootstrap 一起列出来，适合作为只读预检
 
 如果要先做本地健康预检：
 
@@ -305,7 +309,7 @@ skills 目录支持两种布局：
 - local-only 的 Session operator surface：`SessionList`、`SessionGet`、`SessionCreate`、`SessionSend`、`SessionResume`、`SessionWait`
 - 顶层命令与 REPL slash command 的本地发现和执行
 - direct slash CLI 入口（`openyak /agents`、`openyak /skills`、`openyak /foundations`）以及 `--resume` 形式的 resume-safe slash command 恢复执行
-- `openyak doctor` 对配置加载、OAuth 配置/凭据、活动模型鉴权预检和 GitHub CLI 可用性做本地只读检查
+- `openyak doctor` 对配置加载、OAuth 配置/凭据、活动模型鉴权预检，以及 GitHub CLI 可用性 / `gh auth status` readiness 做本地只读检查
 - `openyak foundations [task|team|cron|lsp|mcp]` / `/foundations [task|team|cron|lsp|mcp]` 作为只读的 discovery surface，明确说明当前 Task / Team / Cron / LSP / MCP 的 tool membership 与 `process_local_v1` / registry-backed 边界
 - `openyak package-release` 生成本地 release artifact 目录，供 release/upload 与脱离源码目录的 packaged-use 验证
 - 插件发现、安装、启用、禁用、卸载、更新

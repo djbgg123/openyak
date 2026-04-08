@@ -10,7 +10,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -34,8 +34,8 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    clear_oauth_credentials, command_exists, credentials_path, current_local_date_string,
-    format_usd, generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt,
+    clear_oauth_credentials, credentials_path, current_local_date_string, format_usd,
+    generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt,
     parse_oauth_callback_request_target, pricing_for_model, resolve_command_path,
     save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent, CompactionConfig,
     CompactionSummaryMode, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
@@ -57,6 +57,8 @@ const REQUEST_USER_INPUT_TOOL_NAME: &str = "openyak_request_user_input";
 const REQUEST_USER_INPUT_PROMPT: &str = "answer> ";
 const BROWSER_OBSERVE_TOOL_NAME: &str = "BrowserObserve";
 const BROWSER_INTERACT_TOOL_NAME: &str = "BrowserInteract";
+const GITHUB_WORKFLOW_AUTH_EXPLANATION: &str =
+    "GitHub workflows also require active model auth because openyak drafts content before contacting GitHub.";
 
 fn is_hidden_browser_tool_name(name: &str) -> bool {
     matches!(name, BROWSER_OBSERVE_TOOL_NAME | BROWSER_INTERACT_TOOL_NAME)
@@ -1766,20 +1768,111 @@ fn doctor_active_model_auth_check(config: &runtime::RuntimeConfig) -> DoctorChec
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitHubCliStatus {
+    Missing,
+    Ready { path: PathBuf },
+    AuthMissing { path: PathBuf, detail: String },
+    Unavailable { path: PathBuf, detail: String },
+}
+
+fn inspect_github_cli() -> GitHubCliStatus {
+    let Some(path) = resolve_command_path("gh") else {
+        return GitHubCliStatus::Missing;
+    };
+    match Command::new(&path).args(["auth", "status"]).output() {
+        Ok(output) if output.status.success() => GitHubCliStatus::Ready { path },
+        Ok(output) => GitHubCliStatus::AuthMissing {
+            path,
+            detail: summarize_command_output(&output),
+        },
+        Err(error) => GitHubCliStatus::Unavailable {
+            path,
+            detail: error.to_string(),
+        },
+    }
+}
+
 fn doctor_github_cli_check() -> DoctorCheck {
-    match resolve_command_path("gh") {
-        Some(path) => DoctorCheck::ok(
-            "github cli",
-            format!("GitHub CLI is available at {}.", path.display()),
-            None,
-        ),
-        None => DoctorCheck::warning(
+    match inspect_github_cli() {
+        GitHubCliStatus::Missing => DoctorCheck::warning(
             "github cli",
             "`gh` is not available on PATH.",
             Some(
-                "Install GitHub CLI and run `gh auth login --web` if you want `/pr`, `/issue`, or `/commit-push-pr` workflows.".to_string(),
+                format!(
+                    "Install GitHub CLI, run `gh auth login --web`, and remember {GITHUB_WORKFLOW_AUTH_EXPLANATION}"
+                ),
             ),
         ),
+        GitHubCliStatus::Ready { path } => DoctorCheck::ok(
+            "github cli",
+            format!(
+                "GitHub CLI is available at {} and `gh auth status` succeeded. {}",
+                path.display(),
+                GITHUB_WORKFLOW_AUTH_EXPLANATION
+            ),
+            None,
+        ),
+        GitHubCliStatus::AuthMissing { path, detail } => DoctorCheck::warning(
+            "github cli",
+            format!(
+                "GitHub CLI is available at {} but `gh auth status` is not ready: {detail}",
+                path.display()
+            ),
+            Some(
+                format!("Run `gh auth login --web`. {GITHUB_WORKFLOW_AUTH_EXPLANATION}"),
+            ),
+        ),
+        GitHubCliStatus::Unavailable { path, detail } => DoctorCheck::warning(
+            "github cli",
+            format!(
+                "GitHub CLI is available at {} but `gh auth status` could not run: {detail}",
+                path.display()
+            ),
+            Some(
+                format!(
+                    "Fix the local `gh` installation, then rerun `openyak doctor`. {GITHUB_WORKFLOW_AUTH_EXPLANATION}"
+                ),
+            ),
+        ),
+    }
+}
+
+fn ensure_github_cli_ready(command: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    match inspect_github_cli() {
+        GitHubCliStatus::Missing => Err(io::Error::other(render_github_workflow_unavailable(
+            command,
+            "`gh` is not available on PATH.",
+            &format!(
+                "Install GitHub CLI, run `gh auth login --web`, and rerun the command from an interactive `openyak` session. {GITHUB_WORKFLOW_AUTH_EXPLANATION}"
+            ),
+        ))
+        .into()),
+        GitHubCliStatus::Ready { path } => Ok(path),
+        GitHubCliStatus::AuthMissing { path, detail } => {
+            Err(io::Error::other(render_github_workflow_unavailable(
+                command,
+                &format!(
+                    "GitHub CLI at {} is not authenticated: {detail}",
+                    path.display()
+                ),
+                &format!(
+                    "Run `gh auth login --web`, then rerun the command. {GITHUB_WORKFLOW_AUTH_EXPLANATION}"
+                ),
+            ))
+            .into())
+        }
+        GitHubCliStatus::Unavailable { path, detail } => {
+            Err(io::Error::other(render_github_workflow_unavailable(
+                command,
+                &format!(
+                    "GitHub CLI at {} could not run `gh auth status`: {detail}",
+                    path.display()
+                ),
+                "Fix the local `gh` installation, rerun `openyak doctor`, then retry the workflow.",
+            ))
+            .into())
+        }
     }
 }
 
@@ -3690,9 +3783,7 @@ impl LiveCli {
             return Ok(());
         }
 
-        if !command_exists("gh") {
-            return Err("gh CLI is required for /commit-push-pr".into());
-        }
+        ensure_github_cli_ready("commit-push-pr")?;
 
         let workspace_has_changes = !workspace_status.trim().is_empty();
         let diff_summary = git_output_filtered(&["diff", "--stat"])?;
@@ -3705,7 +3796,15 @@ impl LiveCli {
             truncate_for_prompt(&branch_diff, 8_000),
             recent_user_context(self.runtime.session(), 10)
         );
-        let draft = sanitize_generated_message(&self.run_internal_prompt_text(&prompt, false)?);
+        let draft =
+            sanitize_generated_message(&self.run_internal_prompt_text(&prompt, false).map_err(
+                |error| {
+                    io::Error::other(render_github_workflow_generation_failure(
+                        "commit-push-pr",
+                        &error,
+                    ))
+                },
+            )?);
         let (commit_message, pr_title, pr_body) = parse_commit_push_pr_draft(&draft)
             .ok_or_else(|| "failed to parse generated commit/push/PR response".to_string())?;
         if workspace_has_changes && commit_message.is_none() {
@@ -3733,65 +3832,47 @@ impl LiveCli {
             return Ok(());
         }
 
+        let gh_command = ensure_github_cli_ready("pr")?;
         let staged = git_output_filtered(&["diff", "--stat"])?;
         let prompt = format!(
             "Generate a pull request title and body from this conversation and diff summary. Output plain text in this format exactly:\nTITLE: <title>\nBODY:\n<body markdown>\n\nContext hint: {}\n\nDiff summary:\n{}",
             context.unwrap_or("none"),
             truncate_for_prompt(&staged, 10_000)
         );
-        let draft = sanitize_generated_message(&self.run_internal_prompt_text(&prompt, false)?);
+        let draft =
+            sanitize_generated_message(&self.run_internal_prompt_text(&prompt, false).map_err(
+                |error| io::Error::other(render_github_workflow_generation_failure("pr", &error)),
+            )?);
         let (title, body) = parse_titled_body(&draft)
             .ok_or_else(|| "failed to parse generated PR title/body".to_string())?;
-
-        if let Some(gh_command) = resolve_command_path("gh") {
-            let body_path = write_temp_text_file("openyak-pr-body.md", &body)?;
-            let output = Command::new(gh_command)
-                .args(["pr", "create", "--title", &title, "--body-file"])
-                .arg(&body_path)
-                .current_dir(env::current_dir()?)
-                .output()?;
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                println!(
-                    "PR\n  Result           created\n  Title            {title}\n  URL              {}",
-                    if stdout.is_empty() { "<unknown>" } else { &stdout }
-                );
-                return Ok(());
-            }
-        }
-
-        println!("PR draft\n  Title            {title}\n\n{body}");
+        let cwd = env::current_dir()?;
+        let url = run_github_titled_body_create("pr", &gh_command, &cwd, &title, &body)?;
+        println!(
+            "PR\n  Result           created\n  Title            {title}\n  URL              {url}"
+        );
         Ok(())
     }
 
     fn run_issue(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let gh_command = ensure_github_cli_ready("issue")?;
         let prompt = format!(
             "Generate a GitHub issue title and body from this conversation. Output plain text in this format exactly:\nTITLE: <title>\nBODY:\n<body markdown>\n\nContext hint: {}\n\nConversation context:\n{}",
             context.unwrap_or("none"),
             truncate_for_prompt(&recent_user_context(self.runtime.session(), 10), 10_000)
         );
-        let draft = sanitize_generated_message(&self.run_internal_prompt_text(&prompt, false)?);
+        let draft =
+            sanitize_generated_message(&self.run_internal_prompt_text(&prompt, false).map_err(
+                |error| {
+                    io::Error::other(render_github_workflow_generation_failure("issue", &error))
+                },
+            )?);
         let (title, body) = parse_titled_body(&draft)
             .ok_or_else(|| "failed to parse generated issue title/body".to_string())?;
-
-        if let Some(gh_command) = resolve_command_path("gh") {
-            let body_path = write_temp_text_file("openyak-issue-body.md", &body)?;
-            let output = Command::new(gh_command)
-                .args(["issue", "create", "--title", &title, "--body-file"])
-                .arg(&body_path)
-                .current_dir(env::current_dir()?)
-                .output()?;
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                println!(
-                    "Issue\n  Result           created\n  Title            {title}\n  URL              {}",
-                    if stdout.is_empty() { "<unknown>" } else { &stdout }
-                );
-                return Ok(());
-            }
-        }
-
-        println!("Issue draft\n  Title            {title}\n\n{body}");
+        let cwd = env::current_dir()?;
+        let url = run_github_titled_body_create("issue", &gh_command, &cwd, &title, &body)?;
+        println!(
+            "Issue\n  Result           created\n  Title            {title}\n  URL              {url}"
+        );
         Ok(())
     }
 }
@@ -4357,6 +4438,49 @@ fn render_git_command_requires_repo(command: &str, feature: &str) -> String {
     )
 }
 
+fn render_github_workflow_unavailable(command: &str, reason: &str, tip: &str) -> String {
+    format!(
+        "GitHub workflow unavailable
+  Command          /{command}
+  Reason           {reason}
+  Tip              {tip}"
+    )
+}
+
+fn render_github_workflow_generation_failure(
+    command: &str,
+    error: &dyn std::fmt::Display,
+) -> String {
+    format!(
+        "GitHub workflow blocked before remote execution
+  Command          /{command}
+  Stage            draft generation
+  Reason           {error}
+  Tip              Authenticate the active model first. `openyak doctor` shows local model auth and GitHub CLI readiness."
+    )
+}
+
+fn render_github_remote_failure(
+    command: &str,
+    gh_args: &[&str],
+    title: &str,
+    body_path: &Path,
+    output: &Output,
+) -> String {
+    format!(
+        "GitHub remote workflow failed
+  Command          /{command}
+  Remote           gh {}
+  Reason           {}
+  Draft title      {title}
+  Draft body file  {}
+  Tip              Fix GitHub auth or repository state, then rerun the command from the same interactive `openyak` session.",
+        gh_args.join(" "),
+        summarize_command_output(output),
+        body_path.display()
+    )
+}
+
 fn render_teleport_report(target: &str) -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
 
@@ -4517,6 +4641,65 @@ fn summarize_command_stderr(stderr: &[u8]) -> String {
         .find(|line| !line.is_empty())
         .unwrap_or("command failed")
         .to_string()
+}
+
+fn summarize_command_output(output: &Output) -> String {
+    for stream in [&output.stderr, &output.stdout] {
+        if let Some(line) = String::from_utf8_lossy(stream)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+        {
+            return line.to_string();
+        }
+    }
+    output.status.code().map_or_else(
+        || "command terminated by signal".to_string(),
+        |code| format!("command exited with status {code}"),
+    )
+}
+
+fn run_github_titled_body_create(
+    command: &str,
+    gh_command: &Path,
+    cwd: &Path,
+    title: &str,
+    body: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (gh_args, body_filename) = match command {
+        "pr" => (
+            vec!["pr", "create", "--title", title, "--body-file"],
+            "openyak-pr-body.md",
+        ),
+        "issue" => (
+            vec!["issue", "create", "--title", title, "--body-file"],
+            "openyak-issue-body.md",
+        ),
+        other => {
+            return Err(io::Error::other(format!(
+                "unsupported GitHub titled-body workflow `{other}`"
+            ))
+            .into())
+        }
+    };
+    let body_path = write_temp_text_file(body_filename, body)?;
+    let output = Command::new(gh_command)
+        .args(&gh_args)
+        .arg(&body_path)
+        .current_dir(cwd)
+        .output()?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok(if stdout.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            stdout
+        });
+    }
+    Err(io::Error::other(render_github_remote_failure(
+        command, &gh_args, title, &body_path, &output,
+    ))
+    .into())
 }
 
 fn write_temp_text_file(
@@ -6797,7 +6980,7 @@ fn render_help_topic(topic: HelpTopic) -> &'static str {
             "Usage: openyak onboard\n\nRun the explicit interactive onboarding wizard.\nThe flow is local-only, reuses `openyak init`, persisted user-model setup, provider-aware auth guidance, and `openyak doctor`, and exits safely without writes in non-interactive terminals."
         }
         HelpTopic::Doctor => {
-            "Usage: openyak doctor\n\nRun local read-only health checks for config loading, OAuth setup, active model auth bootstrap, and GitHub CLI availability."
+            "Usage: openyak doctor\n\nRun local read-only health checks for config loading, OAuth setup, active model auth bootstrap, and GitHub CLI availability/auth readiness."
         }
         HelpTopic::Foundations => {
             "Usage: openyak foundations [task|team|cron|lsp|mcp]\n\nShow the shipped read-only foundation families for the current CLI mainline.\nThis surface explains tool membership and current boundaries for Task / Team / Cron / LSP / MCP without implying durable registries, a standalone LSP host, or a broader control plane."
@@ -6832,8 +7015,8 @@ mod tests {
         render_git_command_requires_repo, render_help_topic, render_last_tool_debug_report,
         render_memory_report, render_repl_help, render_unknown_repl_command,
         resolve_effective_model, resolve_model_alias, response_to_events,
-        resume_supported_slash_commands, run_resume_command, sessions_dir,
-        slash_command_completion_candidates, stage_release_artifact, status_context,
+        resume_supported_slash_commands, run_github_titled_body_create, run_resume_command,
+        sessions_dir, slash_command_completion_candidates, stage_release_artifact, status_context,
         status_context_or_fallback_for_cwd, summarize_command_stderr, CliAction, CliOutputFormat,
         CliUserInputPrompter, DefaultRuntimeClient, DoctorCheckStatus, HelpTopic,
         InternalPromptProgressEvent, InternalPromptProgressState, SlashCommand, StatusUsage,
@@ -6957,7 +7140,12 @@ mod tests {
         } else {
             dir.join(name)
         };
-        fs::write(&path, "@echo off\r\n").expect("fake command should write");
+        let script = if cfg!(windows) {
+            "@echo off\r\nexit /b 0\r\n"
+        } else {
+            "#!/bin/sh\nexit 0\n"
+        };
+        fs::write(&path, script).expect("fake command should write");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -6968,6 +7156,55 @@ mod tests {
             permissions.set_mode(0o755);
             fs::set_permissions(&path, permissions)
                 .expect("fake command permissions should update");
+        }
+        path
+    }
+
+    fn write_fake_gh_command(dir: &Path, auth_ready: bool, create_ready: bool) -> PathBuf {
+        let path = if cfg!(windows) {
+            dir.join("gh.cmd")
+        } else {
+            dir.join("gh")
+        };
+        let script = if cfg!(windows) {
+            let auth_branch = if auth_ready {
+                "exit /b 0"
+            } else {
+                "echo gh: not logged in 1>&2\r\nexit /b 1"
+            };
+            let create_branch = if create_ready {
+                "echo https://example.com/test/123\r\nexit /b 0"
+            } else {
+                "echo gh: remote create failed 1>&2\r\nexit /b 1"
+            };
+            format!(
+                "@echo off\r\nif \"%~1 %~2\"==\"auth status\" (\r\n{auth_branch}\r\n)\r\nif \"%~1 %~2\"==\"pr create\" (\r\n{create_branch}\r\n)\r\nif \"%~1 %~2\"==\"issue create\" (\r\n{create_branch}\r\n)\r\nexit /b 0\r\n"
+            )
+        } else {
+            let auth_branch = if auth_ready {
+                "exit 0"
+            } else {
+                "echo 'gh: not logged in' >&2\n  exit 1"
+            };
+            let create_branch = if create_ready {
+                "echo 'https://example.com/test/123'\n  exit 0"
+            } else {
+                "echo 'gh: remote create failed' >&2\n  exit 1"
+            };
+            format!(
+                "#!/bin/sh\nif [ \"$1 $2\" = \"auth status\" ]; then\n  {auth_branch}\nfi\nif [ \"$1 $2\" = \"pr create\" ] || [ \"$1 $2\" = \"issue create\" ]; then\n  {create_branch}\nfi\nexit 0\n"
+            )
+        };
+        fs::write(&path, script).expect("fake gh command should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&path)
+                .expect("fake gh metadata should load")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).expect("fake gh permissions should update");
         }
         path
     }
@@ -8594,6 +8831,50 @@ mod tests {
     }
 
     #[test]
+    fn doctor_report_warns_when_github_cli_is_not_logged_in() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-doctor-gh-auth");
+        let cwd = root.join("workspace");
+        let config_home = root.join("openyak-home");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&cwd).expect("workspace should exist");
+        fs::create_dir_all(&config_home).expect("config home should exist");
+        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        write_fake_gh_command(&bin_dir, false, true);
+        let config_home_env = config_home.to_string_lossy().to_string();
+        let path_env = std::env::join_paths([bin_dir.as_path()])
+            .expect("path should join")
+            .to_string_lossy()
+            .to_string();
+        let _openyak_home = EnvVarGuard::set("OPENYAK_CONFIG_HOME", Some(&config_home_env));
+        let _path = EnvVarGuard::set("PATH", Some(&path_env));
+        let _api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", Some("doctor-test-key"));
+        let _auth_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+
+        let report = super::collect_doctor_report(&cwd);
+        let github_check = doctor_check(&report, "github cli");
+
+        assert!(
+            !report.has_errors(),
+            "gh auth warning should not be blocking"
+        );
+        assert_eq!(github_check.status, DoctorCheckStatus::Warning);
+        assert!(
+            github_check.summary.contains("gh auth status"),
+            "{github_check:?}"
+        );
+        assert!(
+            github_check
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("gh auth login --web")),
+            "{github_check:?}"
+        );
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
     fn doctor_report_flags_malformed_config_path() {
         let _lock = env_lock();
         let root = unique_temp_dir("openyak-cli-doctor-bad-config");
@@ -9934,5 +10215,37 @@ mod tests {
         assert!(report.contains("Command unavailable"));
         assert!(report.contains("Command          /pr"));
         assert!(report.contains("current directory is not inside a git repository"));
+    }
+
+    #[test]
+    fn github_remote_create_failure_is_structured_and_non_successful() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-gh-create-failure");
+        let cwd = root.join("workspace");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&cwd).expect("workspace should exist");
+        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        let gh_path = write_fake_gh_command(&bin_dir, true, false);
+
+        let error = run_github_titled_body_create(
+            "pr",
+            &gh_path,
+            &cwd,
+            "feat: test remote failure",
+            "body",
+        )
+        .expect_err("gh create failure should bubble up");
+        let rendered = error.to_string();
+
+        assert!(
+            rendered.contains("GitHub remote workflow failed"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Command          /pr"), "{rendered}");
+        assert!(rendered.contains("gh pr create"), "{rendered}");
+        assert!(rendered.contains("remote create failed"), "{rendered}");
+        assert!(rendered.contains("Draft body file"), "{rendered}");
+
+        crate::cleanup_temp_dir(&root);
     }
 }
