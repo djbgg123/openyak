@@ -3,6 +3,7 @@ mod hooks;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -959,6 +960,28 @@ impl PluginManager {
         })
     }
 
+    fn managed_install_root(&self) -> Result<PathBuf, PluginError> {
+        canonicalize_allow_missing(&self.install_root()).map_err(PluginError::Io)
+    }
+
+    fn ensure_managed_install_path(
+        &self,
+        path: &Path,
+        action: &str,
+    ) -> Result<PathBuf, PluginError> {
+        let install_root = self.managed_install_root()?;
+        let candidate = canonicalize_allow_missing(path).map_err(PluginError::Io)?;
+        if candidate.starts_with(&install_root) {
+            Ok(candidate)
+        } else {
+            Err(PluginError::CommandFailed(format!(
+                "refusing to {action} plugin path `{}` outside managed install root `{}`",
+                path.display(),
+                install_root.display()
+            )))
+        }
+    }
+
     #[must_use]
     pub fn settings_path(&self) -> PathBuf {
         self.config.config_home.join(SETTINGS_FILE_NAME)
@@ -1071,15 +1094,16 @@ impl PluginManager {
 
     pub fn uninstall(&mut self, plugin_id: &str) -> Result<(), PluginError> {
         let mut registry = self.load_registry()?;
-        let record = registry.plugins.remove(plugin_id).ok_or_else(|| {
+        let record = registry.plugins.get(plugin_id).cloned().ok_or_else(|| {
             PluginError::NotFound(format!("plugin `{plugin_id}` is not installed"))
         })?;
         if record.kind == PluginKind::Bundled {
-            registry.plugins.insert(plugin_id.to_string(), record);
             return Err(PluginError::CommandFailed(format!(
                 "plugin `{plugin_id}` is bundled and managed automatically; disable it instead"
             )));
         }
+        self.ensure_managed_install_path(&record.install_path, "uninstall")?;
+        registry.plugins.remove(plugin_id);
         if record.install_path.exists() {
             fs::remove_dir_all(&record.install_path)?;
         }
@@ -1094,6 +1118,7 @@ impl PluginManager {
         let record = registry.plugins.get(plugin_id).cloned().ok_or_else(|| {
             PluginError::NotFound(format!("plugin `{plugin_id}` is not installed"))
         })?;
+        self.ensure_managed_install_path(&record.install_path, "update")?;
 
         let temp_root = self.install_root().join(".tmp");
         let prepared = prepare_plugin_source(&record.source, &temp_root)?;
@@ -1288,7 +1313,11 @@ impl PluginManager {
 
         for plugin_id in stale_bundled_ids {
             if let Some(record) = registry.plugins.remove(&plugin_id) {
-                if record.install_path.exists() {
+                if self
+                    .ensure_managed_install_path(&record.install_path, "delete")
+                    .is_ok()
+                    && record.install_path.exists()
+                {
                     fs::remove_dir_all(&record.install_path)?;
                 }
                 changed = true;
@@ -2183,6 +2212,35 @@ fn ensure_object<'a>(root: &'a mut Map<String, Value>, key: &str) -> &'a mut Map
         .expect("object should exist")
 }
 
+fn canonicalize_allow_missing(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    let mut missing = Vec::new();
+    let mut cursor = absolute.as_path();
+    while !cursor.exists() {
+        let Some(name) = cursor.file_name() else {
+            return Err(io::Error::other(format!(
+                "failed to resolve path {}",
+                absolute.display()
+            )));
+        };
+        missing.push(name.to_os_string());
+        cursor = cursor.parent().ok_or_else(|| {
+            io::Error::other(format!("failed to resolve path {}", absolute.display()))
+        })?;
+    }
+
+    let mut resolved = cursor.canonicalize()?;
+    for segment in missing.iter().rev() {
+        resolved.push(segment);
+    }
+    Ok(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2902,6 +2960,54 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_rejects_registry_entries_outside_install_root() {
+        let config_home = temp_dir("registry-uninstall-home");
+        let bundled_root = temp_dir("registry-uninstall-bundled");
+        let install_root = config_home.join("plugins").join("installed");
+        let external_install_path = temp_dir("registry-uninstall-external");
+        write_external_plugin(&external_install_path, "escape-demo", "1.0.0");
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        config.install_root = Some(install_root);
+        let mut manager = PluginManager::new(config);
+
+        let mut registry = InstalledPluginRegistry::default();
+        registry.plugins.insert(
+            "escape-demo@external".to_string(),
+            InstalledPluginRecord {
+                kind: PluginKind::External,
+                id: "escape-demo@external".to_string(),
+                name: "escape-demo".to_string(),
+                version: "1.0.0".to_string(),
+                description: "escape demo".to_string(),
+                install_path: external_install_path.clone(),
+                source: PluginInstallSource::LocalPath {
+                    path: external_install_path.clone(),
+                },
+                installed_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            },
+        );
+        manager.store_registry(&registry).expect("store registry");
+
+        let error = manager
+            .uninstall("escape-demo@external")
+            .expect_err("outside install root should be rejected");
+        assert!(error.to_string().contains("outside managed install root"));
+        assert!(external_install_path.exists());
+        assert!(manager
+            .load_registry()
+            .expect("load registry")
+            .plugins
+            .contains_key("escape-demo@external"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(bundled_root);
+        let _ = fs::remove_dir_all(external_install_path);
+    }
+
+    #[test]
     fn installed_plugin_discovery_prunes_stale_registry_entries() {
         let config_home = temp_dir("registry-prune-home");
         let bundled_root = temp_dir("registry-prune-bundled");
@@ -2944,6 +3050,53 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn stale_bundled_cleanup_keeps_outside_install_paths_untouched() {
+        let config_home = temp_dir("bundled-stale-home");
+        let bundled_root = temp_dir("bundled-stale-root");
+        let install_root = config_home.join("plugins").join("installed");
+        let external_install_path = temp_dir("bundled-stale-external");
+        write_bundled_plugin(&external_install_path, "stale-demo", "1.0.0", true);
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        config.install_root = Some(install_root);
+        let manager = PluginManager::new(config);
+
+        let mut registry = InstalledPluginRegistry::default();
+        registry.plugins.insert(
+            "stale-demo@bundled".to_string(),
+            InstalledPluginRecord {
+                kind: PluginKind::Bundled,
+                id: "stale-demo@bundled".to_string(),
+                name: "stale-demo".to_string(),
+                version: "1.0.0".to_string(),
+                description: "stale bundled demo".to_string(),
+                install_path: external_install_path.clone(),
+                source: PluginInstallSource::LocalPath {
+                    path: external_install_path.clone(),
+                },
+                installed_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            },
+        );
+        manager.store_registry(&registry).expect("store registry");
+
+        manager
+            .sync_bundled_plugins()
+            .expect("stale bundled cleanup should succeed");
+        assert!(external_install_path.exists());
+        assert!(!manager
+            .load_registry()
+            .expect("load registry")
+            .plugins
+            .contains_key("stale-demo@bundled"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(bundled_root);
+        let _ = fs::remove_dir_all(external_install_path);
     }
 
     #[test]

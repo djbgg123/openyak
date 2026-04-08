@@ -1128,7 +1128,7 @@ fn execute_run(
         Ok(value) => value,
         Err(error) => {
             return RunExecution {
-                final_session: session,
+                final_session: apply_optimistic_invocation(&session, invocation),
                 recorded_batches: Vec::new(),
                 result: Err(RuntimeError::new(error)),
             }
@@ -1155,6 +1155,27 @@ fn execute_run(
         recorded_batches: take_recorded_batches(&recorded_batches),
         result,
     }
+}
+
+fn apply_optimistic_invocation(
+    session: &RuntimeSession,
+    invocation: &RunInvocation,
+) -> RuntimeSession {
+    let mut next = session.clone();
+    match invocation {
+        RunInvocation::Turn { message } => {
+            next.messages
+                .push(ConversationMessage::user_text(message.clone()));
+        }
+        RunInvocation::Resume { response } => {
+            next.messages.push(ConversationMessage::user_input_response(
+                response.request_id.clone(),
+                response.content.clone(),
+                response.selected_option.clone(),
+            ));
+        }
+    }
+    next
 }
 
 fn build_runtime_client(
@@ -1772,15 +1793,18 @@ fn write_lock<T>(lockable: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        app, recv_thread_stream_event, subscribe_thread_stream, AppState, CreateSessionResponse,
-        ListSessionsResponse, ListThreadsResponse, SessionDetailsResponse, SqliteThreadStore,
-        StartTurnRequest, SubmitUserInputRequest, ThreadEventEnvelope, ThreadExecutionConfig,
-        ThreadRecord, ThreadSnapshot, TurnAcceptedResponse, UserInputAcceptedResponse,
+        app, execute_run, recv_thread_stream_event, subscribe_thread_stream, AppState,
+        CreateSessionResponse, ListSessionsResponse, ListThreadsResponse, RunInvocation,
+        SessionDetailsResponse, SqliteThreadStore, StartTurnRequest, SubmitUserInputRequest,
+        ThreadEventEnvelope, ThreadExecutionConfig, ThreadRecord, ThreadSnapshot,
+        TurnAcceptedResponse, UserInputAcceptedResponse,
     };
     use mock_anthropic_service::MockAnthropicService;
     use reqwest::Client;
+    use runtime::{ContentBlock, ConversationMessage, MessageRole, Session as RuntimeSession};
     use serde_json::{json, Value};
     use std::collections::BTreeSet;
+    use std::ffi::OsString;
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1878,6 +1902,35 @@ mod tests {
             match &self.anthropic_base_url {
                 Some(value) => std::env::set_var("ANTHROPIC_BASE_URL", value),
                 None => std::env::remove_var("ANTHROPIC_BASE_URL"),
+            }
+        }
+    }
+
+    struct RemovedEnvGuard {
+        entries: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl RemovedEnvGuard {
+        fn remove(keys: &[&'static str]) -> Self {
+            let entries = keys
+                .iter()
+                .map(|key| {
+                    let previous = std::env::var_os(key);
+                    std::env::remove_var(key);
+                    (*key, previous)
+                })
+                .collect();
+            Self { entries }
+        }
+    }
+
+    impl Drop for RemovedEnvGuard {
+        fn drop(&mut self) {
+            for (key, previous) in &self.entries {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
             }
         }
     }
@@ -2595,6 +2648,118 @@ mod tests {
         assert!(error
             .to_string()
             .contains("failed to open durable state database"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn execute_run_preserves_optimistic_turn_message_when_runtime_bootstrap_fails() {
+        let _env_guard = env_lock().blocking_lock();
+        let _removed = RemovedEnvGuard::remove(&[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "XAI_API_KEY",
+            "XAI_BASE_URL",
+        ]);
+        let workspace = unique_temp_dir("server-run-bootstrap-failure-turn");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+        let execution = execute_run(
+            RuntimeSession::new(),
+            &ThreadExecutionConfig {
+                cwd: workspace.clone(),
+                model: "opus".to_string(),
+                permission_mode: runtime::PermissionMode::DangerFullAccess,
+                allowed_tools: BTreeSet::new(),
+            },
+            &RunInvocation::Turn {
+                message: "preserve me".to_string(),
+            },
+        );
+
+        assert!(execution.result.is_err());
+        assert!(matches!(
+            execution.final_session.messages.as_slice(),
+            [ConversationMessage {
+                role: MessageRole::User,
+                blocks,
+                ..
+            }] if matches!(
+                blocks.as_slice(),
+                [ContentBlock::Text { text }] if text == "preserve me"
+            )
+        ));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn execute_run_preserves_optimistic_user_input_response_when_runtime_bootstrap_fails() {
+        let _env_guard = env_lock().blocking_lock();
+        let _removed = RemovedEnvGuard::remove(&[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "XAI_API_KEY",
+            "XAI_BASE_URL",
+        ]);
+        let workspace = unique_temp_dir("server-run-bootstrap-failure-user-input");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+        let mut session = RuntimeSession::new();
+        session.messages.push(ConversationMessage::assistant(vec![
+            ContentBlock::UserInputRequest {
+                request_id: "req-1".to_string(),
+                prompt: "Pick one".to_string(),
+                options: vec!["alpha".to_string(), "beta".to_string()],
+                allow_freeform: false,
+            },
+        ]));
+
+        let execution = execute_run(
+            session,
+            &ThreadExecutionConfig {
+                cwd: workspace.clone(),
+                model: "opus".to_string(),
+                permission_mode: runtime::PermissionMode::DangerFullAccess,
+                allowed_tools: BTreeSet::new(),
+            },
+            &RunInvocation::Resume {
+                response: runtime::UserInputResponse {
+                    request_id: "req-1".to_string(),
+                    content: "alpha".to_string(),
+                    selected_option: Some("alpha".to_string()),
+                },
+            },
+        );
+
+        assert!(execution.result.is_err());
+        assert!(matches!(
+            execution.final_session.messages.last(),
+            Some(ConversationMessage {
+                role: MessageRole::User,
+                blocks,
+                ..
+            }) if matches!(
+                blocks.as_slice(),
+                [ContentBlock::UserInputResponse {
+                    request_id,
+                    content,
+                    selected_option
+                }] if request_id == "req-1"
+                    && content == "alpha"
+                    && selected_option.as_deref() == Some("alpha")
+            )
+        ));
+        assert!(execution
+            .final_session
+            .pending_user_input_request()
+            .is_none());
 
         let _ = std::fs::remove_dir_all(workspace);
     }

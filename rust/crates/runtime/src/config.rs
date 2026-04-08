@@ -41,10 +41,10 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimePluginConfig {
     enabled_plugins: BTreeMap<String, bool>,
-    external_directories: Vec<String>,
-    install_root: Option<String>,
-    registry_path: Option<String>,
-    bundled_root: Option<String>,
+    external_directories: Vec<PathBuf>,
+    install_root: Option<PathBuf>,
+    registry_path: Option<PathBuf>,
+    bundled_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -320,12 +320,22 @@ impl ConfigLoader {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
         let mut mcp_servers = BTreeMap::new();
+        let mut plugin_config = RuntimePluginConfig::default();
 
         for entry in self.discover() {
             let Some(value) = read_optional_json_object(&entry.path)? else {
                 continue;
             };
+            let entry_value = JsonValue::Object(value.clone());
             merge_mcp_servers(&mut mcp_servers, entry.source, &value, &entry.path)?;
+            merge_plugin_config_from_entry(
+                &mut plugin_config,
+                &entry_value,
+                entry.source,
+                &self.cwd,
+                &self.config_home,
+                &entry.path,
+            )?;
             deep_merge_objects(&mut merged, &value);
             loaded_entries.push(entry);
         }
@@ -337,7 +347,7 @@ impl ConfigLoader {
 
         let feature_config = RuntimeFeatureConfig {
             hooks: parse_optional_hooks_config(&merged_value)?,
-            plugins: parse_optional_plugin_config(&merged_value)?,
+            plugins: plugin_config,
             skills: parse_optional_skill_config(&merged_value)?,
             mcp: McpConfigCollection {
                 servers: mcp_servers,
@@ -548,22 +558,22 @@ impl RuntimePluginConfig {
     }
 
     #[must_use]
-    pub fn external_directories(&self) -> &[String] {
+    pub fn external_directories(&self) -> &[PathBuf] {
         &self.external_directories
     }
 
     #[must_use]
-    pub fn install_root(&self) -> Option<&str> {
+    pub fn install_root(&self) -> Option<&Path> {
         self.install_root.as_deref()
     }
 
     #[must_use]
-    pub fn registry_path(&self) -> Option<&str> {
+    pub fn registry_path(&self) -> Option<&Path> {
         self.registry_path.as_deref()
     }
 
     #[must_use]
-    pub fn bundled_root(&self) -> Option<&str> {
+    pub fn bundled_root(&self) -> Option<&Path> {
         self.bundled_root.as_deref()
     }
 
@@ -782,34 +792,206 @@ fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, Co
     })
 }
 
-fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig, ConfigError> {
+fn merge_plugin_config_from_entry(
+    config: &mut RuntimePluginConfig,
+    root: &JsonValue,
+    source: ConfigSource,
+    cwd: &Path,
+    config_home: &Path,
+    entry_path: &Path,
+) -> Result<(), ConfigError> {
     let Some(object) = root.as_object() else {
-        return Ok(RuntimePluginConfig::default());
+        return Ok(());
     };
+    let source_name = match source {
+        ConfigSource::User => "user",
+        ConfigSource::Project => "project",
+        ConfigSource::Local => "local",
+    };
+    let context = format!("{source_name} config {}", entry_path.display());
 
-    let mut config = RuntimePluginConfig::default();
     if let Some(enabled_plugins) = object.get("enabledPlugins") {
-        config.enabled_plugins = parse_bool_map(enabled_plugins, "merged settings.enabledPlugins")?;
+        merge_bool_map(
+            &mut config.enabled_plugins,
+            enabled_plugins,
+            &format!("{context}.enabledPlugins"),
+        )?;
     }
 
     let Some(plugins_value) = object.get("plugins") else {
-        return Ok(config);
+        return Ok(());
     };
-    let plugins = expect_object(plugins_value, "merged settings.plugins")?;
+    let plugins = expect_object(plugins_value, &format!("{context}.plugins"))?;
 
     if let Some(enabled_value) = plugins.get("enabled") {
-        config.enabled_plugins = parse_bool_map(enabled_value, "merged settings.plugins.enabled")?;
+        merge_bool_map(
+            &mut config.enabled_plugins,
+            enabled_value,
+            &format!("{context}.plugins.enabled"),
+        )?;
     }
-    config.external_directories =
-        optional_string_array(plugins, "externalDirectories", "merged settings.plugins")?
-            .unwrap_or_default();
-    config.install_root =
-        optional_string(plugins, "installRoot", "merged settings.plugins")?.map(str::to_string);
-    config.registry_path =
-        optional_string(plugins, "registryPath", "merged settings.plugins")?.map(str::to_string);
-    config.bundled_root =
-        optional_string(plugins, "bundledRoot", "merged settings.plugins")?.map(str::to_string);
-    Ok(config)
+
+    if let Some(external_directories) = optional_string_array(
+        plugins,
+        "externalDirectories",
+        &format!("{context}.plugins"),
+    )? {
+        config.external_directories = external_directories
+            .iter()
+            .map(|value| {
+                resolve_plugin_discovery_path(
+                    value,
+                    source,
+                    cwd,
+                    config_home,
+                    &format!("{context}.plugins.externalDirectories"),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+
+    if let Some(install_root) =
+        optional_string(plugins, "installRoot", &format!("{context}.plugins"))?
+    {
+        config.install_root = Some(resolve_plugin_storage_path(
+            install_root,
+            config_home,
+            &format!("{context}.plugins.installRoot"),
+        )?);
+    }
+
+    if let Some(registry_path) =
+        optional_string(plugins, "registryPath", &format!("{context}.plugins"))?
+    {
+        config.registry_path = Some(resolve_plugin_storage_path(
+            registry_path,
+            config_home,
+            &format!("{context}.plugins.registryPath"),
+        )?);
+    }
+
+    if let Some(bundled_root) =
+        optional_string(plugins, "bundledRoot", &format!("{context}.plugins"))?
+    {
+        config.bundled_root = Some(resolve_plugin_discovery_path(
+            bundled_root,
+            source,
+            cwd,
+            config_home,
+            &format!("{context}.plugins.bundledRoot"),
+        )?);
+    }
+
+    Ok(())
+}
+
+fn merge_bool_map(
+    target: &mut BTreeMap<String, bool>,
+    value: &JsonValue,
+    context: &str,
+) -> Result<(), ConfigError> {
+    for (key, enabled) in parse_bool_map(value, context)? {
+        target.insert(key, enabled);
+    }
+    Ok(())
+}
+
+fn resolve_plugin_storage_path(
+    value: &str,
+    config_home: &Path,
+    context: &str,
+) -> Result<PathBuf, ConfigError> {
+    let config_root = canonicalize_allow_missing(config_home, context)?;
+    let raw = if Path::new(value).is_absolute() {
+        PathBuf::from(value)
+    } else {
+        config_home.join(value)
+    };
+    let resolved = canonicalize_allow_missing(&raw, context)?;
+    if resolved.starts_with(&config_root) {
+        Ok(resolved)
+    } else {
+        Err(ConfigError::Parse(format!(
+            "{context}: plugin storage paths must stay inside {}",
+            config_root.display()
+        )))
+    }
+}
+
+fn resolve_plugin_discovery_path(
+    value: &str,
+    source: ConfigSource,
+    cwd: &Path,
+    config_home: &Path,
+    context: &str,
+) -> Result<PathBuf, ConfigError> {
+    let workspace_root = canonicalize_allow_missing(cwd, context)?;
+    let raw = match source {
+        ConfigSource::User => {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else if value.starts_with('.') {
+                cwd.join(path)
+            } else {
+                config_home.join(path)
+            }
+        }
+        ConfigSource::Project | ConfigSource::Local => {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        }
+    };
+    let resolved = canonicalize_allow_missing(&raw, context)?;
+    if matches!(source, ConfigSource::Project | ConfigSource::Local)
+        && !resolved.starts_with(&workspace_root)
+    {
+        return Err(ConfigError::Parse(format!(
+            "{context}: repo-scoped plugin discovery paths must stay inside {}",
+            workspace_root.display()
+        )));
+    }
+    Ok(resolved)
+}
+
+fn canonicalize_allow_missing(path: &Path, context: &str) -> Result<PathBuf, ConfigError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| ConfigError::Parse(format!("{context}: {error}")))?
+            .join(path)
+    };
+
+    let mut missing = Vec::new();
+    let mut cursor = absolute.as_path();
+    while !cursor.exists() {
+        let Some(name) = cursor.file_name() else {
+            return Err(ConfigError::Parse(format!(
+                "{context}: failed to resolve path {}",
+                absolute.display()
+            )));
+        };
+        missing.push(name.to_os_string());
+        cursor = cursor.parent().ok_or_else(|| {
+            ConfigError::Parse(format!(
+                "{context}: failed to resolve path {}",
+                absolute.display()
+            ))
+        })?;
+    }
+
+    let mut resolved = cursor
+        .canonicalize()
+        .map_err(|error| ConfigError::Parse(format!("{context}: {error}")))?;
+    for segment in missing.iter().rev() {
+        resolved.push(segment);
+    }
+    Ok(resolved)
 }
 
 fn parse_optional_skill_config(root: &JsonValue) -> Result<RuntimeSkillConfig, ConfigError> {
@@ -1359,6 +1541,27 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-config-{nanos}"))
     }
 
+    fn normalized_path(path: &std::path::Path) -> String {
+        let raw = path.to_string_lossy();
+        raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
+    }
+
+    fn assert_path_eq(actual: &std::path::Path, expected: &std::path::Path) {
+        assert_eq!(normalized_path(actual), normalized_path(expected));
+    }
+
+    fn assert_path_list_eq(actual: &[std::path::PathBuf], expected: &[std::path::PathBuf]) {
+        let actual = actual
+            .iter()
+            .map(|path| normalized_path(path))
+            .collect::<Vec<_>>();
+        let expected = expected
+            .iter()
+            .map(|path| normalized_path(path))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
     fn create_test_dir_symlink(link: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
         #[cfg(windows)]
         {
@@ -1887,6 +2090,10 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project");
         let home = root.join("home").join(".openyak");
+        let expected_external = cwd.join("external-plugins");
+        let expected_bundled = cwd.join("bundled-plugins");
+        let expected_install = home.join("plugin-cache").join("installed");
+        let expected_registry = home.join("plugin-cache").join("installed.json");
         fs::create_dir_all(cwd.join(".openyak")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
@@ -1917,19 +2124,85 @@ mod tests {
                 .get("core-helpers@builtin"),
             Some(&true)
         );
-        assert_eq!(
+        assert_path_list_eq(
             loaded.plugins().external_directories(),
-            &["./external-plugins".to_string()]
+            &[expected_external],
         );
-        assert_eq!(
-            loaded.plugins().install_root(),
-            Some("plugin-cache/installed")
+        assert_path_eq(
+            loaded
+                .plugins()
+                .install_root()
+                .expect("install root should be present"),
+            &expected_install,
         );
-        assert_eq!(
-            loaded.plugins().registry_path(),
-            Some("plugin-cache/installed.json")
+        assert_path_eq(
+            loaded
+                .plugins()
+                .registry_path()
+                .expect("registry path should be present"),
+            &expected_registry,
         );
-        assert_eq!(loaded.plugins().bundled_root(), Some("./bundled-plugins"));
+        assert_path_eq(
+            loaded
+                .plugins()
+                .bundled_root()
+                .expect("bundled root should be present"),
+            &expected_bundled,
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_project_plugin_storage_paths_outside_config_home() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".openyak");
+        fs::create_dir_all(cwd.join(".openyak")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            cwd.join(".openyak").join("settings.json"),
+            r#"{
+              "plugins": {
+                "installRoot": "../../outside"
+              }
+            }"#,
+        )
+        .expect("write project plugin settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("repo-scoped install root should be rejected");
+        assert!(error
+            .to_string()
+            .contains("plugin storage paths must stay inside"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_repo_scoped_plugin_discovery_paths_outside_workspace() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".openyak");
+        fs::create_dir_all(cwd.join(".openyak")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            cwd.join(".openyak").join("settings.json"),
+            r#"{
+              "plugins": {
+                "externalDirectories": ["../outside"]
+              }
+            }"#,
+        )
+        .expect("write project plugin settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("repo-scoped discovery path should be rejected");
+        assert!(error
+            .to_string()
+            .contains("repo-scoped plugin discovery paths must stay inside"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -1989,7 +2262,13 @@ mod tests {
             reloaded.permission_mode(),
             Some(ResolvedPermissionMode::ReadOnly)
         );
-        assert_eq!(reloaded.plugins().install_root(), Some("plugins/cache"));
+        assert_path_eq(
+            reloaded
+                .plugins()
+                .install_root()
+                .expect("install root should be present"),
+            &home.join("plugins").join("cache"),
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

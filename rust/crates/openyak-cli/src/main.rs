@@ -930,7 +930,7 @@ fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
 fn tool_registry_for_cwd(cwd: &Path) -> Result<GlobalToolRegistry, String> {
     let loader = ConfigLoader::default_for(cwd);
     let runtime_config = loader.load().map_err(|error| error.to_string())?;
-    let plugin_manager = build_plugin_manager(cwd, &loader, &runtime_config);
+    let plugin_manager = build_plugin_manager(&loader, &runtime_config);
     let plugin_tools = plugin_manager
         .aggregated_tools()
         .map_err(|error| error.to_string())?;
@@ -3567,7 +3567,7 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         let loader = ConfigLoader::default_for(&cwd);
         let runtime_config = loader.load()?;
-        let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+        let mut manager = build_plugin_manager(&loader, &runtime_config);
         let result = handle_plugins_slash_command(action, target, &mut manager)?;
         println!("{}", result.message);
         if result.reload_runtime {
@@ -3705,10 +3705,11 @@ impl LiveCli {
             return Ok(());
         }
 
-        let staged_stat = git_output_filtered(&["diff", "--cached", "--stat"])?;
+        let workspace_diff = git_workspace_diff_summary_for_commit_prompt()?;
         let prompt = format!(
-            "Generate a git commit message in plain text Lore format only. Base it on this staged diff summary:\n\n{}\n\nRecent conversation context:\n{}",
-            truncate_for_prompt(&staged_stat, 8_000),
+            "Generate a git commit message in plain text Lore format only. Base it on the full workspace state that will be staged and committed.\n\nWorkspace status:\n{}\n\nWorkspace diff summary vs HEAD:\n{}\n\nRecent conversation context:\n{}",
+            truncate_for_prompt(&status, 4_000),
+            truncate_for_prompt(&workspace_diff, 8_000),
             recent_user_context(self.runtime.session(), 6)
         );
         let message = sanitize_generated_message(&self.run_internal_prompt_text(&prompt, false)?);
@@ -3842,11 +3843,13 @@ impl LiveCli {
         }
 
         let gh_command = ensure_github_cli_ready("pr")?;
-        let staged = git_output_filtered(&["diff", "--stat"])?;
+        let cwd = env::current_dir()?;
+        let default_branch = detect_default_branch(&cwd)?;
+        let branch_diff = git_branch_diff_summary(&cwd, &default_branch)?;
         let prompt = format!(
-            "Generate a pull request title and body from this conversation and diff summary. Output plain text in this format exactly:\nTITLE: <title>\nBODY:\n<body markdown>\n\nContext hint: {}\n\nDiff summary:\n{}",
+            "Generate a pull request title and body from this conversation and the current branch diff against {default_branch}. Output plain text in this format exactly:\nTITLE: <title>\nBODY:\n<body markdown>\n\nContext hint: {}\n\nBranch diff vs {default_branch}:\n{}",
             context.unwrap_or("none"),
-            truncate_for_prompt(&staged, 10_000)
+            truncate_for_prompt(&branch_diff, 10_000)
         );
         let draft =
             sanitize_generated_message(&self.run_internal_prompt_text(&prompt, false).map_err(
@@ -3854,7 +3857,6 @@ impl LiveCli {
             )?);
         let (title, body) = parse_titled_body(&draft)
             .ok_or_else(|| "failed to parse generated PR title/body".to_string())?;
-        let cwd = env::current_dir()?;
         let url = run_github_titled_body_create("pr", &gh_command, &cwd, &title, &body)?;
         println!(
             "PR\n  Result           created\n  Title            {title}\n  URL              {url}"
@@ -4668,6 +4670,36 @@ fn summarize_command_output(output: &Output) -> String {
     )
 }
 
+fn git_workspace_diff_summary_for_commit_prompt() -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .current_dir(env::current_dir()?)
+        .output()?;
+    if output.status.success() {
+        git_output_filtered(&["diff", "--stat", "HEAD"])
+    } else {
+        Ok(String::new())
+    }
+}
+
+fn git_branch_diff_summary(
+    cwd: &Path,
+    default_branch: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("git")
+        .args(["diff", "--stat", &format!("{default_branch}...HEAD")])
+        .current_dir(cwd)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "git diff --stat {default_branch}...HEAD failed: {}",
+            summarize_command_stderr(&output.stderr)
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
 fn run_github_titled_body_create(
     command: &str,
     gh_command: &Path,
@@ -4675,14 +4707,14 @@ fn run_github_titled_body_create(
     title: &str,
     body: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let (gh_args, body_filename) = match command {
+    let (gh_args, body_prefix) = match command {
         "pr" => (
             vec!["pr", "create", "--title", title, "--body-file"],
-            "openyak-pr-body.md",
+            "openyak-pr-body",
         ),
         "issue" => (
             vec!["issue", "create", "--title", title, "--body-file"],
-            "openyak-issue-body.md",
+            "openyak-issue-body",
         ),
         other => {
             return Err(io::Error::other(format!(
@@ -4691,7 +4723,7 @@ fn run_github_titled_body_create(
             .into())
         }
     };
-    let body_path = write_temp_text_file(body_filename, body)?;
+    let body_path = write_temp_text_file(body_prefix, "md", body)?;
     let output = Command::new(gh_command)
         .args(&gh_args)
         .arg(&body_path)
@@ -4712,10 +4744,15 @@ fn run_github_titled_body_create(
 }
 
 fn write_temp_text_file(
-    filename: &str,
+    prefix: &str,
+    extension: &str,
     contents: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let path = env::temp_dir().join(filename);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let path = env::temp_dir().join(format!("{prefix}-{nanos}.{extension}"));
     fs::write(&path, contents)?;
     Ok(path)
 }
@@ -4944,7 +4981,7 @@ fn build_runtime_plugin_state(
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader.load()?;
-    let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+    let plugin_manager = build_plugin_manager(&loader, &runtime_config);
     let feature_config = merge_plugin_hooks(
         runtime_config.feature_config().clone(),
         plugin_manager.aggregated_hooks()?,
@@ -4969,39 +5006,17 @@ fn merge_plugin_hooks(
 }
 
 fn build_plugin_manager(
-    cwd: &Path,
     loader: &ConfigLoader,
     runtime_config: &runtime::RuntimeConfig,
 ) -> PluginManager {
     let plugin_settings = runtime_config.plugins();
     let mut plugin_config = PluginManagerConfig::new(loader.config_home().to_path_buf());
     plugin_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
-    plugin_config.external_dirs = plugin_settings
-        .external_directories()
-        .iter()
-        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path))
-        .collect();
-    plugin_config.install_root = plugin_settings
-        .install_root()
-        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
-    plugin_config.registry_path = plugin_settings
-        .registry_path()
-        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
-    plugin_config.bundled_root = plugin_settings
-        .bundled_root()
-        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.external_dirs = plugin_settings.external_directories().to_vec();
+    plugin_config.install_root = plugin_settings.install_root().map(Path::to_path_buf);
+    plugin_config.registry_path = plugin_settings.registry_path().map(Path::to_path_buf);
+    plugin_config.bundled_root = plugin_settings.bundled_root().map(Path::to_path_buf);
     PluginManager::new(plugin_config)
-}
-
-fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        path
-    } else if value.starts_with('.') {
-        cwd.join(path)
-    } else {
-        config_home.join(path)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7017,7 +7032,8 @@ mod tests {
         format_plan_mode_enabled_report, format_plan_mode_not_active_report,
         format_plan_permissions_blocked_report, format_resume_report, format_status_report,
         format_tool_call_start, format_tool_result, git_args_excluding_local_artifacts,
-        initialize_repo, load_session_from_reference, normalize_permission_mode, parse_args,
+        git_branch_diff_summary, git_workspace_diff_summary_for_commit_prompt, initialize_repo,
+        load_session_from_reference, normalize_permission_mode, parse_args,
         parse_commit_push_pr_draft, parse_git_status_metadata, parse_manual_oauth_callback_input,
         parse_user_input_submission, permission_policy, print_help_to, push_output_block,
         render_config_report, render_diff_report, render_foundations_report,
@@ -7026,11 +7042,11 @@ mod tests {
         resolve_effective_model, resolve_model_alias, response_to_events,
         resume_supported_slash_commands, run_github_titled_body_create, run_resume_command,
         sessions_dir, slash_command_completion_candidates, stage_release_artifact, status_context,
-        status_context_or_fallback_for_cwd, summarize_command_stderr, CliAction, CliOutputFormat,
-        CliUserInputPrompter, ConfigLoader, DefaultRuntimeClient, DoctorCheckStatus, HelpTopic,
-        InternalPromptProgressEvent, InternalPromptProgressState, SlashCommand, StatusUsage,
-        ThreadServerInfoGuard, BROWSER_INTERACT_TOOL_NAME, BROWSER_OBSERVE_TOOL_NAME,
-        DEFAULT_MODEL, DEFAULT_RELEASE_OUTPUT_DIR, DEFAULT_SERVER_BIND,
+        status_context_or_fallback_for_cwd, summarize_command_stderr, write_temp_text_file,
+        CliAction, CliOutputFormat, CliUserInputPrompter, ConfigLoader, DefaultRuntimeClient,
+        DoctorCheckStatus, HelpTopic, InternalPromptProgressEvent, InternalPromptProgressState,
+        SlashCommand, StatusUsage, ThreadServerInfoGuard, BROWSER_INTERACT_TOOL_NAME,
+        BROWSER_OBSERVE_TOOL_NAME, DEFAULT_MODEL, DEFAULT_RELEASE_OUTPUT_DIR, DEFAULT_SERVER_BIND,
         REQUEST_USER_INPUT_TOOL_NAME, THREAD_SERVER_INFO_FILENAME, VERSION,
     };
     use api::{InputContentBlock, MessageResponse, OutputContentBlock, ProviderKind, Usage};
@@ -10274,6 +10290,157 @@ mod tests {
         assert!(report.contains("Command unavailable"));
         assert!(report.contains("Command          /pr"));
         assert!(report.contains("current directory is not inside a git repository"));
+    }
+
+    #[test]
+    fn github_body_temp_files_use_unique_paths() {
+        let first = write_temp_text_file("openyak-pr-body", "md", "first")
+            .expect("first temp file should write");
+        let second = write_temp_text_file("openyak-pr-body", "md", "second")
+            .expect("second temp file should write");
+
+        assert_ne!(first, second);
+
+        let _ = fs::remove_file(first);
+        let _ = fs::remove_file(second);
+    }
+
+    #[test]
+    fn commit_prompt_diff_summary_covers_staged_and_unstaged_workspace_changes() {
+        let _lock = env_lock();
+        let Some(git_path) = resolve_command_path("git") else {
+            return;
+        };
+        let root = unique_temp_dir("openyak-cli-commit-prompt-diff");
+        fs::create_dir_all(&root).expect("create root");
+        {
+            let _cwd = CurrentDirGuard::set(&root);
+
+            let init = Command::new(&git_path)
+                .args(["init", "-b", "main"])
+                .current_dir(&root)
+                .output()
+                .expect("git init should run");
+            assert!(init.status.success(), "git init should succeed");
+            for args in [
+                ["config", "user.name", "Openyak Test"],
+                ["config", "user.email", "openyak-test@example.com"],
+            ] {
+                let output = Command::new(&git_path)
+                    .args(args)
+                    .current_dir(&root)
+                    .output()
+                    .expect("git config should run");
+                assert!(output.status.success(), "git config should succeed");
+            }
+
+            fs::write(root.join("staged.txt"), "one\n").expect("seed staged file");
+            fs::write(root.join("unstaged.txt"), "alpha\n").expect("seed unstaged file");
+            let add_all = Command::new(&git_path)
+                .args(["add", "."])
+                .current_dir(&root)
+                .output()
+                .expect("git add should run");
+            assert!(add_all.status.success(), "git add should succeed");
+            let commit = Command::new(&git_path)
+                .args(["commit", "-m", "seed"])
+                .current_dir(&root)
+                .output()
+                .expect("git commit should run");
+            assert!(commit.status.success(), "git commit should succeed");
+
+            fs::write(root.join("staged.txt"), "one\nstage me\n").expect("update staged file");
+            fs::write(root.join("unstaged.txt"), "alpha\nleave me\n")
+                .expect("update unstaged file");
+            let stage_one = Command::new(&git_path)
+                .args(["add", "staged.txt"])
+                .current_dir(&root)
+                .output()
+                .expect("git add staged should run");
+            assert!(stage_one.status.success(), "git add staged should succeed");
+
+            let summary = git_workspace_diff_summary_for_commit_prompt()
+                .expect("workspace summary should succeed");
+            assert!(summary.contains("staged.txt"), "{summary}");
+            assert!(summary.contains("unstaged.txt"), "{summary}");
+        }
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn pr_prompt_uses_branch_diff_against_default_branch() {
+        let _lock = env_lock();
+        let Some(git_path) = resolve_command_path("git") else {
+            return;
+        };
+        let root = unique_temp_dir("openyak-cli-pr-branch-diff");
+        fs::create_dir_all(&root).expect("create root");
+        {
+            let init = Command::new(&git_path)
+                .args(["init", "-b", "main"])
+                .current_dir(&root)
+                .output()
+                .expect("git init should run");
+            assert!(init.status.success(), "git init should succeed");
+            for args in [
+                ["config", "user.name", "Openyak Test"],
+                ["config", "user.email", "openyak-test@example.com"],
+            ] {
+                let output = Command::new(&git_path)
+                    .args(args)
+                    .current_dir(&root)
+                    .output()
+                    .expect("git config should run");
+                assert!(output.status.success(), "git config should succeed");
+            }
+
+            fs::write(root.join("README.md"), "seed\n").expect("seed readme");
+            let add_seed = Command::new(&git_path)
+                .args(["add", "."])
+                .current_dir(&root)
+                .output()
+                .expect("git add seed should run");
+            assert!(add_seed.status.success(), "git add seed should succeed");
+            let seed_commit = Command::new(&git_path)
+                .args(["commit", "-m", "seed"])
+                .current_dir(&root)
+                .output()
+                .expect("git commit should run");
+            assert!(seed_commit.status.success(), "git commit should succeed");
+
+            let switch = Command::new(&git_path)
+                .args(["switch", "-c", "feature/test"])
+                .current_dir(&root)
+                .output()
+                .expect("git switch should run");
+            assert!(switch.status.success(), "git switch should succeed");
+            fs::write(root.join("feature.txt"), "feature\n").expect("write feature file");
+            let add_feature = Command::new(&git_path)
+                .args(["add", "feature.txt"])
+                .current_dir(&root)
+                .output()
+                .expect("git add feature should run");
+            assert!(
+                add_feature.status.success(),
+                "git add feature should succeed"
+            );
+            let feature_commit = Command::new(&git_path)
+                .args(["commit", "-m", "feature work"])
+                .current_dir(&root)
+                .output()
+                .expect("git commit feature should run");
+            assert!(
+                feature_commit.status.success(),
+                "git commit feature should succeed"
+            );
+
+            let summary =
+                git_branch_diff_summary(&root, "main").expect("branch diff summary should succeed");
+            assert!(summary.contains("feature.txt"), "{summary}");
+        }
+
+        crate::cleanup_temp_dir(&root);
     }
 
     #[test]

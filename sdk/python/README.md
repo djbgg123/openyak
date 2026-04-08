@@ -6,7 +6,7 @@ Current package metadata:
 
 - version: `0.0.0a1`
 - requires Python `>=3.10`
-- verified against local `openyak` CLI `v0.1.0` on `2026-04-07`
+- verified against local `openyak` CLI `v0.1.0` on `2026-04-08`
 
 ## Scope
 
@@ -163,6 +163,7 @@ snapshot = thread.read()
 - The SDK hard-fails on unsupported `protocol_version`.
 - `thread.resync_required` becomes `OpenyakResyncRequiredError` in `run_streamed()` / `resume_user_input_streamed()`.
 - `run()` may reconcile from `thread.read()` after a dropped stream and marks the result with `recovered_from_snapshot=True`.
+- If the local server fails before runtime/provider bootstrap completes, the latest thread snapshot still preserves the submitted turn or user-input response instead of silently dropping it.
 - That reconciliation is intentionally best-effort for local attach-first, single-writer usage; if the latest snapshot shows a different active `run_id`, `run()` raises `OpenyakReconnectRequiredError` instead of pretending replay exists.
 - `run_streamed()` does **not** pretend replay exists; if live streaming fidelity is lost, it raises.
 
@@ -190,4 +191,4 @@ python -m mypy
 python -m build
 ```
 
-These commands were rerun successfully on `2026-04-07` during the latest repo-wide documentation refresh and full command-by-command CLI verification.
+These commands were rerun successfully on `2026-04-08` during the latest repo-wide documentation refresh and full command-by-command CLI verification.

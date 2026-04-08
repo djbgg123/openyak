@@ -65,13 +65,19 @@ skills 发现和解析必须复用共享实现，且同时支持：
 
 不要在 `commands`、`tools`、CLI 或测试里再维护一份私有扫描逻辑，也不要引入任何机器本地硬编码路径。
 
-### 插件清单路径边界
+### 插件路径边界
 
 插件 manifest 中声明的文件和目录路径必须继续满足下面这些约束：
 
 - 路径必须相对插件根目录解析。
 - 解析后的最终路径必须保持在插件根目录内。
 - 不要为了“方便”重新放开 `..` 逃逸、绝对路径直通或其他会越出插件根目录的写法。
+
+插件配置路径也必须继续满足下面这些约束：
+
+- `settings.plugins.installRoot` 和 `settings.plugins.registryPath` 的最终路径必须保持在用户级 config home 内。
+- project/local config 中的 `settings.plugins.externalDirectories` 和 `settings.plugins.bundledRoot` 必须保持在当前 workspace 内。
+- managed plugin update/uninstall 只能作用在 managed install root 下的插件路径上。
 
 文档里要把这件事描述为路径边界加固，而不是夸大成完整沙箱。
 
@@ -114,7 +120,7 @@ skills 发现和解析必须复用共享实现，且同时支持：
 - SDK 的包名、导入名、协议边界或验证方式：同步更新对应的 Python SDK README 或 TypeScript SDK README。
 - `openyak init` 的脚手架产物：同步更新根 README，并保持 `OPENYAK.md` 口径一致。
 - release binary、packaged-use 或平台相关示例：至少同时覆盖类 Unix 与 Windows PowerShell 写法，不要让 README 只剩单平台命令。
-- 插件 manifest 的路径边界或权限语义：同步更新根 README、Rust README 和发布说明。
+- 插件 manifest 或插件配置路径边界、权限语义：同步更新根 README、Rust README 和发布说明。
 - 发布能力或版本说明：同步更新发布说明草案。
 - Registry-backed parity foundation / operator surface 边界：同步更新 [`rust/docs/parity-foundation-registries.md`](./rust/docs/parity-foundation-registries.md)。
 - mock harness 的运行方式、场景或输出契约：同步更新 [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md)。

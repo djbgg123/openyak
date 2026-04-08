@@ -7,7 +7,7 @@ Current package metadata:
 - version: `0.0.0-alpha.1`
 - requires Node.js `>=18`
 - package manager in-repo: `pnpm`
-- verified against local `openyak` CLI `v0.1.0` on `2026-04-07`
+- verified against local `openyak` CLI `v0.1.0` on `2026-04-08`
 
 ## Scope
 
@@ -142,6 +142,7 @@ const snapshot = await thread.read();
 - The SDK hard-fails on unsupported `protocol_version`.
 - `thread.resync_required` becomes `OpenyakResyncRequiredError` in `runStreamed()`.
 - `run()` may reconcile from `thread.read()` after a dropped stream and marks the result with `recoveredFromSnapshot: true`.
+- If the local server fails before runtime/provider bootstrap completes, the latest thread snapshot still preserves the submitted turn or user-input response instead of silently dropping it.
 - That reconciliation is intentionally best-effort for local attach-first, single-writer usage; if the latest snapshot shows a different active `run_id`, `run()` throws `OpenyakReconnectRequiredError` instead of pretending replay exists.
 - `runStreamed()` does **not** pretend replay exists; if live streaming fidelity is lost, it throws.
 
@@ -154,4 +155,4 @@ pnpm lint
 pnpm build
 ```
 
-These commands were rerun successfully on `2026-04-07` during the latest repo-wide documentation refresh and full command-by-command CLI verification.
+These commands were rerun successfully on `2026-04-08` during the latest repo-wide documentation refresh and full command-by-command CLI verification.
