@@ -5235,6 +5235,8 @@ impl From<runtime::PendingUserInputRequest> for PendingUserInputPayload {
 struct ThreadStateSnapshotValue {
     status: String,
     #[serde(default)]
+    lifecycle: Option<runtime::LifecycleStateSnapshot>,
+    #[serde(default)]
     run_id: Option<String>,
     #[serde(default)]
     pending_user_input: Option<PendingUserInputPayload>,
@@ -5283,10 +5285,10 @@ struct ThreadSnapshotValue {
 fn thread_lifecycle_snapshot(
     state: &ThreadStateSnapshotValue,
 ) -> runtime::LifecycleStateSnapshot {
-    runtime::LifecycleStateSnapshot::daemon_thread(
-        &state.status,
-        state.recovery.clone(),
-    )
+    state
+        .lifecycle
+        .clone()
+        .unwrap_or_else(|| runtime::LifecycleStateSnapshot::daemon_thread(&state.status, state.recovery.clone()))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

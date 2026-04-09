@@ -15,8 +15,17 @@ const threadSnapshot = {
   thread_id: "thread-1",
   created_at: 0,
   updated_at: 0,
+  contract: {
+    truth_layer: "daemon_local_v1",
+    operator_plane: "local_loopback_operator_v1",
+    persistence: "workspace_sqlite_v1",
+    attach_api: "/v1/threads",
+  },
   state: {
     status: "idle",
+    lifecycle: {
+      status: "idle",
+    },
   },
   config: {
     cwd: "/tmp/workspace",
@@ -198,6 +207,9 @@ test("run recovers awaiting_user_input from the latest snapshot after a dropped 
         updated_at: 1,
         state: {
           status: "awaiting_user_input",
+          lifecycle: {
+            status: "awaiting_user_input",
+          },
           run_id: "run-1",
           pending_user_input: {
             request_id: "req-1",
@@ -244,6 +256,9 @@ test("run fails predictably when reconciliation sees a different active run", as
         updated_at: 2,
         state: {
           status: "awaiting_user_input",
+          lifecycle: {
+            status: "awaiting_user_input",
+          },
           run_id: "run-2",
           pending_user_input: {
             request_id: "req-2",
@@ -264,5 +279,66 @@ test("run fails predictably when reconciliation sees a different active run", as
       error.threadId === "thread-1" &&
       error.runId === "run-1" &&
       error.latestSnapshot?.state.run_id === "run-2",
+  );
+});
+
+test("run recovers interrupted lifecycle metadata from latest snapshot", async () => {
+  const client = new OpenyakClient({
+    baseUrl: "http://local.test",
+    fetch: createQueuedFetch([
+      sseResponse([
+        {
+          protocol_version: "v1",
+          thread_id: "thread-1",
+          sequence: 0,
+          timestamp_ms: 0,
+          type: "thread.snapshot",
+          payload: threadSnapshot,
+        },
+      ]),
+      jsonResponse({
+        protocol_version: "v1",
+        thread_id: "thread-1",
+        run_id: "run-1",
+        status: "accepted",
+      }),
+      jsonResponse({
+        ...threadSnapshot,
+        updated_at: 3,
+        state: {
+          status: "interrupted",
+          lifecycle: {
+            status: "interrupted",
+            failure_kind: "daemon_restart_interrupted_run",
+            recovery: {
+              failure_kind: "daemon_restart_interrupted_run",
+              recovery_kind: "reattach_or_retry",
+              recommended_actions: [
+                "reattach to the thread and inspect the latest snapshot",
+              ],
+            },
+          },
+          run_id: "run-1",
+          recovery_note: "server restarted mid-run",
+          recovery: {
+            failure_kind: "daemon_restart_interrupted_run",
+            recovery_kind: "reattach_or_retry",
+            recommended_actions: [
+              "reattach to the thread and inspect the latest snapshot",
+            ],
+          },
+        },
+      }),
+    ]),
+  });
+
+  const thread = client.resumeThread("thread-1");
+  const result = await thread.run("hello");
+
+  assert.equal(result.status, "interrupted");
+  assert.equal(result.recoveryNote, "server restarted mid-run");
+  assert.equal(
+    result.snapshot?.state.lifecycle?.failure_kind,
+    "daemon_restart_interrupted_run",
   );
 });

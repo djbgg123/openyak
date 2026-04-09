@@ -16,10 +16,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage,
-    ConversationRuntime, MessageRole, PendingUserInputRequest, PermissionEnforcer, PermissionMode,
-    PermissionPolicy, RecoveryGuidanceSnapshot, ResolvedPermissionMode, RuntimeError,
-    Session as RuntimeSession, ThreadContractSnapshot, ToolError, ToolExecutor, TurnSummary,
-    UserInputOutcome, UserInputPrompter, UserInputRequest, UserInputResponse,
+    ConversationRuntime, LifecycleStateSnapshot, MessageRole, PendingUserInputRequest,
+    PermissionEnforcer, PermissionMode, PermissionPolicy, RecoveryGuidanceSnapshot,
+    ResolvedPermissionMode, RuntimeError, Session as RuntimeSession, ThreadContractSnapshot,
+    ToolError, ToolExecutor, TurnSummary, UserInputOutcome, UserInputPrompter, UserInputRequest,
+    UserInputResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -215,6 +216,7 @@ impl ThreadStatus {
         match self {
             Self::Idle => ThreadStateSnapshot {
                 status: "idle".to_string(),
+                lifecycle: LifecycleStateSnapshot::daemon_thread("idle", None),
                 run_id: None,
                 pending_user_input: None,
                 recovery_note: None,
@@ -222,6 +224,7 @@ impl ThreadStatus {
             },
             Self::Running { run_id } => ThreadStateSnapshot {
                 status: "running".to_string(),
+                lifecycle: LifecycleStateSnapshot::daemon_thread("running", None),
                 run_id: Some(run_id.clone()),
                 pending_user_input: None,
                 recovery_note: None,
@@ -229,6 +232,7 @@ impl ThreadStatus {
             },
             Self::AwaitingUserInput { run_id, request } => ThreadStateSnapshot {
                 status: "awaiting_user_input".to_string(),
+                lifecycle: LifecycleStateSnapshot::daemon_thread("awaiting_user_input", None),
                 run_id: Some(run_id.clone()),
                 pending_user_input: Some(UserInputRequestPayload::from_request(request.clone())),
                 recovery_note: None,
@@ -239,6 +243,10 @@ impl ThreadStatus {
                 recovery_note,
             } => ThreadStateSnapshot {
                 status: "interrupted".to_string(),
+                lifecycle: LifecycleStateSnapshot::daemon_thread(
+                    "interrupted",
+                    Some(recovery_guidance_for_note(recovery_note)),
+                ),
                 run_id: run_id.clone(),
                 pending_user_input: None,
                 recovery_note: Some(recovery_note.clone()),
@@ -722,6 +730,7 @@ impl UserInputRequestPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadStateSnapshot {
     pub status: String,
+    pub lifecycle: LifecycleStateSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
     #[serde(skip_serializing_if = "Option::is_none")]

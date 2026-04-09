@@ -71,6 +71,25 @@ export interface ThreadConfigSnapshot {
   allowed_tools: string[];
 }
 
+export interface ThreadContractSnapshot {
+  truth_layer: string;
+  operator_plane: string;
+  persistence: string;
+  attach_api: string;
+}
+
+export interface RecoveryGuidanceSnapshot {
+  failure_kind: string;
+  recovery_kind: string;
+  recommended_actions: string[];
+}
+
+export interface LifecycleStateSnapshot {
+  status: string;
+  failure_kind?: string;
+  recovery?: RecoveryGuidanceSnapshot;
+}
+
 export interface UserInputRequestPayload {
   request_id: string;
   prompt: string;
@@ -80,13 +99,16 @@ export interface UserInputRequestPayload {
 
 export interface ThreadStateSnapshot {
   status: "idle" | "running" | "awaiting_user_input" | "interrupted";
+  lifecycle?: LifecycleStateSnapshot;
   run_id?: string;
   pending_user_input?: UserInputRequestPayload;
   recovery_note?: string;
+  recovery?: RecoveryGuidanceSnapshot;
 }
 
 export interface ThreadSnapshot {
   protocol_version: ProtocolVersion;
+  contract?: ThreadContractSnapshot;
   thread_id: string;
   created_at: number;
   updated_at: number;
@@ -96,6 +118,7 @@ export interface ThreadSnapshot {
 }
 
 export interface ThreadSummary {
+  contract?: ThreadContractSnapshot;
   thread_id: string;
   created_at: number;
   updated_at: number;

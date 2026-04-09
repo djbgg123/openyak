@@ -23,7 +23,10 @@
       "created_at": 0,
       "updated_at": 0,
       "state": {
-        "status": "idle"
+        "status": "idle",
+        "lifecycle": {
+          "status": "idle"
+        }
       },
       "config": {
         "cwd": "<cwd>",
@@ -52,7 +55,10 @@
           "created_at": 0,
           "updated_at": 0,
           "state": {
-            "status": "idle"
+            "status": "idle",
+            "lifecycle": {
+              "status": "idle"
+            }
           },
           "message_count": 0,
           "contract": {
@@ -70,7 +76,10 @@
       "created_at": 0,
       "updated_at": 0,
       "state": {
-        "status": "idle"
+        "status": "idle",
+        "lifecycle": {
+          "status": "idle"
+        }
       },
       "config": {
         "cwd": "<cwd>",
@@ -121,6 +130,9 @@
         "details": {
           "status": {
             "status": "awaiting_user_input",
+            "lifecycle": {
+              "status": "awaiting_user_input"
+            },
             "run_id": "run-2",
             "pending_user_input": {
               "request_id": "req-user-input-roundtrip",
@@ -164,7 +176,10 @@
           "created_at": 0,
           "updated_at": 0,
           "state": {
-            "status": "idle"
+            "status": "idle",
+            "lifecycle": {
+              "status": "idle"
+            }
           },
           "config": {
             "cwd": "<cwd>",
@@ -319,7 +334,10 @@
           "created_at": 0,
           "updated_at": 0,
           "state": {
-            "status": "idle"
+            "status": "idle",
+            "lifecycle": {
+              "status": "idle"
+            }
           },
           "config": {
             "cwd": "<cwd>",
@@ -492,7 +510,10 @@
           "created_at": 0,
           "updated_at": 0,
           "state": {
-            "status": "idle"
+            "status": "idle",
+            "lifecycle": {
+              "status": "idle"
+            }
           },
           "config": {
             "cwd": "<cwd>",

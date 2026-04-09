@@ -99,6 +99,35 @@ class ThreadConfigSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class LifecycleContractSnapshot:
+    truth_layer: str
+    operator_plane: str
+    persistence: str
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadContractSnapshot:
+    truth_layer: str
+    operator_plane: str
+    persistence: str
+    attach_api: str
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryGuidanceSnapshot:
+    failure_kind: str
+    recovery_kind: str
+    recommended_actions: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleStateSnapshot:
+    status: str
+    failure_kind: str | None = None
+    recovery: RecoveryGuidanceSnapshot | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class UserInputRequestPayload:
     request_id: str
     prompt: str
@@ -109,14 +138,17 @@ class UserInputRequestPayload:
 @dataclass(frozen=True, slots=True)
 class ThreadStateSnapshot:
     status: Literal["idle", "running", "awaiting_user_input", "interrupted"]
+    lifecycle: LifecycleStateSnapshot | None = None
     run_id: str | None = None
     pending_user_input: UserInputRequestPayload | None = None
     recovery_note: str | None = None
+    recovery: RecoveryGuidanceSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ThreadSnapshot:
     protocol_version: ProtocolVersion
+    contract: ThreadContractSnapshot | None
     thread_id: str
     created_at: int
     updated_at: int
@@ -127,6 +159,7 @@ class ThreadSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class ThreadSummary:
+    contract: ThreadContractSnapshot | None
     thread_id: str
     created_at: int
     updated_at: int
@@ -396,6 +429,11 @@ def parse_thread_snapshot(value: object, context: str = "thread snapshot") -> Th
     record = _as_mapping(value, context)
     return ThreadSnapshot(
         protocol_version=_parse_protocol_version(record, context),
+        contract=(
+            parse_thread_contract_snapshot(record.get("contract"), f"{context}.contract")
+            if record.get("contract") is not None
+            else None
+        ),
         thread_id=_require_str(record, "thread_id", context),
         created_at=_require_int(record, "created_at", context),
         updated_at=_require_int(record, "updated_at", context),
@@ -650,6 +688,11 @@ def parse_thread_event(value: object, context: str = "thread event") -> ThreadEv
 def parse_thread_summary(value: object, context: str = "thread summary") -> ThreadSummary:
     record = _as_mapping(value, context)
     return ThreadSummary(
+        contract=(
+            parse_thread_contract_snapshot(record.get("contract"), f"{context}.contract")
+            if record.get("contract") is not None
+            else None
+        ),
         thread_id=_require_str(record, "thread_id", context),
         created_at=_require_int(record, "created_at", context),
         updated_at=_require_int(record, "updated_at", context),
@@ -670,8 +713,15 @@ def parse_thread_state_snapshot(
         status,
     )
     pending_user_input = record.get("pending_user_input")
+    lifecycle = record.get("lifecycle")
+    recovery = record.get("recovery")
     return ThreadStateSnapshot(
         status=typed_status,
+        lifecycle=(
+            parse_lifecycle_state_snapshot(lifecycle, f"{context}.lifecycle")
+            if lifecycle is not None
+            else None
+        ),
         run_id=_optional_str(record, "run_id", context),
         pending_user_input=(
             parse_user_input_request_payload(
@@ -682,6 +732,50 @@ def parse_thread_state_snapshot(
             else None
         ),
         recovery_note=_optional_str(record, "recovery_note", context),
+        recovery=(
+            parse_recovery_guidance_snapshot(recovery, f"{context}.recovery")
+            if recovery is not None
+            else None
+        ),
+    )
+
+
+def parse_thread_contract_snapshot(
+    value: object, context: str = "thread contract snapshot"
+) -> ThreadContractSnapshot:
+    record = _as_mapping(value, context)
+    return ThreadContractSnapshot(
+        truth_layer=_require_str(record, "truth_layer", context),
+        operator_plane=_require_str(record, "operator_plane", context),
+        persistence=_require_str(record, "persistence", context),
+        attach_api=_require_str(record, "attach_api", context),
+    )
+
+
+def parse_recovery_guidance_snapshot(
+    value: object, context: str = "recovery guidance snapshot"
+) -> RecoveryGuidanceSnapshot:
+    record = _as_mapping(value, context)
+    return RecoveryGuidanceSnapshot(
+        failure_kind=_require_str(record, "failure_kind", context),
+        recovery_kind=_require_str(record, "recovery_kind", context),
+        recommended_actions=_require_list_of_str(record, "recommended_actions", context),
+    )
+
+
+def parse_lifecycle_state_snapshot(
+    value: object, context: str = "lifecycle state snapshot"
+) -> LifecycleStateSnapshot:
+    record = _as_mapping(value, context)
+    recovery = record.get("recovery")
+    return LifecycleStateSnapshot(
+        status=_require_str(record, "status", context),
+        failure_kind=_optional_str(record, "failure_kind", context),
+        recovery=(
+            parse_recovery_guidance_snapshot(recovery, f"{context}.recovery")
+            if recovery is not None
+            else None
+        ),
     )
 
 

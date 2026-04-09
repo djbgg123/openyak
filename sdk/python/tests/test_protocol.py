@@ -40,8 +40,17 @@ def _thread_snapshot() -> dict[str, object]:
         "thread_id": "thread-1",
         "created_at": 0,
         "updated_at": 0,
+        "contract": {
+            "truth_layer": "daemon_local_v1",
+            "operator_plane": "local_loopback_operator_v1",
+            "persistence": "workspace_sqlite_v1",
+            "attach_api": "/v1/threads",
+        },
         "state": {
             "status": "idle",
+            "lifecycle": {
+                "status": "idle",
+            },
         },
         "config": {
             "cwd": "/tmp/workspace",
@@ -73,7 +82,10 @@ def test_fixture_matrix_decodes_locked_v1_contract() -> None:
     resync_required = parse_thread_event(fixture["events"]["thread_resync_required"])
 
     assert created.protocol_version == "v1"
+    assert created.contract is not None
+    assert created.contract.truth_layer == "daemon_local_v1"
     assert listed.threads[0].thread_id == "thread-1"
+    assert listed.threads[0].contract is not None
     assert turn_accepted.run_id == "run-1"
     assert user_input_accepted.request_id == "req-user-input-roundtrip"
     assert bash_events[0].type == "thread.snapshot"
@@ -441,8 +453,26 @@ def test_async_run_recovers_interrupted_from_the_latest_snapshot() -> None:
                             "updated_at": 3,
                             "state": {
                                 "status": "interrupted",
+                                "lifecycle": {
+                                    "status": "interrupted",
+                                    "failure_kind": "daemon_restart_interrupted_run",
+                                    "recovery": {
+                                        "failure_kind": "daemon_restart_interrupted_run",
+                                        "recovery_kind": "reattach_or_retry",
+                                        "recommended_actions": [
+                                            "reattach to the thread and inspect the latest snapshot"
+                                        ],
+                                    },
+                                },
                                 "run_id": "run-1",
                                 "recovery_note": "server restarted mid-run",
+                                "recovery": {
+                                    "failure_kind": "daemon_restart_interrupted_run",
+                                    "recovery_kind": "reattach_or_retry",
+                                    "recommended_actions": [
+                                        "reattach to the thread and inspect the latest snapshot"
+                                    ],
+                                },
                             },
                         }
                     ),
@@ -454,6 +484,12 @@ def test_async_run_recovers_interrupted_from_the_latest_snapshot() -> None:
         assert result.status == "interrupted"
         assert result.recovered_from_snapshot is True
         assert result.recovery_note == "server restarted mid-run"
+        assert result.snapshot is not None
+        assert result.snapshot.state.recovery is not None
+        assert (
+            result.snapshot.state.recovery.failure_kind
+            == "daemon_restart_interrupted_run"
+        )
         await client.aclose()
 
     asyncio.run(case())
