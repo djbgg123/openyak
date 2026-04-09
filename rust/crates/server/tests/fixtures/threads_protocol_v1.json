@@ -36,6 +36,12 @@
       "session": {
         "version": 1,
         "messages": []
+      },
+      "contract": {
+        "truth_layer": "daemon_local_v1",
+        "operator_plane": "local_loopback_operator_v1",
+        "persistence": "workspace_sqlite_v1",
+        "attach_api": "/v1/threads"
       }
     },
     "list_threads": {
@@ -71,6 +77,12 @@
       "session": {
         "version": 1,
         "messages": []
+      },
+      "contract": {
+        "truth_layer": "daemon_local_v1",
+        "operator_plane": "local_loopback_operator_v1",
+        "persistence": "workspace_sqlite_v1",
+        "attach_api": "/v1/threads"
       }
     },
     "turn_accepted": {
@@ -159,6 +171,12 @@
           "session": {
             "version": 1,
             "messages": []
+          },
+          "contract": {
+            "truth_layer": "daemon_local_v1",
+            "operator_plane": "local_loopback_operator_v1",
+            "persistence": "workspace_sqlite_v1",
+            "attach_api": "/v1/threads"
           }
         }
       },
@@ -308,6 +326,12 @@
           "session": {
             "version": 1,
             "messages": []
+          },
+          "contract": {
+            "truth_layer": "daemon_local_v1",
+            "operator_plane": "local_loopback_operator_v1",
+            "persistence": "workspace_sqlite_v1",
+            "attach_api": "/v1/threads"
           }
         }
       },
@@ -473,6 +497,12 @@
           "session": {
             "version": 1,
             "messages": []
+          },
+          "contract": {
+            "truth_layer": "daemon_local_v1",
+            "operator_plane": "local_loopback_operator_v1",
+            "persistence": "workspace_sqlite_v1",
+            "attach_api": "/v1/threads"
           }
         }
       }
