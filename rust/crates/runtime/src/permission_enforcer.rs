@@ -182,7 +182,7 @@ fn normalize_comparable_path(path: &Path) -> PathBuf {
         normalized.push(component.as_os_str());
     }
 
-    normalized
+    PathBuf::from(normalized.to_string_lossy().to_lowercase())
 }
 
 #[cfg(not(windows))]
@@ -479,6 +479,19 @@ mod tests {
 
         let result =
             enforcer.check_file_write("generated/output.txt", workspace.to_string_lossy().as_ref());
+
+        let _ = fs::remove_dir_all(&workspace);
+        assert_eq!(result, EnforcementResult::Allowed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_write_allows_case_mismatched_workspace_root() {
+        let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
+        let workspace = temp_workspace("case-mismatch");
+        let workspace_upper = workspace.to_string_lossy().to_uppercase();
+
+        let result = enforcer.check_file_write("generated/output.txt", &workspace_upper);
 
         let _ = fs::remove_dir_all(&workspace);
         assert_eq!(result, EnforcementResult::Allowed);
