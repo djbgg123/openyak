@@ -33,13 +33,22 @@
 - `disabled_reason`：当前只用于 cron，V1 固定记录低风险 disable 语义，而不是引入完整调度控制面。
 - `created_at` / `updated_at`：统一作为 V1 object lifecycle metadata 暴露给 tool payload，避免 operator 只能依赖隐含顺序推断对象新旧。
 
+当前仓库里已经有一组更窄、但已经结构化的 lifecycle / failure / recovery schema：
+
+- thread snapshot 的 `contract` 层固定暴露 `truth_layer`、`operator_plane`、`persistence`、`attach_api`
+- thread snapshot 的 `state` 层继续暴露 `status`、`run_id`、`recovery_note`
+- 若线程因 server restart 等场景进入恢复态，还会附带 `recovery.failure_kind`、`recovery.recovery_kind`、`recovery.recommended_actions`
+
+这组 schema 现在只服务于 `/v1/threads` attach-first 真值；它们不意味着 Task / Team / Cron 也具备 daemon-backed recovery recipe plane。
+
 ## 与 daemon-backed thread truth 的边界
 
 当前仓库里已经有一个**更窄但确实 daemon-backed** 的 truth slice：`openyak server` 提供的 thread snapshot contract。
 
 - thread snapshot 显式声明 `truth_layer = "daemon_local_v1"`
+- thread snapshot 同时声明 `operator_plane = "local_loopback_operator_v1"` 与 `persistence = "workspace_sqlite_v1"`
 - thread snapshot 同时声明 `attach_api = "/v1/threads"`
-- restart 后的 `interrupted` + `recovery_note` 只适用于这条 attach-first thread truth
+- restart 后的 `interrupted` + `recovery_note`，以及 `failure_kind` / `recovery_kind` / `recommended_actions` 只适用于这条 attach-first thread truth
 
 这不应和 foundation registry 的 `process_local_v1` 混为一谈：
 

@@ -210,6 +210,8 @@ fn daemon_truth_docs_keep_threads_and_foundations_split() {
 
     for marker in [
         "`truth_layer = daemon_local_v1`",
+        "`operator_plane = local_loopback_operator_v1`",
+        "`recovery.failure_kind` / `recovery.recovery_kind` / `recovery.recommended_actions`",
         "`/v1/threads`",
         "恢复 guidance",
         "未有：daemon-backed worker/task/team truth layer",
@@ -231,7 +233,8 @@ fn daemon_truth_docs_keep_threads_and_foundations_split() {
 
     for marker in [
         "`origin = \"process_local_v1\"`",
-        "restart 后的 `interrupted` + `recovery_note` 只适用于这条 attach-first thread truth",
+        "`operator_plane = \"local_loopback_operator_v1\"`",
+        "`failure_kind` / `recovery_kind` / `recommended_actions`",
         "不提供持久化、恢复、租约语义",
     ] {
         assert!(
@@ -252,6 +255,7 @@ fn attach_first_sdk_docs_stay_narrow_about_daemon_operator_plane() {
             "legacy `/sessions` compatibility routes",
             "public contract remains `/v1/threads` only",
             "attach-first",
+            "`failure_kind`, `recovery_kind`, `recommended_actions`",
             "not yet a client for daemon start/stop/status/recover operator APIs",
         ] {
             assert!(

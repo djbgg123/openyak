@@ -112,8 +112,9 @@ cd ../..
 - 交互式 REPL、单次 prompt、会话恢复、配置加载、插件管理、skills/agents 枚举都已接通。
 - MCP、OAuth 与 Git/GitHub 工作流已经具备主实现；LSP/MCP 当前以 registry-backed operator surface 为主。
 - `openyak server` 已作为本地 HTTP/SSE thread server 对外 surfaced，暴露 `/v1/threads` 与 legacy `/sessions` compatibility routes，把线程状态持久化到工作区 `.openyak/state.sqlite3`，并将 bind 范围限制在 loopback 地址。
-- 当前 thread persistence / restart-recovery 只覆盖 thread 级 attach-first 状态：当 server 在 run 中途重启时，线程会恢复为 `interrupted` 并带 `recovery_note`；这为后续 daemon/control-plane 路线提供恢复原语，但还没有把 Task / Team / Cron 等 foundation slices 提升成 daemon-backed orchestration truth。
+- 当前 thread persistence / restart-recovery 只覆盖 thread 级 attach-first 状态：当 server 在 run 中途重启时，线程会恢复为 `interrupted` 并带 `recovery_note`，同时通过结构化 `recovery.failure_kind` / `recovery.recovery_kind` / `recovery.recommended_actions` 暴露恢复 guidance；这为后续 daemon/control-plane 路线提供恢复原语，但还没有把 Task / Team / Cron 等 foundation slices 提升成 daemon-backed orchestration truth。
 - 面向 operator 的真值标签当前必须分开理解：thread snapshot 使用 `truth_layer = daemon_local_v1` 且 `attach_api = /v1/threads`；Task / Team / Cron foundation 仍明确保留 `origin = process_local_v1`，只表示当前 runtime 进程内的临时 registry metadata。
+- thread/session operator surface 现在还会回显 `operator_plane = local_loopback_operator_v1` 与 `persistence = workspace_sqlite_v1`；这组 contract/recovery schema 只描述 `/v1/threads` attach-first truth，不代表 foundation registries 获得 daemon lifecycle store。
 - 同一工作区存在重叠生命周期的多个 `openyak server` 实例时，本地 thread discovery 文件会按写入 `pid` 做 owner-safe 清理；较早退出的实例不会再误删较新实例的发现入口。
 - thread/session 工具现在会同时尝试当前工作区路径和 canonical 工作区路径下的 thread discovery 文件；通过 symlink、junction 或其他等价路径进入同一工作区时，仍能发现正在运行的本地 `openyak server`。
 - 已新增 attach-first、本地-only 的 SDK alpha：
