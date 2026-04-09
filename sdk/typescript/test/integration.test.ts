@@ -2,7 +2,39 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { OpenyakClient } from "../src/index.js";
-import { withServerHarness } from "./helpers/harness.js";
+import { startMockAnthropicService, startOpenyakServer, withServerHarness } from "./helpers/harness.js";
+
+const providerEnvKeys = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "XAI_API_KEY",
+  "XAI_BASE_URL",
+] as const;
+
+async function withRuntimeFailureHarness<T>(
+  fn: (harness: {
+    mock: Awaited<ReturnType<typeof startMockAnthropicService>>;
+    server: Awaited<ReturnType<typeof startOpenyakServer>>;
+  }) => Promise<T>,
+): Promise<T> {
+  const mock = await startMockAnthropicService();
+  const env = { ...process.env };
+  for (const key of providerEnvKeys) {
+    delete env[key];
+  }
+  env.ANTHROPIC_BASE_URL = mock.baseUrl;
+  const server = await startOpenyakServer(env);
+
+  try {
+    return await fn({ mock, server });
+  } finally {
+    await server.close();
+    await mock.close();
+  }
+}
 
 test("attach-first client can create/list/get threads and stream a bash run", async () => {
   await withServerHarness(async ({ server }) => {
@@ -96,5 +128,73 @@ test("buffered run returns awaiting_user_input and resumeUserInput continues the
     const completed = await thread.read();
     assert.equal(completed.state.status, "idle");
     assert.equal(completed.state.pending_user_input, undefined);
+  });
+});
+
+test("buffered run preserves runtime failure recovery metadata against a real local server", async () => {
+  await withRuntimeFailureHarness(async ({ server }) => {
+    const client = new OpenyakClient({
+      baseUrl: server.baseUrl,
+      timeoutMs: 30_000,
+    });
+
+    const thread = await client.createThread({
+      model: "opus",
+      allowedTools: [],
+    });
+
+    const failed = await thread.run("provider bootstrap should fail");
+
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.runId, "run-1");
+    assert.equal(failed.error.code, "runtime_error");
+    assert.equal(failed.error.status, "failed");
+    assert.equal(
+      failed.error.lifecycle?.failure_kind,
+      "daemon_thread_runtime_error",
+    );
+    assert.equal(
+      failed.error.lifecycle?.recovery?.recovery_kind,
+      "inspect_error_and_retry",
+    );
+
+    const completed = await thread.read();
+    assert.equal(completed.state.status, "idle");
+  });
+});
+
+test("runStreamed surfaces runtime failure recovery metadata against a real local server", async () => {
+  await withRuntimeFailureHarness(async ({ server }) => {
+    const client = new OpenyakClient({
+      baseUrl: server.baseUrl,
+      timeoutMs: 30_000,
+    });
+
+    const thread = await client.createThread({
+      model: "opus",
+      allowedTools: [],
+    });
+
+    const streamed = await thread.runStreamed("provider bootstrap should fail");
+    const eventTypes: string[] = [];
+    let failedEvent: { payload: { lifecycle?: { failure_kind?: string; recovery?: { recovery_kind?: string } } } } | undefined;
+
+    for await (const event of streamed.events) {
+      eventTypes.push(event.type);
+      if (event.type === "run.failed") {
+        failedEvent = event;
+        break;
+      }
+    }
+
+    assert.deepEqual(eventTypes, ["run.started", "run.failed"]);
+    assert.equal(
+      failedEvent?.payload.lifecycle?.failure_kind,
+      "daemon_thread_runtime_error",
+    );
+    assert.equal(
+      failedEvent?.payload.lifecycle?.recovery?.recovery_kind,
+      "inspect_error_and_retry",
+    );
   });
 });

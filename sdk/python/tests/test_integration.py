@@ -1,10 +1,43 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import cast
 
 from openyak_sdk import AsyncOpenyakClient, OpenyakClient
+from openyak_sdk._models import RunFailedEvent
 
-from .helpers.harness import server_harness
+from .helpers.harness import (
+    ServerHarness,
+    server_harness,
+    start_mock_anthropic_service,
+    start_openyak_server,
+)
+
+PROVIDER_ENV_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "XAI_API_KEY",
+    "XAI_BASE_URL",
+)
+
+
+@contextmanager
+def runtime_failure_server_harness() -> Iterator[ServerHarness]:
+    mock = start_mock_anthropic_service()
+    env = {key: value for key, value in os.environ.items() if key not in PROVIDER_ENV_KEYS}
+    env["ANTHROPIC_BASE_URL"] = mock.base_url
+    server = start_openyak_server(env)
+    harness = ServerHarness(mock=mock, server=server)
+    try:
+        yield harness
+    finally:
+        harness.close()
 
 
 def test_attach_first_sync_client_can_create_list_get_and_stream_a_bash_run() -> None:
@@ -57,6 +90,63 @@ def test_attach_first_sync_client_can_create_list_get_and_stream_a_bash_run() ->
 
             completed = thread.read()
             assert completed.state.status == "idle"
+
+
+def test_buffered_sync_run_preserves_runtime_failure_recovery_metadata() -> None:
+    with runtime_failure_server_harness() as harness:
+        with OpenyakClient(base_url=harness.server.base_url, timeout_s=30.0) as client:
+            thread = client.create_thread(
+                model="opus",
+                allowed_tools=[],
+            )
+
+            failed = thread.run("provider bootstrap should fail")
+
+            assert failed.status == "failed"
+            assert failed.run_id == "run-1"
+            assert failed.error.code == "runtime_error"
+            assert failed.error.status == "failed"
+            assert failed.error.lifecycle is not None
+            assert failed.error.lifecycle.failure_kind == "daemon_thread_runtime_error"
+            assert failed.error.lifecycle.recovery is not None
+            assert failed.error.lifecycle.recovery.recovery_kind == "inspect_error_and_retry"
+            assert failed.terminal_event is not None
+            assert failed.terminal_event.payload.lifecycle is not None
+            assert (
+                failed.terminal_event.payload.lifecycle.recovery.recommended_actions[0]
+                == "inspect the error message and latest /v1/threads snapshot"
+            )
+
+            completed = thread.read()
+            assert completed.state.status == "idle"
+
+
+def test_streamed_sync_run_surfaces_runtime_failure_recovery_metadata() -> None:
+    with runtime_failure_server_harness() as harness:
+        with OpenyakClient(base_url=harness.server.base_url, timeout_s=30.0) as client:
+            thread = client.create_thread(
+                model="opus",
+                allowed_tools=[],
+            )
+
+            with thread.run_streamed("provider bootstrap should fail") as streamed:
+                event_types: list[str] = []
+                failed_event = None
+                for event in streamed.events:
+                    event_types.append(event.type)
+                    if event.type == "run.failed":
+                        failed_event = cast(RunFailedEvent, event)
+                        break
+
+            assert event_types == ["run.started", "run.failed"]
+            assert failed_event is not None
+            assert failed_event.payload.lifecycle is not None
+            assert failed_event.payload.lifecycle.failure_kind == "daemon_thread_runtime_error"
+            assert (
+                failed_event.payload.lifecycle.recovery is not None
+                and failed_event.payload.lifecycle.recovery.recovery_kind
+                == "inspect_error_and_retry"
+            )
 
 
 def test_buffered_sync_run_returns_awaiting_user_input_and_resume_continues_the_same_run() -> None:
