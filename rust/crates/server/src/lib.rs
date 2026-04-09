@@ -1557,6 +1557,44 @@ fn decode_pending_request_payload(
         })
 }
 
+fn recovery_guidance_for_note(note: &str) -> RecoveryGuidanceSnapshot {
+    let (failure_kind, recovery_kind, recommended_actions): (&str, &str, &[&str]) =
+        if note.contains("restart or shutdown") {
+            (
+                "daemon_restart_interrupted_run",
+                "reattach_or_retry",
+                &[
+                    "reattach to the thread and inspect the latest snapshot",
+                    "retry the interrupted work from the operator plane when safe",
+                ],
+            )
+        } else if note.contains("pending user input") {
+            (
+                "pending_user_input_state_mismatch",
+                "refresh_and_resubmit_user_input",
+                &[
+                    "refresh the thread snapshot before resubmitting user input",
+                    "resume only after confirming the pending request matches the latest durable state",
+                ],
+            )
+        } else {
+            (
+                "interrupted_requires_recovery",
+                "manual_operator_recovery",
+                &[
+                    "inspect the recovery note and latest thread snapshot",
+                    "choose retry, resume, or abandon from the operator plane",
+                ],
+            )
+        };
+
+    RecoveryGuidanceSnapshot {
+        failure_kind: failure_kind.to_string(),
+        recovery_kind: recovery_kind.to_string(),
+        recommended_actions: recommended_actions.iter().map(|value| (*value).to_string()).collect(),
+    }
+}
+
 fn recovered_status_from_persisted(
     persisted: &PersistedThreadRecord,
     pending_request: Option<UserInputRequestPayload>,
