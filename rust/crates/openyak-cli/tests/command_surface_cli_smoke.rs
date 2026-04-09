@@ -181,6 +181,10 @@ fn openyak_direct_commands_match_verified_smoke_paths() {
     assert!(foundations.contains("Foundations"), "{foundations}");
     assert!(foundations.contains("TaskCreate"), "{foundations}");
     assert!(foundations.contains("process_local_v1"), "{foundations}");
+    assert!(
+        foundations.contains("without implying durable registries"),
+        "{foundations}"
+    );
 
     let foundations_task = sandbox.run_success(&["foundations", "task"]);
     assert!(
@@ -188,6 +192,49 @@ fn openyak_direct_commands_match_verified_smoke_paths() {
         "{foundations_task}"
     );
     assert!(foundations_task.contains("TaskWait"), "{foundations_task}");
+    assert!(
+        foundations_task.contains("process_local_v1 current-runtime registry"),
+        "{foundations_task}"
+    );
+}
+
+#[test]
+fn daemon_truth_docs_keep_threads_and_foundations_split() {
+    let repo_root = repo_root();
+    let readme = fs::read_to_string(repo_root.join("README.md")).expect("README should exist");
+    let contributing = fs::read_to_string(repo_root.join("CONTRIBUTING.md"))
+        .expect("CONTRIBUTING should exist");
+    let parity_doc = fs::read_to_string(repo_root.join("docs/parity-foundation-registries.md"))
+        .expect("parity foundation doc should exist");
+
+    for marker in [
+        "`truth_layer = daemon_local_v1`",
+        "`/v1/threads`",
+        "未有：daemon-backed worker/task/team truth layer",
+        "Task / Team / Cron registry 保持 `process_local_v1` 语义",
+    ] {
+        assert!(readme.contains(marker), "README missing {marker}: {readme}");
+    }
+
+    for marker in [
+        "Task / Team / Cron 的 V1 contract 当前固定为 `process_local_v1`",
+        "不要偷偷引入持久化、恢复、租约、共享服务或 crash recovery 语义",
+    ] {
+        assert!(
+            contributing.contains(marker),
+            "CONTRIBUTING missing {marker}: {contributing}"
+        );
+    }
+
+    for marker in [
+        "`origin = \"process_local_v1\"`",
+        "不提供持久化、恢复、租约语义",
+    ] {
+        assert!(
+            parity_doc.contains(marker),
+            "parity foundation doc missing {marker}: {parity_doc}"
+        );
+    }
 }
 
 #[test]
