@@ -55,6 +55,8 @@ pub struct FoundationSurface {
     pub summary: &'static str,
     pub access_type: &'static str,
     pub backing_model: &'static str,
+    pub truth_label: &'static str,
+    pub operator_label: &'static str,
     pub boundary_note: &'static str,
     pub adjacent_scope: Option<&'static str>,
     pub not_promised: &'static str,
@@ -111,6 +113,8 @@ const FOUNDATION_SURFACES: &[FoundationSurface] = &[
         summary: "Metadata-first task lifecycle foundation for the current runtime.",
         access_type: "process-local foundation",
         backing_model: "process_local_v1 current-runtime registry",
+        truth_label: "process_local_v1 runtime-only truth",
+        operator_label: "local runtime foundation metadata",
         boundary_note: "Fresh CLI processes do not inherit durable task inventory.",
         adjacent_scope: None,
         not_promised: "persistence, leases, cross-process scheduling, remote execution",
@@ -121,6 +125,8 @@ const FOUNDATION_SURFACES: &[FoundationSurface] = &[
         summary: "Metadata-first team grouping foundation for the current runtime.",
         access_type: "process-local foundation",
         backing_model: "process_local_v1 current-runtime registry",
+        truth_label: "process_local_v1 runtime-only truth",
+        operator_label: "local runtime foundation metadata",
         boundary_note: "Fresh CLI processes do not inherit durable team inventory.",
         adjacent_scope: None,
         not_promised: "persistence, leases, cross-process orchestration, remote execution",
@@ -131,6 +137,8 @@ const FOUNDATION_SURFACES: &[FoundationSurface] = &[
         summary: "Metadata-first cron foundation for low-risk operator scheduling semantics.",
         access_type: "process-local foundation",
         backing_model: "process_local_v1 current-runtime registry",
+        truth_label: "process_local_v1 runtime-only truth",
+        operator_label: "local runtime foundation metadata",
         boundary_note: "Fresh CLI processes do not inherit durable cron inventory.",
         adjacent_scope: None,
         not_promised: "durable schedulers, crash recovery, shared services, remote execution",
@@ -141,6 +149,8 @@ const FOUNDATION_SURFACES: &[FoundationSurface] = &[
         summary: "Registry-backed query bridge for current LSP visibility and diagnostics.",
         access_type: "registry-backed bridge",
         backing_model: "current runtime LSP registry bridge",
+        truth_label: "current_runtime_registry_bridge",
+        operator_label: "registry-backed diagnostics visibility",
         boundary_note: "This is not a standalone openyak lsp host or control plane.",
         adjacent_scope: Some("MB2 keeps standalone server/LSP surfacing narrow."),
         not_promised:
@@ -153,6 +163,8 @@ const FOUNDATION_SURFACES: &[FoundationSurface] = &[
             "Registry-backed bridge for current MCP server, tool, resource, and auth visibility.",
         access_type: "registry-backed bridge",
         backing_model: "current runtime MCP registry bridge",
+        truth_label: "current_runtime_registry_bridge",
+        operator_label: "registry-backed MCP visibility",
         boundary_note: "This is not a broader MCP control plane.",
         adjacent_scope: Some("MB5 owns deeper configured/auth/error lifecycle hardening."),
         not_promised: "remote orchestration, notification buses, wider control-plane behavior",
@@ -2996,11 +3008,13 @@ fn thread_session_summary_json(summary: &ThreadSummaryValue) -> Value {
         "kind": SessionKind::Thread.as_str(),
         "id": summary.thread_id,
         "origin": SessionKind::Thread.origin(),
+        "contract": summary.contract,
         "capabilities": SessionKind::Thread.capabilities(),
         "status": summary.state.status,
         "run_id": summary.state.run_id,
         "pending_user_input": summary.state.pending_user_input,
         "recovery_note": summary.state.recovery_note,
+        "recovery": summary.state.recovery,
         "created_at": summary.created_at,
         "updated_at": summary.updated_at,
         "message_count": summary.message_count
@@ -3012,11 +3026,13 @@ fn thread_session_detail_json(snapshot: &ThreadSnapshotValue) -> Value {
         "kind": SessionKind::Thread.as_str(),
         "id": snapshot.thread_id,
         "origin": SessionKind::Thread.origin(),
+        "contract": snapshot.contract,
         "capabilities": SessionKind::Thread.capabilities(),
         "status": snapshot.state.status,
         "run_id": snapshot.state.run_id,
         "pending_user_input": snapshot.state.pending_user_input,
         "recovery_note": snapshot.state.recovery_note,
+        "recovery": snapshot.state.recovery,
         "created_at": snapshot.created_at,
         "updated_at": snapshot.updated_at,
         "message_count": snapshot.session.messages.len(),
@@ -5184,6 +5200,8 @@ struct ThreadStateSnapshotValue {
     pending_user_input: Option<PendingUserInputPayload>,
     #[serde(default)]
     recovery_note: Option<String>,
+    #[serde(default)]
+    recovery: Option<ThreadRecoveryGuidanceValue>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -5195,7 +5213,23 @@ struct ThreadConfigSnapshotValue {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct ThreadContractSnapshotValue {
+    truth_layer: String,
+    operator_plane: String,
+    persistence: String,
+    attach_api: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct ThreadRecoveryGuidanceValue {
+    failure_kind: String,
+    recovery_kind: String,
+    recommended_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct ThreadSummaryValue {
+    contract: ThreadContractSnapshotValue,
     thread_id: String,
     created_at: u64,
     updated_at: u64,
@@ -5212,6 +5246,7 @@ struct ListThreadsResponseValue {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct ThreadSnapshotValue {
     protocol_version: String,
+    contract: ThreadContractSnapshotValue,
     thread_id: String,
     created_at: u64,
     updated_at: u64,
