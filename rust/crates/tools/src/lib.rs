@@ -10172,6 +10172,12 @@ mod tests {
                 json!({
                     "protocol_version": "v1",
                     "threads": [{
+                        "contract": {
+                            "truth_layer": "daemon_local_v1",
+                            "operator_plane": "local_loopback_operator_v1",
+                            "persistence": "workspace_sqlite_v1",
+                            "attach_api": "/v1/threads"
+                        },
                         "thread_id": "thread-7",
                         "created_at": 10,
                         "updated_at": 20,
@@ -10199,6 +10205,12 @@ mod tests {
                 "OK",
                 json!({
                     "protocol_version": "v1",
+                    "contract": {
+                        "truth_layer": "daemon_local_v1",
+                        "operator_plane": "local_loopback_operator_v1",
+                        "persistence": "workspace_sqlite_v1",
+                        "attach_api": "/v1/threads"
+                    },
                     "thread_id": "thread-7",
                     "created_at": 10,
                     "updated_at": if *resumed_for_server.lock().unwrap_or_else(std::sync::PoisonError::into_inner) { 40 } else { 20 },
@@ -10239,6 +10251,12 @@ mod tests {
                 "Created",
                 json!({
                     "protocol_version": "v1",
+                    "contract": {
+                        "truth_layer": "daemon_local_v1",
+                        "operator_plane": "local_loopback_operator_v1",
+                        "persistence": "workspace_sqlite_v1",
+                        "attach_api": "/v1/threads"
+                    },
                     "thread_id": "thread-8",
                     "created_at": 50,
                     "updated_at": 50,
