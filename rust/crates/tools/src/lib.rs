@@ -10196,7 +10196,23 @@ mod tests {
                                     "allow_freeform": true
                                 })
                             },
-                            "recovery_note": Value::Null
+                            "recovery_note": if *resumed_for_server.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+                                Value::Null
+                            } else {
+                                Value::String("previous run ended during server restart or shutdown".to_string())
+                            },
+                            "recovery": if *resumed_for_server.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+                                Value::Null
+                            } else {
+                                json!({
+                                    "failure_kind": "daemon_restart_interrupted_run",
+                                    "recovery_kind": "reattach_or_retry",
+                                    "recommended_actions": [
+                                        "reattach to the thread and inspect the latest snapshot",
+                                        "retry the interrupted work from the operator plane when safe"
+                                    ]
+                                })
+                            }
                         },
                         "message_count": 2
                     }]
@@ -10229,7 +10245,23 @@ mod tests {
                                 "allow_freeform": true
                             })
                         },
-                        "recovery_note": Value::Null
+                        "recovery_note": if *resumed_for_server.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+                            Value::Null
+                        } else {
+                            Value::String("previous run ended during server restart or shutdown".to_string())
+                        },
+                        "recovery": if *resumed_for_server.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+                            Value::Null
+                        } else {
+                            json!({
+                                "failure_kind": "daemon_restart_interrupted_run",
+                                "recovery_kind": "reattach_or_retry",
+                                "recommended_actions": [
+                                    "reattach to the thread and inspect the latest snapshot",
+                                    "retry the interrupted work from the operator plane when safe"
+                                ]
+                            })
+                        }
                     },
                     "config": {
                         "cwd": "C:/workspace",
@@ -10333,6 +10365,16 @@ mod tests {
             .expect("thread session present");
         assert_eq!(thread["id"], "thread-7");
         assert_eq!(thread["contract"]["truth_layer"], "daemon_local_v1");
+        assert_eq!(
+            thread["recovery"]["failure_kind"],
+            "daemon_restart_interrupted_run"
+        );
+        assert_eq!(thread["recovery"]["recovery_kind"], "reattach_or_retry");
+        assert!(thread["recovery"]["recommended_actions"]
+            .as_array()
+            .expect("thread recovery actions")
+            .iter()
+            .any(|entry| entry == "reattach to the thread and inspect the latest snapshot"));
         assert!(thread["capabilities"]
             .as_array()
             .expect("thread capabilities")
@@ -10369,6 +10411,10 @@ mod tests {
             thread_get_value["contract"]["operator_plane"],
             "local_loopback_operator_v1"
         );
+        assert_eq!(
+            thread_get_value["recovery"]["failure_kind"],
+            "daemon_restart_interrupted_run"
+        );
         assert_eq!(thread_get_value["config"]["model"], "opus");
         assert_eq!(thread_get_value["message_count"], 2);
 
@@ -10395,6 +10441,10 @@ mod tests {
         let waiting_value: Value = serde_json::from_str(&waiting).expect("session wait json");
         assert_eq!(waiting_value["status"], "awaiting_user_input");
         assert_eq!(waiting_value["terminal"], true);
+        assert_eq!(
+            waiting_value["recovery"]["recovery_kind"],
+            "reattach_or_retry"
+        );
 
         let resumed_value = execute_tool(
             "SessionResume",

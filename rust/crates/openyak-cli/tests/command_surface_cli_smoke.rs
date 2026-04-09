@@ -211,7 +211,9 @@ fn daemon_truth_docs_keep_threads_and_foundations_split() {
     for marker in [
         "`truth_layer = daemon_local_v1`",
         "`/v1/threads`",
+        "恢复 guidance",
         "未有：daemon-backed worker/task/team truth layer",
+        "failure taxonomy / recovery recipes",
         "Task / Team / Cron registry 保持 `process_local_v1` 语义",
     ] {
         assert!(readme.contains(marker), "README missing {marker}: {readme}");
@@ -229,6 +231,7 @@ fn daemon_truth_docs_keep_threads_and_foundations_split() {
 
     for marker in [
         "`origin = \"process_local_v1\"`",
+        "restart 后的 `interrupted` + `recovery_note` 只适用于这条 attach-first thread truth",
         "不提供持久化、恢复、租约语义",
     ] {
         assert!(
