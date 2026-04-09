@@ -32,7 +32,22 @@
 - `disabled_reason`：当前只用于 cron，V1 固定记录低风险 disable 语义，而不是引入完整调度控制面。
 - `created_at` / `updated_at`：统一作为 V1 object lifecycle metadata 暴露给 tool payload，避免 operator 只能依赖隐含顺序推断对象新旧。
 
-与之相对，daemon-backed truth 当前只在 thread attach-first surface 落地：`Session*` 的 thread payload 可以回显 `contract` 与 `recovery` metadata，但这不改变 Task / Team / Cron 仍是 `process_local_v1` foundation 的事实。
+## 与 daemon-backed thread truth 的边界
+
+当前仓库里已经有一个**更窄但确实 daemon-backed** 的 truth slice：`openyak server` 提供的 thread snapshot contract。
+
+- thread snapshot 显式声明 `truth_layer = "daemon_local_v1"`
+- thread snapshot 同时声明 `attach_api = "/v1/threads"`
+- restart 后的 `interrupted` + `recovery_note` 只适用于这条 attach-first thread truth
+
+这不应和 foundation registry 的 `process_local_v1` 混为一谈：
+
+- `Task*` / `Team*` / `Cron*` payload 继续使用 `origin = "process_local_v1"`
+- 它们仍然只表示当前 runtime 进程内的临时 registry state
+- 当前没有 daemon-backed worker/task/team lifecycle store、租约、跨进程恢复或统一 recovery recipe plane
+
+评审口径应保持成对出现：**thread truth 已经带 daemon label；foundation truth 仍然是 process-local label。**
+这条分界线也应体现在 operator-facing 文档、CLI 帮助叙事和 SDK README 中，避免把 thread-level recovery primitive 误写成更宽的 daemon control plane。
 
 ## 当前已经落地的 operator-facing surface
 
