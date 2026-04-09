@@ -2213,13 +2213,19 @@ mod tests {
 
         assert_eq!(created.thread_id, "thread-1");
         assert_eq!(created.protocol_version, "v1");
-        assert_eq!(created.contract.truth_layer, THREAD_TRUTH_LAYER);
-        assert_eq!(created.contract.operator_plane, THREAD_OPERATOR_PLANE);
+        assert_eq!(created.contract.truth_layer, super::THREAD_TRUTH_LAYER);
+        assert_eq!(
+            created.contract.operator_plane,
+            super::THREAD_OPERATOR_PLANE
+        );
         assert_eq!(created.state.status, "idle");
         assert!(created.session.messages.is_empty());
         assert_eq!(listed.threads.len(), 1);
         assert_eq!(listed.threads[0].thread_id, created.thread_id);
-        assert_eq!(listed.threads[0].contract.truth_layer, THREAD_TRUTH_LAYER);
+        assert_eq!(
+            listed.threads[0].contract.truth_layer,
+            super::THREAD_TRUTH_LAYER
+        );
         assert_eq!(fetched.thread_id, created.thread_id);
         assert_eq!(fetched.config.permission_mode, "danger-full-access");
         assert!(!fetched.config.allowed_tools.is_empty());
