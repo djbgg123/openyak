@@ -8,6 +8,7 @@ mod date;
 mod file_ops;
 mod hooks;
 mod json;
+mod lifecycle;
 mod lsp_client;
 mod mcp;
 mod mcp_client;
@@ -56,6 +57,12 @@ pub use file_ops::{
     WriteFileOutput,
 };
 pub use hooks::{HookEvent, HookRunResult, HookRunner};
+pub use lifecycle::{
+    LifecycleContractSnapshot, RecoveryGuidanceSnapshot, ThreadContractSnapshot,
+    DAEMON_LOCAL_TRUTH_LAYER, LOCAL_LOOPBACK_OPERATOR_PLANE,
+    LOCAL_RUNTIME_FOUNDATION_OPERATOR_PLANE, PROCESS_LOCAL_TRUTH_LAYER,
+    PROCESS_MEMORY_PERSISTENCE_LAYER, THREAD_ATTACH_API, WORKSPACE_SQLITE_PERSISTENCE_LAYER,
+};
 pub use lsp::{
     FileDiagnostics, LspContextEnrichment, LspError, LspManager, LspServerConfig, SymbolLocation,
     WorkspaceDiagnostics,

@@ -26,6 +26,7 @@
 当前统一的 metadata 口径：
 
 - `origin = "process_local_v1"`：明确表明 backing store 只是当前进程内 registry。
+- `contract.truth_layer = "process_local_v1"` / `contract.operator_plane = "local_runtime_foundation_v1"` / `contract.persistence = "process_memory_only_v1"`：继续把 foundation lifecycle contract 锁在当前 runtime 进程，不借用 thread daemon contract。
 - `openyak foundations ...` 输出里的 `Truth` / `Operator label` 行应继续把这些 family 标成 `process_local_v1 runtime-only truth` 或对应的 registry bridge，而不是借 thread daemon truth 做过度类比。
 - `capabilities`：列出当前对象在 V1 中稳定可用的低风险 operator-facing 动作。
 - `last_error`：仅记录该对象最近一次“命中对象本身的非法状态操作”错误；缺失并不代表系统从未报错，只代表当前对象没有保留到更具体的错误上下文。

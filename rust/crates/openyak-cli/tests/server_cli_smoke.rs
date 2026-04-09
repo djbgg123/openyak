@@ -99,7 +99,10 @@ fn openyak_server_surfaces_thread_routes() {
         "thread server info should match the advertised address"
     );
     assert_eq!(server_info_json["truthLayer"], "daemon_local_v1");
-    assert_eq!(server_info_json["operatorPlane"], "local_loopback_operator_v1");
+    assert_eq!(
+        server_info_json["operatorPlane"],
+        "local_loopback_operator_v1"
+    );
     assert_eq!(server_info_json["persistence"], "workspace_sqlite_v1");
     assert_eq!(server_info_json["attachApi"], "/v1/threads");
 
@@ -144,7 +147,10 @@ fn openyak_server_surfaces_thread_routes() {
             .any(|entry| entry["thread_id"].as_str() == Some(thread_id.as_str())),
         "created thread should appear in thread list: {listed}"
     );
-    assert_eq!(listed["threads"][0]["contract"]["truth_layer"], "daemon_local_v1");
+    assert_eq!(
+        listed["threads"][0]["contract"]["truth_layer"],
+        "daemon_local_v1"
+    );
 }
 
 #[test]

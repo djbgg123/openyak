@@ -2388,6 +2388,7 @@ fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
         "updated_at": task.updated_at,
         "last_error": task.last_error,
         "origin": task.origin,
+        "contract": task.contract,
         "capabilities": task.capabilities,
         "message_count": task.messages.len(),
         "output_length": task.output.len(),
@@ -2408,6 +2409,7 @@ fn run_task_get(input: TaskIdInput) -> Result<String, String> {
             "updated_at": task.updated_at,
             "last_error": task.last_error,
             "origin": task.origin,
+            "contract": task.contract,
             "capabilities": task.capabilities,
             "message_count": task.messages.len(),
             "messages": task.messages,
@@ -2433,6 +2435,7 @@ fn run_task_list(_input: Value) -> Result<String, String> {
                 "updated_at": task.updated_at,
                 "last_error": task.last_error,
                 "origin": task.origin,
+                "contract": task.contract,
                 "capabilities": task.capabilities,
                 "message_count": task.messages.len(),
                 "output_length": task.output.len(),
@@ -2454,6 +2457,7 @@ fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
             "updated_at": task.updated_at,
             "last_error": task.last_error,
             "origin": task.origin,
+            "contract": task.contract,
             "capabilities": task.capabilities,
             "message_count": task.messages.len(),
             "output_length": task.output.len(),
@@ -2475,6 +2479,7 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
             "updated_at": task.updated_at,
             "last_error": task.last_error,
             "origin": task.origin,
+            "contract": task.contract,
             "capabilities": task.capabilities,
             "output_length": task.output.len(),
             "has_output": !task.output.is_empty(),
@@ -2500,6 +2505,7 @@ fn run_task_output(input: TaskIdInput) -> Result<String, String> {
                 "updated_at": task.updated_at,
                 "last_error": task.last_error,
                 "origin": task.origin,
+                "contract": task.contract,
                 "capabilities": task.capabilities
             }))
         }
@@ -2534,6 +2540,7 @@ fn run_task_wait(input: TaskWaitInput) -> Result<String, String> {
                 "updated_at": task.updated_at,
                 "last_error": task.last_error,
                 "origin": task.origin,
+                "contract": task.contract,
                 "capabilities": task.capabilities,
                 "message_count": task.messages.len(),
                 "output_length": task.output.len(),
@@ -2584,6 +2591,7 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
         "updated_at": team.updated_at,
         "last_error": team.last_error,
         "origin": team.origin,
+        "contract": team.contract,
         "capabilities": team.capabilities
     }))
 }
@@ -2603,6 +2611,7 @@ fn run_team_get(input: TeamIdInput) -> Result<String, String> {
                 "updated_at": team.updated_at,
                 "last_error": team.last_error,
                 "origin": team.origin,
+                "contract": team.contract,
                 "capabilities": team.capabilities
             }))
         }
@@ -2626,6 +2635,7 @@ fn run_team_list(_input: Value) -> Result<String, String> {
                 "updated_at": team.updated_at,
                 "last_error": team.last_error,
                 "origin": team.origin,
+                "contract": team.contract,
                 "capabilities": team.capabilities
             })
         })
@@ -2648,6 +2658,7 @@ fn run_team_delete(input: TeamIdInput) -> Result<String, String> {
                 "updated_at": team.updated_at,
                 "last_error": team.last_error,
                 "origin": team.origin,
+                "contract": team.contract,
                 "capabilities": team.capabilities,
                 "message": "Team deleted"
             }))
@@ -2673,6 +2684,7 @@ fn run_cron_create(input: CronCreateInput) -> Result<String, String> {
         "last_error": entry.last_error,
         "disabled_reason": entry.disabled_reason,
         "origin": entry.origin,
+        "contract": entry.contract,
         "capabilities": entry.capabilities
     }))
 }
@@ -2693,6 +2705,7 @@ fn run_cron_get(input: CronIdInput) -> Result<String, String> {
             "last_error": entry.last_error,
             "disabled_reason": entry.disabled_reason,
             "origin": entry.origin,
+            "contract": entry.contract,
             "capabilities": entry.capabilities
         })),
         None => Err(format!("cron not found: {}", input.cron_id)),
@@ -2716,6 +2729,7 @@ fn run_cron_disable(input: CronIdInput) -> Result<String, String> {
         "last_error": entry.last_error,
         "disabled_reason": entry.disabled_reason,
         "origin": entry.origin,
+        "contract": entry.contract,
         "capabilities": entry.capabilities
     }))
 }
@@ -2737,6 +2751,7 @@ fn run_cron_enable(input: CronIdInput) -> Result<String, String> {
         "last_error": entry.last_error,
         "disabled_reason": entry.disabled_reason,
         "origin": entry.origin,
+        "contract": entry.contract,
         "capabilities": entry.capabilities
     }))
 }
@@ -2754,6 +2769,7 @@ fn run_cron_delete(input: CronIdInput) -> Result<String, String> {
             "last_error": entry.last_error,
             "disabled_reason": entry.disabled_reason,
             "origin": entry.origin,
+            "contract": entry.contract,
             "capabilities": entry.capabilities
         })),
         Err(error) => Err(error),
@@ -2778,6 +2794,7 @@ fn run_cron_list(_input: Value) -> Result<String, String> {
                 "last_error": entry.last_error,
                 "disabled_reason": entry.disabled_reason,
                 "origin": entry.origin,
+                "contract": entry.contract,
                 "capabilities": entry.capabilities
             })
         })
@@ -5201,7 +5218,7 @@ struct ThreadStateSnapshotValue {
     #[serde(default)]
     recovery_note: Option<String>,
     #[serde(default)]
-    recovery: Option<ThreadRecoveryGuidanceValue>,
+    recovery: Option<runtime::RecoveryGuidanceSnapshot>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -5213,23 +5230,8 @@ struct ThreadConfigSnapshotValue {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-struct ThreadContractSnapshotValue {
-    truth_layer: String,
-    operator_plane: String,
-    persistence: String,
-    attach_api: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-struct ThreadRecoveryGuidanceValue {
-    failure_kind: String,
-    recovery_kind: String,
-    recommended_actions: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct ThreadSummaryValue {
-    contract: ThreadContractSnapshotValue,
+    contract: runtime::ThreadContractSnapshot,
     thread_id: String,
     created_at: u64,
     updated_at: u64,
@@ -5246,7 +5248,7 @@ struct ListThreadsResponseValue {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct ThreadSnapshotValue {
     protocol_version: String,
-    contract: ThreadContractSnapshotValue,
+    contract: runtime::ThreadContractSnapshot,
     thread_id: String,
     created_at: u64,
     updated_at: u64,
@@ -10624,6 +10626,15 @@ mod tests {
         assert_eq!(task_value["team_id"], Value::Null);
         assert_eq!(task_value["created_at"], task_value["updated_at"]);
         assert_eq!(task_value["origin"], "process_local_v1");
+        assert_eq!(task_value["contract"]["truth_layer"], "process_local_v1");
+        assert_eq!(
+            task_value["contract"]["operator_plane"],
+            "local_runtime_foundation_v1"
+        );
+        assert_eq!(
+            task_value["contract"]["persistence"],
+            "process_memory_only_v1"
+        );
         assert_eq!(task_value["last_error"], Value::Null);
         assert!(task_value["capabilities"]
             .as_array()
@@ -10638,6 +10649,7 @@ mod tests {
         assert_eq!(fetched_value["output_length"], 0);
         assert_eq!(fetched_value["has_output"], false);
         assert_eq!(fetched_value["origin"], "process_local_v1");
+        assert_eq!(fetched_value["contract"]["truth_layer"], "process_local_v1");
 
         let updated = execute_tool(
             "TaskUpdate",
@@ -10664,6 +10676,7 @@ mod tests {
         assert_eq!(waited_value["timed_out"], false);
         assert_eq!(waited_value["status"], "completed");
         assert_eq!(waited_value["origin"], "process_local_v1");
+        assert_eq!(waited_value["contract"]["truth_layer"], "process_local_v1");
 
         let team = execute_tool(
             "TeamCreate",
@@ -10675,6 +10688,7 @@ mod tests {
         assert_eq!(team_value["task_count"], 1);
         assert_eq!(team_value["created_at"], team_value["updated_at"]);
         assert_eq!(team_value["origin"], "process_local_v1");
+        assert_eq!(team_value["contract"]["truth_layer"], "process_local_v1");
         assert_eq!(team_value["last_error"], Value::Null);
         assert!(team_value["capabilities"]
             .as_array()
@@ -10687,6 +10701,10 @@ mod tests {
         assert_eq!(team_get_value["team_id"], team_id);
         assert_eq!(team_get_value["task_ids"][0], task_id);
         assert_eq!(team_get_value["origin"], "process_local_v1");
+        assert_eq!(
+            team_get_value["contract"]["operator_plane"],
+            "local_runtime_foundation_v1"
+        );
 
         let team_list = execute_tool("TeamList", &json!({})).expect("TeamList");
         let team_list_value: Value = serde_json::from_str(&team_list).expect("team list json");
@@ -10707,6 +10725,7 @@ mod tests {
         assert_eq!(cron_value["last_run_at"], Value::Null);
         assert_eq!(cron_value["created_at"], cron_value["updated_at"]);
         assert_eq!(cron_value["origin"], "process_local_v1");
+        assert_eq!(cron_value["contract"]["truth_layer"], "process_local_v1");
         assert_eq!(cron_value["disabled_reason"], Value::Null);
         assert_eq!(cron_value["last_error"], Value::Null);
         assert!(cron_value["capabilities"]
@@ -10720,6 +10739,10 @@ mod tests {
         assert_eq!(cron_get_value["cron_id"], cron_id);
         assert_eq!(cron_get_value["enabled"], true);
         assert_eq!(cron_get_value["origin"], "process_local_v1");
+        assert_eq!(
+            cron_get_value["contract"]["persistence"],
+            "process_memory_only_v1"
+        );
 
         let disabled =
             execute_tool("CronDisable", &json!({"cron_id": cron_id})).expect("CronDisable");
@@ -10753,6 +10776,7 @@ mod tests {
         let deleted_value: Value = serde_json::from_str(&deleted).expect("cron delete json");
         assert_eq!(deleted_value["status"], "deleted");
         assert_eq!(deleted_value["origin"], "process_local_v1");
+        assert_eq!(deleted_value["contract"]["truth_layer"], "process_local_v1");
 
         let team_deleted =
             execute_tool("TeamDelete", &json!({"team_id": team_id})).expect("TeamDelete");
@@ -10762,6 +10786,10 @@ mod tests {
         assert_eq!(team_deleted_value["task_ids"][0], task_id);
         assert_eq!(team_deleted_value["task_count"], 1);
         assert_eq!(team_deleted_value["origin"], "process_local_v1");
+        assert_eq!(
+            team_deleted_value["contract"]["truth_layer"],
+            "process_local_v1"
+        );
 
         global_team_registry().remove(team_id);
         global_task_registry().remove(task_id);

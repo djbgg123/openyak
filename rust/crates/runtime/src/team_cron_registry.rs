@@ -9,9 +9,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::LifecycleContractSnapshot;
 use serde::{Deserialize, Serialize};
 
-const REGISTRY_ORIGIN: &str = "process_local_v1";
+const REGISTRY_ORIGIN: &str = crate::PROCESS_LOCAL_TRUTH_LAYER;
 
 fn team_capabilities() -> Vec<String> {
     ["get", "list", "delete"]
@@ -51,6 +52,7 @@ pub struct Team {
     pub updated_at: u64,
     pub last_error: Option<String>,
     pub origin: String,
+    pub contract: LifecycleContractSnapshot,
     pub capabilities: Vec<String>,
 }
 
@@ -105,6 +107,7 @@ impl TeamRegistry {
             updated_at: ts,
             last_error: None,
             origin: REGISTRY_ORIGIN.to_owned(),
+            contract: LifecycleContractSnapshot::process_local_foundation(),
             capabilities: team_capabilities(),
         };
         inner.teams.insert(team_id, team.clone());
@@ -171,6 +174,7 @@ pub struct CronEntry {
     pub last_error: Option<String>,
     pub disabled_reason: Option<String>,
     pub origin: String,
+    pub contract: LifecycleContractSnapshot,
     pub capabilities: Vec<String>,
 }
 
@@ -209,6 +213,7 @@ impl CronRegistry {
             last_error: None,
             disabled_reason: None,
             origin: REGISTRY_ORIGIN.to_owned(),
+            contract: LifecycleContractSnapshot::process_local_foundation(),
             capabilities: cron_capabilities(),
         };
         inner.entries.insert(cron_id, entry.clone());
@@ -496,6 +501,11 @@ mod tests {
         let team = registry.create("Alpha", vec![]);
 
         assert_eq!(team.origin, REGISTRY_ORIGIN);
+        assert_eq!(team.contract.truth_layer, REGISTRY_ORIGIN);
+        assert_eq!(
+            team.contract.operator_plane,
+            crate::LOCAL_RUNTIME_FOUNDATION_OPERATOR_PLANE
+        );
         assert_eq!(team.last_error, None);
         assert!(team.capabilities.contains(&"delete".to_string()));
     }
@@ -575,6 +585,11 @@ mod tests {
         assert_eq!(entry.last_error, None);
         assert_eq!(entry.disabled_reason, None);
         assert_eq!(entry.origin, REGISTRY_ORIGIN);
+        assert_eq!(entry.contract.truth_layer, REGISTRY_ORIGIN);
+        assert_eq!(
+            entry.contract.persistence,
+            crate::PROCESS_MEMORY_PERSISTENCE_LAYER
+        );
         assert!(entry.capabilities.contains(&"record_run".to_string()));
     }
 
