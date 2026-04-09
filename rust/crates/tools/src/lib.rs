@@ -3134,6 +3134,7 @@ fn managed_session_summary_json(record: &ManagedSessionRecord) -> Value {
         "origin": SessionKind::ManagedSession.origin(),
         "capabilities": SessionKind::ManagedSession.capabilities(),
         "status": managed_session_status(&record.session),
+        "lifecycle": managed_session_lifecycle(&record.session),
         "created_at": record.created_at,
         "updated_at": record.updated_at,
         "message_count": record.session.messages.len(),
@@ -3152,6 +3153,7 @@ fn managed_session_detail_json(record: &ManagedSessionRecord) -> Value {
         "origin": SessionKind::ManagedSession.origin(),
         "capabilities": SessionKind::ManagedSession.capabilities(),
         "status": managed_session_status(&record.session),
+        "lifecycle": managed_session_lifecycle(&record.session),
         "created_at": record.created_at,
         "updated_at": record.updated_at,
         "message_count": record.session.messages.len(),
@@ -3170,6 +3172,10 @@ fn managed_session_status(session: &Session) -> &'static str {
     } else {
         "idle"
     }
+}
+
+fn managed_session_lifecycle(session: &Session) -> runtime::LifecycleStateSnapshot {
+    runtime::LifecycleStateSnapshot::status(managed_session_status(session))
 }
 
 fn managed_sessions_dir() -> Result<PathBuf, String> {
@@ -3230,6 +3236,7 @@ fn agent_run_summary_json(record: &AgentRunRecord) -> Value {
         "origin": SessionKind::AgentRun.origin(),
         "capabilities": SessionKind::AgentRun.capabilities(),
         "status": record.manifest.status,
+        "lifecycle": agent_run_lifecycle(record),
         "created_at": record.created_at,
         "updated_at": record.updated_at,
         "output_length": record.output.len(),
@@ -3249,6 +3256,7 @@ fn agent_run_detail_json(record: &AgentRunRecord) -> Value {
         "origin": SessionKind::AgentRun.origin(),
         "capabilities": SessionKind::AgentRun.capabilities(),
         "status": record.manifest.status,
+        "lifecycle": agent_run_lifecycle(record),
         "created_at": record.created_at,
         "updated_at": record.updated_at,
         "output_length": record.output.len(),
@@ -3263,6 +3271,10 @@ fn agent_run_detail_json(record: &AgentRunRecord) -> Value {
         "error": record.manifest.error,
         "output": record.output
     })
+}
+
+fn agent_run_lifecycle(record: &AgentRunRecord) -> runtime::LifecycleStateSnapshot {
+    runtime::LifecycleStateSnapshot::status(record.manifest.status.clone())
 }
 
 fn session_server_request<T: DeserializeOwned>(
@@ -10420,6 +10432,7 @@ mod tests {
             .find(|entry| entry["kind"] == "managed_session")
             .expect("managed session present");
         assert_eq!(managed["status"], "awaiting_user_input");
+        assert_eq!(managed["lifecycle"]["status"], "awaiting_user_input");
         assert_eq!(managed["message_count"], 2);
         assert_eq!(
             managed["capabilities"]
@@ -10433,6 +10446,7 @@ mod tests {
             .find(|entry| entry["kind"] == "agent_run")
             .expect("agent run present");
         assert_eq!(agent["status"], "running");
+        assert_eq!(agent["lifecycle"]["status"], "running");
         assert!(agent["capabilities"]
             .as_array()
             .expect("agent caps")
@@ -10545,6 +10559,7 @@ mod tests {
         let waited_agent_value: Value =
             serde_json::from_str(&waited_agent).expect("agent wait json");
         assert_eq!(waited_agent_value["status"], "completed");
+        assert_eq!(waited_agent_value["lifecycle"]["status"], "completed");
         assert_eq!(waited_agent_value["terminal"], true);
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
