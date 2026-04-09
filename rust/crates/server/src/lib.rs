@@ -2415,6 +2415,10 @@ mod tests {
             .json::<Value>()
             .await
             .expect("conflict body should parse");
+        assert_eq!(
+            conflict_body["details"]["status"]["lifecycle"]["status"],
+            "awaiting_user_input"
+        );
 
         let submit_user_input_request = json!({
             "request_id": pending.request_id.clone(),
@@ -2994,6 +2998,10 @@ mod tests {
             .await
             .expect("conflict body should parse");
         assert_eq!(conflict_body["code"], "conflict");
+        assert_eq!(
+            conflict_body["details"]["status"]["lifecycle"]["status"],
+            "awaiting_user_input"
+        );
 
         let resumed = client
             .post(server.url(&format!("/v1/threads/{}/user-input", created.thread_id)))

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  OpenyakApiError,
   OpenyakClient,
   OpenyakCompatibilityError,
   OpenyakReconnectRequiredError,
@@ -306,6 +307,46 @@ test("run fails predictably when reconciliation sees a different active run", as
       error.threadId === "thread-1" &&
       error.runId === "run-1" &&
       error.latestSnapshot?.state.run_id === "run-2",
+  );
+});
+
+test("thread conflict responses preserve lifecycle metadata in error details", async () => {
+  const client = new OpenyakClient({
+    baseUrl: "http://local.test",
+    fetch: createQueuedFetch([
+      jsonResponse(
+        {
+          code: "conflict",
+          message: "thread already has an active or blocked run",
+          details: {
+            status: {
+              status: "awaiting_user_input",
+              lifecycle: {
+                status: "awaiting_user_input",
+              },
+              run_id: "run-2",
+              pending_user_input: {
+                request_id: "req-1",
+                prompt: "Continue?",
+                options: ["yes"],
+                allow_freeform: true,
+              },
+            },
+          },
+        },
+        { status: 409 },
+      ),
+    ]),
+  });
+
+  const thread = client.resumeThread("thread-1");
+  await assert.rejects(
+    thread.startTurn("hello"),
+    (error: unknown) =>
+      error instanceof OpenyakApiError &&
+      (error.details as Record<string, unknown>).status !== undefined &&
+      ((error.details as Record<string, unknown>).status as Record<string, unknown>)
+        .lifecycle !== undefined,
   );
 });
 

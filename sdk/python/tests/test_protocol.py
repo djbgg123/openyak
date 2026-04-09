@@ -14,6 +14,7 @@ from openyak_sdk import (
     OpenyakResyncRequiredError,
 )
 from openyak_sdk._models import (
+    parse_api_error_envelope,
     parse_list_threads_response,
     parse_thread_event,
     parse_thread_snapshot,
@@ -101,6 +102,14 @@ def test_fixture_matrix_decodes_locked_v1_contract() -> None:
     assert user_input_events[-1].type == "run.completed"
     assert resync_required.type == "thread.resync_required"
     assert resync_required.payload.skipped == 1
+
+    conflict = parse_api_error_envelope(fixture["errors"]["conflict"]["body"])
+    assert conflict.code == "conflict"
+    assert conflict.details is not None
+    assert (
+        conflict.details["status"]["lifecycle"]["status"]  # type: ignore[index]
+        == "awaiting_user_input"
+    )
 
 
 def test_list_threads_rejects_unsupported_protocol_versions() -> None:
