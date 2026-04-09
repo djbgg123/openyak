@@ -1371,6 +1371,8 @@ fn render_foundations_inventory() -> String {
         lines.push(surface.key.to_ascii_uppercase());
         lines.push(format!("  Access           {}", surface.access_type));
         lines.push(format!("  Backing          {}", surface.backing_model));
+        lines.push(format!("  Truth            {}", surface.truth_label));
+        lines.push(format!("  Operator label   {}", surface.operator_label));
         lines.push(format!(
             "  Tools            {}",
             surface.tool_names.join(", ")
@@ -1390,6 +1392,8 @@ fn render_foundation_detail(family: &str) -> Result<String, String> {
         format!("  Summary          {}", surface.summary),
         format!("  Access           {}", surface.access_type),
         format!("  Backing          {}", surface.backing_model),
+        format!("  Truth            {}", surface.truth_label),
+        format!("  Operator label   {}", surface.operator_label),
         format!("  Tools            {}", surface.tool_names.join(", ")),
         format!("  Boundary         {}", surface.boundary_note),
         format!("  Not promised     {}", surface.not_promised),
