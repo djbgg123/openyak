@@ -331,7 +331,7 @@ mod tests {
 
     #[cfg(windows)]
     fn hello_command() -> String {
-        "[Console]::Out.Write('hello')".to_string()
+        "Write-Output 'hello'".to_string()
     }
 
     #[cfg(not(windows))]
@@ -364,7 +364,7 @@ mod tests {
         })
         .expect("bash command should execute");
 
-        assert_eq!(output.stdout, "hello");
+        assert_eq!(output.stdout.trim_end_matches(['\r', '\n']), "hello");
         assert!(!output.interrupted, "stderr: {}", output.stderr);
         assert!(output.sandbox_status.is_some());
     }
