@@ -167,6 +167,77 @@ test("streamEvents preserves run lifecycle metadata on additive terminal payload
   assert.equal(events[2]?.payload.lifecycle?.status, "completed");
 });
 
+test("streamEvents preserves run.failed recovery metadata on additive failure payloads", async () => {
+  const client = new OpenyakClient({
+    baseUrl: "http://local.test",
+    fetch: createQueuedFetch([
+      sseResponse([
+        {
+          protocol_version: "v1",
+          thread_id: "thread-1",
+          sequence: 0,
+          timestamp_ms: 0,
+          type: "thread.snapshot",
+          payload: threadSnapshot,
+        },
+        {
+          protocol_version: "v1",
+          thread_id: "thread-1",
+          run_id: "run-1",
+          sequence: 1,
+          timestamp_ms: 0,
+          type: "run.started",
+          payload: {
+            kind: "turn",
+            message: "hello",
+            status: "running",
+            lifecycle: {
+              status: "running",
+            },
+          },
+        },
+        {
+          protocol_version: "v1",
+          thread_id: "thread-1",
+          run_id: "run-1",
+          sequence: 2,
+          timestamp_ms: 0,
+          type: "run.failed",
+          payload: {
+            code: "runtime_error",
+            message: "boom",
+            status: "failed",
+            lifecycle: {
+              status: "failed",
+              failure_kind: "daemon_thread_runtime_error",
+              recovery: {
+                failure_kind: "daemon_thread_runtime_error",
+                recovery_kind: "inspect_error_and_retry",
+                recommended_actions: [
+                  "inspect the error message and latest /v1/threads snapshot",
+                ],
+              },
+            },
+          },
+        },
+      ]),
+    ]),
+  });
+
+  const events: ThreadEvent[] = [];
+  for await (const event of client.resumeThread("thread-1").streamEvents()) {
+    events.push(event);
+  }
+
+  assert.equal(events[2]?.type, "run.failed");
+  assert.equal(events[2]?.payload.status, "failed");
+  assert.equal(events[2]?.payload.lifecycle?.failure_kind, "daemon_thread_runtime_error");
+  assert.equal(
+    events[2]?.payload.lifecycle?.recovery?.recovery_kind,
+    "inspect_error_and_retry",
+  );
+});
+
 test("runStreamed surfaces thread.resync_required as a dedicated error", async () => {
   const client = new OpenyakClient({
     baseUrl: "http://local.test",

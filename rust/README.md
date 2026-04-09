@@ -375,6 +375,7 @@ skills 目录支持两种布局：
 - 已有 operator-facing truth labels：thread snapshot 显式声明 `truth_layer = daemon_local_v1` 与 `attach_api = /v1/threads`；Task / Team / Cron registry payload 则继续声明 `origin = process_local_v1`。
 - 已有 shared lifecycle/failure/recovery schema family：thread truth 公开 `contract` / `state` / `recovery` 三层快照；Task / Team / Cron 则只在 `process_local_v1` 边界内复用 lifecycle metadata（`created_at`、`updated_at`、`last_error`、`disabled_reason`、`capabilities`），没有被升级成 daemon-backed recovery plane。
 - `/v1/threads/{id}/events` 的 `run.*` SSE payload 现在也会 additive 地回传 `status + lifecycle` 元数据，用于把运行中/完成/等待输入/失败语义锁进同一套 shared schema，而不是引入新的 daemon service lifecycle plane。
+- `run.failed` 的 runtime/storage 两类失败路径现在也有 fixture + live regression 锁定，统一落到 shared `failure_kind / recovery_kind / recommended_actions` taxonomy，而不是继续漂移成 event-local 错误形状。
 - 未有：daemon-backed worker/task/team truth layer、跨 family 的 daemon lifecycle store、CLI-first daemon operator controls。
 
 当前 V1 contract 已冻结的核心口径：

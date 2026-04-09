@@ -532,6 +532,213 @@
         }
       }
     ],
+    "runtime_failure_turn": [
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-3",
+        "sequence": 0,
+        "timestamp_ms": 0,
+        "type": "thread.snapshot",
+        "payload": {
+          "protocol_version": "v1",
+          "thread_id": "thread-3",
+          "created_at": 0,
+          "updated_at": 0,
+          "state": {
+            "status": "idle",
+            "lifecycle": {
+              "status": "idle"
+            }
+          },
+          "config": {
+            "cwd": "<cwd>",
+            "model": "opus",
+            "permission_mode": "danger-full-access",
+            "allowed_tools": [
+              "Agent",
+              "Config",
+              "CronCreate",
+              "CronDelete",
+              "CronDisable",
+              "CronEnable",
+              "CronGet",
+              "CronList",
+              "LSP",
+              "ListMcpResources",
+              "ListMcpServers",
+              "ListMcpTools",
+              "MCP",
+              "McpAuth",
+              "NotebookEdit",
+              "PowerShell",
+              "REPL",
+              "ReadMcpResource",
+              "SendUserMessage",
+              "SessionCreate",
+              "SessionGet",
+              "SessionList",
+              "SessionResume",
+              "SessionSend",
+              "SessionWait",
+              "Skill",
+              "Sleep",
+              "StructuredOutput",
+              "TaskCreate",
+              "TaskGet",
+              "TaskList",
+              "TaskOutput",
+              "TaskStop",
+              "TaskUpdate",
+              "TaskWait",
+              "TeamCreate",
+              "TeamDelete",
+              "TeamGet",
+              "TeamList",
+              "TestingPermission",
+              "TodoWrite",
+              "ToolSearch",
+              "WebFetch",
+              "WebSearch",
+              "bash",
+              "edit_file",
+              "glob_search",
+              "grep_search",
+              "read_file",
+              "write_file"
+            ]
+          },
+          "session": {
+            "version": 1,
+            "messages": []
+          },
+          "contract": {
+            "truth_layer": "daemon_local_v1",
+            "operator_plane": "local_loopback_operator_v1",
+            "persistence": "workspace_sqlite_v1",
+            "attach_api": "/v1/threads"
+          }
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-3",
+        "run_id": "run-4",
+        "sequence": 1,
+        "timestamp_ms": 0,
+        "type": "run.started",
+        "payload": {
+          "kind": "turn",
+          "message": "provider bootstrap should fail",
+          "status": "running",
+          "lifecycle": {
+            "status": "running"
+          }
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-3",
+        "run_id": "run-4",
+        "sequence": 2,
+        "timestamp_ms": 0,
+        "type": "run.failed",
+        "payload": {
+          "code": "runtime_error",
+          "message": "missing openyak credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY before calling the openyak API",
+          "status": "failed",
+          "lifecycle": {
+            "status": "failed",
+            "failure_kind": "daemon_thread_runtime_error",
+            "recovery": {
+              "failure_kind": "daemon_thread_runtime_error",
+              "recovery_kind": "inspect_error_and_retry",
+              "recommended_actions": [
+                "inspect the error message and latest /v1/threads snapshot",
+                "retry the same attach-first action only after the underlying runtime issue is understood"
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "storage_failure_turn": [
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-storage",
+        "sequence": 0,
+        "timestamp_ms": 0,
+        "type": "thread.snapshot",
+        "payload": {
+          "protocol_version": "v1",
+          "thread_id": "thread-storage",
+          "created_at": 0,
+          "updated_at": 0,
+          "state": {
+            "status": "idle",
+            "lifecycle": {
+              "status": "idle"
+            }
+          },
+          "config": {
+            "cwd": "<cwd>",
+            "model": "opus",
+            "permission_mode": "danger-full-access",
+            "allowed_tools": []
+          },
+          "session": {
+            "version": 1,
+            "messages": []
+          },
+          "contract": {
+            "truth_layer": "daemon_local_v1",
+            "operator_plane": "local_loopback_operator_v1",
+            "persistence": "workspace_sqlite_v1",
+            "attach_api": "/v1/threads"
+          }
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-storage",
+        "run_id": "run-storage",
+        "sequence": 1,
+        "timestamp_ms": 0,
+        "type": "run.started",
+        "payload": {
+          "kind": "turn",
+          "message": "storage failure should emit",
+          "status": "running",
+          "lifecycle": {
+            "status": "running"
+          }
+        }
+      },
+      {
+        "protocol_version": "v1",
+        "thread_id": "thread-storage",
+        "run_id": "run-storage",
+        "sequence": 2,
+        "timestamp_ms": 0,
+        "type": "run.failed",
+        "payload": {
+          "code": "storage_error",
+          "message": "failed to persist thread `thread-storage`: no such table: threads",
+          "status": "failed",
+          "lifecycle": {
+            "status": "failed",
+            "failure_kind": "daemon_thread_storage_error",
+            "recovery": {
+              "failure_kind": "daemon_thread_storage_error",
+              "recovery_kind": "read_latest_snapshot_and_retry",
+              "recommended_actions": [
+                "read the latest /v1/threads snapshot before retrying",
+                "retry the same attach-first action only after the local store issue is resolved"
+              ]
+            }
+          }
+        }
+      }
+    ],
     "thread_resync_required": {
       "protocol_version": "v1",
       "thread_id": "thread-lag",

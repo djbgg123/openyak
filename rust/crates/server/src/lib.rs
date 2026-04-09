@@ -1959,7 +1959,11 @@ mod tests {
     };
     use mock_anthropic_service::MockAnthropicService;
     use reqwest::Client;
-    use runtime::{ContentBlock, ConversationMessage, MessageRole, Session as RuntimeSession};
+    use rusqlite::Connection;
+    use runtime::{
+        ContentBlock, ConversationMessage, MessageRole, Session as RuntimeSession, TokenUsage,
+        TurnSummary,
+    };
     use serde_json::{json, Value};
     use std::collections::BTreeSet;
     use std::ffi::OsString;
@@ -1973,6 +1977,16 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio::task::JoinHandle;
     use tokio::time::{sleep, timeout};
+
+    const PROVIDER_ENV_KEYS: &[&str] = &[
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "XAI_API_KEY",
+        "XAI_BASE_URL",
+    ];
 
     struct TestServer {
         address: SocketAddr,
@@ -2544,6 +2558,134 @@ mod tests {
             }
         }
 
+        drop(_env);
+        let _removed = RemovedEnvGuard::remove(PROVIDER_ENV_KEYS);
+        let runtime_failure_created = create_thread(
+            &client,
+            &server,
+            json!({ "model": "opus", "allowed_tools": [] }),
+        )
+        .await;
+        let mut runtime_failure_events_response = client
+            .get(server.url(&format!(
+                "/v1/threads/{}/events",
+                runtime_failure_created.thread_id
+            )))
+            .send()
+            .await
+            .expect("runtime-failure events request should succeed")
+            .error_for_status()
+            .expect("runtime-failure events request should return success");
+        let mut runtime_failure_buffer = String::new();
+        let runtime_failure_snapshot: ThreadEventEnvelope = sse_json(
+            &next_sse_frame(
+                &mut runtime_failure_events_response,
+                &mut runtime_failure_buffer,
+            )
+            .await,
+        );
+        let runtime_failure_accepted = client
+            .post(server.url(&format!(
+                "/v1/threads/{}/turns",
+                runtime_failure_created.thread_id
+            )))
+            .json(&StartTurnRequest {
+                message: "provider bootstrap should fail".to_string(),
+            })
+            .send()
+            .await
+            .expect("runtime-failure turn request should succeed")
+            .error_for_status()
+            .expect("runtime-failure turn request should return success")
+            .json::<TurnAcceptedResponse>()
+            .await
+            .expect("runtime-failure turn response should parse");
+        let mut runtime_failure_events = vec![
+            serde_json::to_value(runtime_failure_snapshot)
+                .expect("runtime-failure snapshot should serialize"),
+        ];
+        loop {
+            let frame =
+                next_sse_frame(&mut runtime_failure_events_response, &mut runtime_failure_buffer)
+                    .await;
+            let event: ThreadEventEnvelope = sse_json(&frame);
+            let event_type = event.event_type.clone();
+            if event.run_id.as_deref() == Some(runtime_failure_accepted.run_id.as_str()) {
+                runtime_failure_events.push(
+                    serde_json::to_value(event)
+                        .expect("runtime-failure event should serialize"),
+                );
+            }
+            if event_type == "run.failed" {
+                break;
+            }
+        }
+
+        let storage_workspace = unique_temp_dir("server-storage-failure-fixture");
+        std::fs::create_dir_all(&storage_workspace).expect("storage workspace should create");
+        let storage_store = Arc::new(
+            SqliteThreadStore::open(&storage_workspace).expect("storage failure store should open"),
+        );
+        let storage_record = ThreadRecord::new(
+            "thread-storage".to_string(),
+            ThreadExecutionConfig {
+                cwd: std::env::current_dir().expect("current directory should resolve"),
+                model: "opus".to_string(),
+                permission_mode: runtime::PermissionMode::DangerFullAccess,
+                allowed_tools: BTreeSet::new(),
+            },
+            Arc::clone(&storage_store),
+        )
+        .expect("storage failure record should persist");
+        let (mut storage_receiver, storage_snapshot) = subscribe_thread_stream(&storage_record);
+        let mut storage_snapshot_sequence = storage_snapshot.sequence;
+        let storage_optimistic_len = storage_record
+            .start_turn("run-storage", "storage failure should emit")
+            .expect("storage failure start should succeed");
+        let storage_db_path = storage_workspace.join(".openyak").join("state.sqlite3");
+        let storage_db = Connection::open(&storage_db_path)
+            .expect("storage failure fixture should open sqlite path");
+        storage_db
+            .execute_batch("DROP TABLE threads;")
+            .expect("storage failure fixture should drop threads table");
+        drop(storage_db);
+        let storage_final_session = storage_record.worker_base_session();
+        storage_record.complete_run(
+            "run-storage",
+            &storage_final_session,
+            storage_optimistic_len,
+            &[],
+            Ok(TurnSummary {
+                assistant_messages: Vec::new(),
+                tool_results: Vec::new(),
+                iterations: 1,
+                usage: TokenUsage::default(),
+            }),
+        );
+        let mut storage_failure_events = vec![
+            serde_json::to_value(storage_snapshot)
+                .expect("storage-failure snapshot should serialize"),
+        ];
+        loop {
+            let event =
+                recv_thread_stream_event(&storage_record, &mut storage_receiver, &mut storage_snapshot_sequence)
+                    .await
+                    .expect("storage failure event should arrive");
+            let event_type = event.event_type.clone();
+            if event.run_id.as_deref() == Some("run-storage") {
+                storage_failure_events.push(
+                    serde_json::to_value(event)
+                        .expect("storage-failure event should serialize"),
+                );
+            }
+            if event_type == "run.failed" {
+                break;
+            }
+        }
+        drop(storage_record);
+        drop(storage_store);
+        let _ = std::fs::remove_dir_all(&storage_workspace);
+
         let workspace = unique_temp_dir("server-lagged-fixture");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let record = ThreadRecord::new(
@@ -2613,6 +2755,8 @@ mod tests {
             "events": {
                 "bash_turn": bash_events,
                 "user_input_roundtrip": user_input_events,
+                "runtime_failure_turn": runtime_failure_events,
+                "storage_failure_turn": storage_failure_events,
                 "thread_resync_required": serde_json::to_value(resync_required)
                     .expect("resync event should serialize"),
             }
@@ -2842,15 +2986,7 @@ mod tests {
     #[test]
     fn execute_run_preserves_optimistic_turn_message_when_runtime_bootstrap_fails() {
         let _env_guard = env_lock().blocking_lock();
-        let _removed = RemovedEnvGuard::remove(&[
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_BASE_URL",
-            "OPENAI_API_KEY",
-            "OPENAI_BASE_URL",
-            "XAI_API_KEY",
-            "XAI_BASE_URL",
-        ]);
+        let _removed = RemovedEnvGuard::remove(PROVIDER_ENV_KEYS);
         let workspace = unique_temp_dir("server-run-bootstrap-failure-turn");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
 
@@ -2886,15 +3022,7 @@ mod tests {
     #[test]
     fn execute_run_preserves_optimistic_user_input_response_when_runtime_bootstrap_fails() {
         let _env_guard = env_lock().blocking_lock();
-        let _removed = RemovedEnvGuard::remove(&[
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_BASE_URL",
-            "OPENAI_API_KEY",
-            "OPENAI_BASE_URL",
-            "XAI_API_KEY",
-            "XAI_BASE_URL",
-        ]);
+        let _removed = RemovedEnvGuard::remove(PROVIDER_ENV_KEYS);
         let workspace = unique_temp_dir("server-run-bootstrap-failure-user-input");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
 
@@ -3213,6 +3341,147 @@ mod tests {
             .shutdown()
             .await
             .expect("mock service should shut down cleanly");
+    }
+
+    #[tokio::test]
+    async fn runtime_bootstrap_failures_emit_run_failed_with_recovery_metadata() {
+        let _env_guard = env_lock().lock().await;
+        let _removed = RemovedEnvGuard::remove(PROVIDER_ENV_KEYS);
+        let server = TestServer::spawn().await;
+        let client = Client::new();
+
+        let created = create_thread(
+            &client,
+            &server,
+            serde_json::json!({ "model": "opus", "allowed_tools": [] }),
+        )
+        .await;
+        let mut response = client
+            .get(server.url(&format!("/v1/threads/{}/events", created.thread_id)))
+            .send()
+            .await
+            .expect("events request should succeed")
+            .error_for_status()
+            .expect("events request should return success");
+        let mut buffer = String::new();
+        let _snapshot_frame = next_sse_frame(&mut response, &mut buffer).await;
+
+        let accepted = client
+            .post(server.url(&format!("/v1/threads/{}/turns", created.thread_id)))
+            .json(&StartTurnRequest {
+                message: "provider bootstrap should fail".to_string(),
+            })
+            .send()
+            .await
+            .expect("turn request should succeed")
+            .error_for_status()
+            .expect("turn request should return success")
+            .json::<TurnAcceptedResponse>()
+            .await
+            .expect("turn response should parse");
+
+        let mut saw_run_started = false;
+        let mut failed_payload = None;
+        for _ in 0..8 {
+            let frame = next_sse_frame(&mut response, &mut buffer).await;
+            let event: ThreadEventEnvelope = sse_json(&frame);
+            if event.run_id.as_deref() != Some(accepted.run_id.as_str()) {
+                continue;
+            }
+            if event.event_type == "run.started" {
+                saw_run_started = true;
+            }
+            if event.event_type == "run.failed" {
+                failed_payload = Some(event.payload);
+                break;
+            }
+        }
+
+        assert!(saw_run_started);
+        let failed_payload = failed_payload.expect("run.failed payload should arrive");
+        assert_eq!(failed_payload["code"], "runtime_error");
+        assert_eq!(failed_payload["status"], "failed");
+        assert_eq!(
+            failed_payload["lifecycle"]["failure_kind"],
+            "daemon_thread_runtime_error"
+        );
+        assert_eq!(
+            failed_payload["lifecycle"]["recovery"]["recovery_kind"],
+            "inspect_error_and_retry"
+        );
+
+        let idle = wait_for_thread_status(&client, &server, &created.thread_id, "idle").await;
+        assert_eq!(idle.state.status, "idle");
+    }
+
+    #[tokio::test]
+    async fn storage_persist_failures_emit_run_failed_with_recovery_metadata() {
+        let workspace = unique_temp_dir("server-storage-failure");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        let store = Arc::new(SqliteThreadStore::open(&workspace).expect("store should open"));
+        let record = ThreadRecord::new(
+            "thread-storage".to_string(),
+            ThreadExecutionConfig {
+                cwd: std::env::current_dir().expect("current directory should resolve"),
+                model: "opus".to_string(),
+                permission_mode: runtime::PermissionMode::DangerFullAccess,
+                allowed_tools: BTreeSet::new(),
+            },
+            Arc::clone(&store),
+        )
+        .expect("record should persist");
+        let (mut receiver, snapshot) = subscribe_thread_stream(&record);
+        let mut snapshot_sequence = snapshot.sequence;
+
+        let optimistic_len = record
+            .start_turn("run-storage", "storage failure should emit")
+            .expect("start_turn should succeed");
+        let db_path = workspace.join(".openyak").join("state.sqlite3");
+        let connection = Connection::open(&db_path).expect("storage database should open");
+        connection
+            .execute_batch("DROP TABLE threads;")
+            .expect("threads table should be droppable in test");
+        drop(connection);
+
+        let final_session = record.worker_base_session();
+        record.complete_run(
+            "run-storage",
+            &final_session,
+            optimistic_len,
+            &[],
+            Ok(TurnSummary {
+                assistant_messages: Vec::new(),
+                tool_results: Vec::new(),
+                iterations: 1,
+                usage: TokenUsage::default(),
+            }),
+        );
+
+        let started =
+            recv_thread_stream_event(&record, &mut receiver, &mut snapshot_sequence)
+                .await
+                .expect("run.started should arrive");
+        assert_eq!(started.event_type, "run.started");
+
+        let failed =
+            recv_thread_stream_event(&record, &mut receiver, &mut snapshot_sequence)
+                .await
+                .expect("run.failed should arrive");
+        assert_eq!(failed.event_type, "run.failed");
+        assert_eq!(failed.payload["code"], "storage_error");
+        assert_eq!(failed.payload["status"], "failed");
+        assert_eq!(
+            failed.payload["lifecycle"]["failure_kind"],
+            "daemon_thread_storage_error"
+        );
+        assert_eq!(
+            failed.payload["lifecycle"]["recovery"]["recovery_kind"],
+            "read_latest_snapshot_and_retry"
+        );
+
+        drop(record);
+        drop(store);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]

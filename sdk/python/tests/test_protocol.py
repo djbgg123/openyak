@@ -80,6 +80,12 @@ def test_fixture_matrix_decodes_locked_v1_contract() -> None:
     user_input_events = [
         parse_thread_event(event) for event in fixture["events"]["user_input_roundtrip"]
     ]
+    runtime_failure_events = [
+        parse_thread_event(event) for event in fixture["events"]["runtime_failure_turn"]
+    ]
+    storage_failure_events = [
+        parse_thread_event(event) for event in fixture["events"]["storage_failure_turn"]
+    ]
     resync_required = parse_thread_event(fixture["events"]["thread_resync_required"])
 
     assert created.protocol_version == "v1"
@@ -111,6 +117,20 @@ def test_fixture_matrix_decodes_locked_v1_contract() -> None:
     assert waiting_event.payload.lifecycle is not None
     assert waiting_event.payload.lifecycle.status == "awaiting_user_input"
     assert user_input_events[-1].type == "run.completed"
+    assert runtime_failure_events[-1].type == "run.failed"
+    assert runtime_failure_events[-1].payload.status == "failed"
+    assert runtime_failure_events[-1].payload.lifecycle is not None
+    assert (
+        runtime_failure_events[-1].payload.lifecycle.failure_kind
+        == "daemon_thread_runtime_error"
+    )
+    assert storage_failure_events[-1].type == "run.failed"
+    assert storage_failure_events[-1].payload.status == "failed"
+    assert storage_failure_events[-1].payload.lifecycle is not None
+    assert (
+        storage_failure_events[-1].payload.lifecycle.failure_kind
+        == "daemon_thread_storage_error"
+    )
     assert resync_required.type == "thread.resync_required"
     assert resync_required.payload.skipped == 1
 

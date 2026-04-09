@@ -98,6 +98,7 @@ console.log(result.status, result.finalText, result.usage);
 
 `streamEvents()` exposes raw `/v1/threads/{id}/events` envelopes, including the initial `thread.snapshot`.
 Current `run.*` SSE payloads are additive-metadata aware: `run.started`, `run.completed`, `run.waiting_user_input`, and `run.failed` now carry `status` plus shared `lifecycle` metadata without widening the attach-first `/v1/threads` boundary.
+That now includes locked runtime/storage `run.failed` recovery taxonomy coverage, so `failure_kind`, `recovery_kind`, and `recommended_actions` stay stable across both fixture decoding and live local-server regressions.
 
 ```ts
 for await (const event of thread.streamEvents()) {
