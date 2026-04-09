@@ -191,6 +191,7 @@ export type RunStartedEvent = ThreadEventBase<
     kind: "turn";
     message: string;
     status: "running";
+    lifecycle?: LifecycleStateSnapshot;
   }
 >;
 
@@ -242,12 +243,17 @@ export type RunCompletedEvent = ThreadEventBase<
     assistant_message_count: number;
     tool_result_count: number;
     cumulative_usage: TokenUsage;
+    status?: "completed";
+    lifecycle?: LifecycleStateSnapshot;
   }
 >;
 
 export type RunWaitingUserInputEvent = ThreadEventBase<
   "run.waiting_user_input",
-  UserInputRequestPayload
+  UserInputRequestPayload & {
+    status?: "awaiting_user_input";
+    lifecycle?: LifecycleStateSnapshot;
+  }
 >;
 
 export type RunFailedEvent = ThreadEventBase<
@@ -255,6 +261,8 @@ export type RunFailedEvent = ThreadEventBase<
   {
     code: string;
     message: string;
+    status?: "failed";
+    lifecycle?: LifecycleStateSnapshot;
   }
 >;
 

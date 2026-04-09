@@ -409,11 +409,7 @@ impl ThreadRecord {
         self.emit_protocol_event(
             "run.started",
             Some(run_id),
-            json!({
-                "kind": "turn",
-                "message": message,
-                "status": "running",
-            }),
+            to_value(RunStartedPayload::turn(message.to_string())),
         );
         Ok(optimistic_len)
     }
@@ -527,10 +523,7 @@ impl ThreadRecord {
             self.emit_protocol_event(
                 "run.failed",
                 Some(run_id),
-                json!({
-                    "code": "storage_error",
-                    "message": error.to_string(),
-                }),
+                to_value(RunFailedPayload::from_error("storage_error", error.to_string())),
             );
             return;
         }
@@ -551,12 +544,7 @@ impl ThreadRecord {
                 self.emit_protocol_event(
                     "run.completed",
                     Some(run_id),
-                    json!({
-                        "iterations": summary.iterations,
-                        "assistant_message_count": summary.assistant_messages.len(),
-                        "tool_result_count": summary.tool_results.len(),
-                        "cumulative_usage": summary.usage,
-                    }),
+                    to_value(RunCompletedPayload::from_summary(&summary)),
                 );
             }
             Err(error) => {
@@ -564,21 +552,13 @@ impl ThreadRecord {
                     self.emit_protocol_event(
                         "run.waiting_user_input",
                         Some(run_id),
-                        json!({
-                            "request_id": request.request_id,
-                            "prompt": request.prompt,
-                            "options": request.options,
-                            "allow_freeform": request.allow_freeform,
-                        }),
+                        to_value(RunWaitingUserInputPayload::from_request(request)),
                     );
                 } else {
                     self.emit_protocol_event(
                         "run.failed",
                         Some(run_id),
-                        json!({
-                            "code": "runtime_error",
-                            "message": error.to_string(),
-                        }),
+                        to_value(RunFailedPayload::from_error("runtime_error", error.to_string())),
                     );
                 }
             }
@@ -723,6 +703,111 @@ impl UserInputRequestPayload {
             prompt: request.prompt,
             options: request.options,
             allow_freeform: request.allow_freeform,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunStartedPayload {
+    pub kind: String,
+    pub message: String,
+    pub status: String,
+    pub lifecycle: LifecycleStateSnapshot,
+}
+
+impl RunStartedPayload {
+    fn turn(message: String) -> Self {
+        Self {
+            kind: "turn".to_string(),
+            message,
+            status: "running".to_string(),
+            lifecycle: LifecycleStateSnapshot::status("running"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunCompletedPayload {
+    pub iterations: usize,
+    pub assistant_message_count: usize,
+    pub tool_result_count: usize,
+    pub cumulative_usage: runtime::TokenUsage,
+    pub status: String,
+    pub lifecycle: LifecycleStateSnapshot,
+}
+
+impl RunCompletedPayload {
+    fn from_summary(summary: &TurnSummary) -> Self {
+        Self {
+            iterations: summary.iterations,
+            assistant_message_count: summary.assistant_messages.len(),
+            tool_result_count: summary.tool_results.len(),
+            cumulative_usage: summary.usage.clone(),
+            status: "completed".to_string(),
+            lifecycle: LifecycleStateSnapshot::status("completed"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunWaitingUserInputPayload {
+    pub request_id: String,
+    pub prompt: String,
+    pub options: Vec<String>,
+    pub allow_freeform: bool,
+    pub status: String,
+    pub lifecycle: LifecycleStateSnapshot,
+}
+
+impl RunWaitingUserInputPayload {
+    fn from_request(request: PendingUserInputRequest) -> Self {
+        Self {
+            request_id: request.request_id,
+            prompt: request.prompt,
+            options: request.options,
+            allow_freeform: request.allow_freeform,
+            status: "awaiting_user_input".to_string(),
+            lifecycle: LifecycleStateSnapshot::status("awaiting_user_input"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunFailedPayload {
+    pub code: String,
+    pub message: String,
+    pub status: String,
+    pub lifecycle: LifecycleStateSnapshot,
+}
+
+impl RunFailedPayload {
+    fn from_error(code: &str, message: String) -> Self {
+        let recovery = match code {
+            "storage_error" => RecoveryGuidanceSnapshot {
+                failure_kind: "daemon_thread_storage_error".to_string(),
+                recovery_kind: "read_latest_snapshot_and_retry".to_string(),
+                recommended_actions: vec![
+                    "read the latest /v1/threads snapshot before retrying".to_string(),
+                    "retry the same attach-first action only after the local store issue is resolved"
+                        .to_string(),
+                ],
+            },
+            _ => RecoveryGuidanceSnapshot {
+                failure_kind: "daemon_thread_runtime_error".to_string(),
+                recovery_kind: "inspect_error_and_retry".to_string(),
+                recommended_actions: vec![
+                    "inspect the error message and latest /v1/threads snapshot".to_string(),
+                    "retry the same attach-first action only after the underlying runtime issue is understood"
+                        .to_string(),
+                ],
+            },
+        };
+
+        Self {
+            code: code.to_string(),
+            message,
+            status: "failed".to_string(),
+            lifecycle: LifecycleStateSnapshot::with_recovery("failed", recovery),
         }
     }
 }
@@ -1866,7 +1951,8 @@ fn write_lock<T>(lockable: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 mod tests {
     use super::{
         app, execute_run, recv_thread_stream_event, subscribe_thread_stream, AppState,
-        CreateSessionResponse, ListSessionsResponse, ListThreadsResponse, RunInvocation,
+        CreateSessionResponse, ListSessionsResponse, ListThreadsResponse, RunFailedPayload,
+        RunInvocation,
         SessionDetailsResponse, SqliteThreadStore, StartTurnRequest, SubmitUserInputRequest,
         ThreadEventEnvelope, ThreadExecutionConfig, ThreadRecord, ThreadSnapshot,
         TurnAcceptedResponse, UserInputAcceptedResponse,
@@ -2912,10 +2998,16 @@ mod tests {
         let mut seen_types = Vec::new();
         let mut saw_tool_result = false;
         let mut saw_final_text = false;
+        let mut saw_running_lifecycle = false;
+        let mut saw_completed_lifecycle = false;
         for _ in 0..16 {
             let frame = next_sse_frame(&mut response, &mut buffer).await;
             let event: ThreadEventEnvelope = sse_json(&frame);
             seen_types.push(event.event_type.clone());
+            if event.event_type == "run.started" {
+                saw_running_lifecycle = event.payload["status"] == "running"
+                    && event.payload["lifecycle"]["status"] == "running";
+            }
             if event.event_type == "assistant.tool_result" {
                 saw_tool_result = true;
             }
@@ -2926,6 +3018,8 @@ mod tests {
                     .contains("bash completed");
             }
             if event.event_type == "run.completed" {
+                saw_completed_lifecycle = event.payload["status"] == "completed"
+                    && event.payload["lifecycle"]["status"] == "completed";
                 break;
             }
         }
@@ -2938,6 +3032,8 @@ mod tests {
         assert!(seen_types.iter().any(|value| value == "run.completed"));
         assert!(saw_tool_result);
         assert!(saw_final_text);
+        assert!(saw_running_lifecycle);
+        assert!(saw_completed_lifecycle);
 
         let completed = wait_for_thread_status(&client, &server, &created.thread_id, "idle").await;
         assert_eq!(completed.session.messages.len(), 4);
@@ -3103,6 +3199,8 @@ mod tests {
                 saw_resubmitted = true;
             }
             if event.event_type == "run.completed" {
+                assert_eq!(event.payload["status"], "completed");
+                assert_eq!(event.payload["lifecycle"]["status"], "completed");
                 saw_completed = true;
                 break;
             }
@@ -3292,6 +3390,43 @@ mod tests {
         assert_eq!(
             details.session.messages[0],
             runtime::ConversationMessage::user_text("hello from test")
+        );
+    }
+
+    #[test]
+    fn run_failed_payloads_lock_recovery_metadata_by_error_kind() {
+        let runtime_failure =
+            RunFailedPayload::from_error("runtime_error", "runtime blew up".to_string());
+        assert_eq!(runtime_failure.status, "failed");
+        assert_eq!(runtime_failure.lifecycle.status, "failed");
+        assert_eq!(
+            runtime_failure.lifecycle.failure_kind.as_deref(),
+            Some("daemon_thread_runtime_error")
+        );
+        assert_eq!(
+            runtime_failure
+                .lifecycle
+                .recovery
+                .as_ref()
+                .expect("runtime failure recovery")
+                .recovery_kind,
+            "inspect_error_and_retry"
+        );
+
+        let storage_failure =
+            RunFailedPayload::from_error("storage_error", "sqlite busy".to_string());
+        assert_eq!(
+            storage_failure.lifecycle.failure_kind.as_deref(),
+            Some("daemon_thread_storage_error")
+        );
+        assert_eq!(
+            storage_failure
+                .lifecycle
+                .recovery
+                .as_ref()
+                .expect("storage failure recovery")
+                .recovery_kind,
+            "read_latest_snapshot_and_retry"
         );
     }
 }

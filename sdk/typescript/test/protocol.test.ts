@@ -99,6 +99,74 @@ test("streamEvents preserves snapshot-first SSE ordering and resync envelopes", 
   assert.equal(events[1]?.payload.skipped, 3);
 });
 
+test("streamEvents preserves run lifecycle metadata on additive terminal payloads", async () => {
+  const client = new OpenyakClient({
+    baseUrl: "http://local.test",
+    fetch: createQueuedFetch([
+      sseResponse([
+        {
+          protocol_version: "v1",
+          thread_id: "thread-1",
+          sequence: 0,
+          timestamp_ms: 0,
+          type: "thread.snapshot",
+          payload: threadSnapshot,
+        },
+        {
+          protocol_version: "v1",
+          thread_id: "thread-1",
+          run_id: "run-1",
+          sequence: 1,
+          timestamp_ms: 0,
+          type: "run.started",
+          payload: {
+            kind: "turn",
+            message: "hello",
+            status: "running",
+            lifecycle: {
+              status: "running",
+            },
+          },
+        },
+        {
+          protocol_version: "v1",
+          thread_id: "thread-1",
+          run_id: "run-1",
+          sequence: 2,
+          timestamp_ms: 0,
+          type: "run.completed",
+          payload: {
+            iterations: 1,
+            assistant_message_count: 1,
+            tool_result_count: 0,
+            cumulative_usage: {
+              input_tokens: 1,
+              output_tokens: 1,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+            },
+            status: "completed",
+            lifecycle: {
+              status: "completed",
+            },
+          },
+        },
+      ]),
+    ]),
+  });
+
+  const events: ThreadEvent[] = [];
+  for await (const event of client.resumeThread("thread-1").streamEvents()) {
+    events.push(event);
+  }
+
+  assert.equal(events[1]?.type, "run.started");
+  assert.equal(events[1]?.payload.lifecycle?.status, "running");
+  assert.equal(events[2]?.type, "run.completed");
+  assert.equal(events[2]?.payload.status, "completed");
+  assert.equal(events[2]?.payload.lifecycle?.status, "completed");
+});
+
 test("runStreamed surfaces thread.resync_required as a dedicated error", async () => {
   const client = new OpenyakClient({
     baseUrl: "http://local.test",

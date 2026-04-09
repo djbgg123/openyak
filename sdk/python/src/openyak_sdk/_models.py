@@ -224,6 +224,7 @@ class RunStartedPayload:
     kind: str
     message: str
     status: Literal["running"]
+    lifecycle: LifecycleStateSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,12 +265,26 @@ class RunCompletedPayload:
     assistant_message_count: int
     tool_result_count: int
     cumulative_usage: TokenUsage
+    status: Literal["completed"] = "completed"
+    lifecycle: LifecycleStateSnapshot | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RunWaitingUserInputPayload:
+    request_id: str
+    prompt: str
+    options: list[str]
+    allow_freeform: bool
+    status: Literal["awaiting_user_input"] = "awaiting_user_input"
+    lifecycle: LifecycleStateSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class RunFailedPayload:
     code: str
     message: str
+    status: Literal["failed"] = "failed"
+    lifecycle: LifecycleStateSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,7 +317,7 @@ AssistantUsageEvent: TypeAlias = ThreadEvent[TokenUsage]
 AssistantMessageStopEvent: TypeAlias = ThreadEvent[AssistantMessageStopPayload]
 UserInputSubmittedEvent: TypeAlias = ThreadEvent[UserInputSubmittedPayload]
 RunCompletedEvent: TypeAlias = ThreadEvent[RunCompletedPayload]
-RunWaitingUserInputEvent: TypeAlias = ThreadEvent[UserInputRequestPayload]
+RunWaitingUserInputEvent: TypeAlias = ThreadEvent[RunWaitingUserInputPayload]
 RunFailedEvent: TypeAlias = ThreadEvent[RunFailedPayload]
 ThreadResyncRequiredEvent: TypeAlias = ThreadEvent[ThreadResyncRequiredPayload]
 
@@ -474,11 +489,7 @@ def parse_turn_accepted_response(
         ),
         thread_id=_require_str(record, "thread_id", context),
         run_id=_require_str(record, "run_id", context),
-        lifecycle=(
-            parse_lifecycle_state_snapshot(record.get("lifecycle"), f"{context}.lifecycle")
-            if record.get("lifecycle") is not None
-            else None
-        ),
+        lifecycle=_parse_optional_lifecycle(record.get("lifecycle"), f"{context}.lifecycle"),
         status=_require_accepted(record, context),
     )
 
@@ -497,11 +508,7 @@ def parse_user_input_accepted_response(
         thread_id=_require_str(record, "thread_id", context),
         run_id=_require_str(record, "run_id", context),
         request_id=_require_str(record, "request_id", context),
-        lifecycle=(
-            parse_lifecycle_state_snapshot(record.get("lifecycle"), f"{context}.lifecycle")
-            if record.get("lifecycle") is not None
-            else None
-        ),
+        lifecycle=_parse_optional_lifecycle(record.get("lifecycle"), f"{context}.lifecycle"),
         status=_require_accepted(record, context),
     )
 
@@ -538,6 +545,10 @@ def parse_thread_event(value: object, context: str = "thread event") -> ThreadEv
                 kind=_require_str(payload_record, "kind", f"{context}.payload"),
                 message=_require_str(payload_record, "message", f"{context}.payload"),
                 status=_require_running(payload_record, f"{context}.payload"),
+                lifecycle=_parse_optional_lifecycle(
+                    payload_record.get("lifecycle"),
+                    f"{context}.payload.lifecycle",
+                ),
             ),
         )
     if event_type == "assistant.text.delta":
@@ -659,9 +670,15 @@ def parse_thread_event(value: object, context: str = "thread event") -> ThreadEv
                     payload_record.get("cumulative_usage"),
                     f"{context}.payload.cumulative_usage",
                 ),
+                status=_require_completed(payload_record, f"{context}.payload"),
+                lifecycle=_parse_optional_lifecycle(
+                    payload_record.get("lifecycle"),
+                    f"{context}.payload.lifecycle",
+                ),
             ),
         )
     if event_type == "run.waiting_user_input":
+        payload_record = _as_mapping(payload, f"{context}.payload")
         return _thread_event(
             protocol_version=protocol_version,
             thread_id=thread_id,
@@ -669,7 +686,21 @@ def parse_thread_event(value: object, context: str = "thread event") -> ThreadEv
             sequence=sequence,
             timestamp_ms=timestamp_ms,
             event_type=event_type,
-            payload=parse_user_input_request_payload(payload, f"{context}.payload"),
+            payload=RunWaitingUserInputPayload(
+                request_id=_require_str(payload_record, "request_id", f"{context}.payload"),
+                prompt=_require_str(payload_record, "prompt", f"{context}.payload"),
+                options=_require_list_of_str(payload_record, "options", f"{context}.payload"),
+                allow_freeform=_require_bool(
+                    payload_record,
+                    "allow_freeform",
+                    f"{context}.payload",
+                ),
+                status=_require_awaiting_user_input(payload_record, f"{context}.payload"),
+                lifecycle=_parse_optional_lifecycle(
+                    payload_record.get("lifecycle"),
+                    f"{context}.payload.lifecycle",
+                ),
+            ),
         )
     if event_type == "run.failed":
         payload_record = _as_mapping(payload, f"{context}.payload")
@@ -683,6 +714,11 @@ def parse_thread_event(value: object, context: str = "thread event") -> ThreadEv
             payload=RunFailedPayload(
                 code=_require_str(payload_record, "code", f"{context}.payload"),
                 message=_require_str(payload_record, "message", f"{context}.payload"),
+                status=_require_failed(payload_record, f"{context}.payload"),
+                lifecycle=_parse_optional_lifecycle(
+                    payload_record.get("lifecycle"),
+                    f"{context}.payload.lifecycle",
+                ),
             ),
         )
     if event_type == "thread.resync_required":
@@ -741,11 +777,7 @@ def parse_thread_state_snapshot(
     recovery = record.get("recovery")
     return ThreadStateSnapshot(
         status=typed_status,
-        lifecycle=(
-            parse_lifecycle_state_snapshot(lifecycle, f"{context}.lifecycle")
-            if lifecycle is not None
-            else None
-        ),
+        lifecycle=_parse_optional_lifecycle(lifecycle, f"{context}.lifecycle"),
         run_id=_optional_str(record, "run_id", context),
         pending_user_input=(
             parse_user_input_request_payload(
@@ -762,6 +794,12 @@ def parse_thread_state_snapshot(
             else None
         ),
     )
+
+
+def _parse_optional_lifecycle(
+    value: object, context: str
+) -> LifecycleStateSnapshot | None:
+    return parse_lifecycle_state_snapshot(value, context) if value is not None else None
 
 
 def parse_thread_contract_snapshot(
@@ -1098,3 +1136,28 @@ def _require_running(record: dict[str, object], context: str) -> Literal["runnin
     if value != "running":
         raise OpenyakProtocolError(f"{context}.status expected 'running', got {value!r}")
     return cast(Literal["running"], value)
+
+
+def _require_completed(record: dict[str, object], context: str) -> Literal["completed"]:
+    value = _optional_str(record, "status", context) or "completed"
+    if value != "completed":
+        raise OpenyakProtocolError(f"{context}.status expected 'completed', got {value!r}")
+    return cast(Literal["completed"], value)
+
+
+def _require_awaiting_user_input(
+    record: dict[str, object], context: str
+) -> Literal["awaiting_user_input"]:
+    value = _optional_str(record, "status", context) or "awaiting_user_input"
+    if value != "awaiting_user_input":
+        raise OpenyakProtocolError(
+            f"{context}.status expected 'awaiting_user_input', got {value!r}"
+        )
+    return cast(Literal["awaiting_user_input"], value)
+
+
+def _require_failed(record: dict[str, object], context: str) -> Literal["failed"]:
+    value = _optional_str(record, "status", context) or "failed"
+    if value != "failed":
+        raise OpenyakProtocolError(f"{context}.status expected 'failed', got {value!r}")
+    return cast(Literal["failed"], value)

@@ -96,9 +96,20 @@ def test_fixture_matrix_decodes_locked_v1_contract() -> None:
     assert user_input_accepted.lifecycle is not None
     assert user_input_accepted.lifecycle.status == "accepted"
     assert bash_events[0].type == "thread.snapshot"
+    assert bash_events[1].payload.lifecycle is not None
+    assert bash_events[1].payload.lifecycle.status == "running"
     assert bash_events[-1].type == "run.completed"
+    assert bash_events[-1].payload.status == "completed"
+    assert bash_events[-1].payload.lifecycle is not None
+    assert bash_events[-1].payload.lifecycle.status == "completed"
     assert bash_events[-1].payload.cumulative_usage.input_tokens == 26
     assert [event.type for event in user_input_events].count("run.waiting_user_input") == 1
+    waiting_event = next(
+        event for event in user_input_events if event.type == "run.waiting_user_input"
+    )
+    assert waiting_event.payload.status == "awaiting_user_input"
+    assert waiting_event.payload.lifecycle is not None
+    assert waiting_event.payload.lifecycle.status == "awaiting_user_input"
     assert user_input_events[-1].type == "run.completed"
     assert resync_required.type == "thread.resync_required"
     assert resync_required.payload.skipped == 1
@@ -171,6 +182,40 @@ def test_stream_events_preserves_snapshot_first_sse_and_resync_envelopes() -> No
 
     assert [event.type for event in events] == ["thread.snapshot", "thread.resync_required"]
     assert events[1].payload.skipped == 3
+
+
+def test_parse_thread_event_preserves_run_failed_lifecycle_recovery_metadata() -> None:
+    event = parse_thread_event(
+        {
+            "protocol_version": "v1",
+            "thread_id": "thread-1",
+            "run_id": "run-1",
+            "sequence": 2,
+            "timestamp_ms": 0,
+            "type": "run.failed",
+            "payload": {
+                "code": "runtime_error",
+                "message": "boom",
+                "status": "failed",
+                "lifecycle": {
+                    "status": "failed",
+                    "failure_kind": "daemon_thread_runtime_error",
+                    "recovery": {
+                        "failure_kind": "daemon_thread_runtime_error",
+                        "recovery_kind": "inspect_error_and_retry",
+                        "recommended_actions": [
+                            "inspect the error message and latest /v1/threads snapshot",
+                        ],
+                    },
+                },
+            },
+        }
+    )
+
+    assert event.type == "run.failed"
+    assert event.payload.status == "failed"
+    assert event.payload.lifecycle is not None
+    assert event.payload.lifecycle.failure_kind == "daemon_thread_runtime_error"
 
 
 def test_run_streamed_surfaces_thread_resync_required_as_a_dedicated_error() -> None:

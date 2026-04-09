@@ -118,6 +118,7 @@ asyncio.run(main())
 ## Streaming
 
 `stream_events()` exposes raw `/v1/threads/{id}/events` envelopes, including the initial `thread.snapshot`.
+Current `run.*` SSE payloads are additive-metadata aware: `run.started`, `run.completed`, `run.waiting_user_input`, and `run.failed` now carry `status` plus shared `lifecycle` metadata without widening the attach-first `/v1/threads` boundary.
 
 ```python
 for event in thread.stream_events():

@@ -229,7 +229,10 @@
         "payload": {
           "kind": "turn",
           "message": "PARITY_SCENARIO:bash_stdout_roundtrip",
-          "status": "running"
+          "status": "running",
+          "lifecycle": {
+            "status": "running"
+          }
         }
       },
       {
@@ -335,6 +338,10 @@
             "output_tokens": 11,
             "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": 0
+          },
+          "status": "completed",
+          "lifecycle": {
+            "status": "completed"
           }
         }
       }
@@ -387,7 +394,10 @@
         "payload": {
           "kind": "turn",
           "message": "PARITY_SCENARIO:request_user_input_roundtrip",
-          "status": "running"
+          "status": "running",
+          "lifecycle": {
+            "status": "running"
+          }
         }
       },
       {
@@ -444,7 +454,11 @@
             "main",
             "feature"
           ],
-          "allow_freeform": true
+          "allow_freeform": true,
+          "status": "awaiting_user_input",
+          "lifecycle": {
+            "status": "awaiting_user_input"
+          }
         }
       },
       {
@@ -510,6 +524,10 @@
             "output_tokens": 11,
             "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": 0
+          },
+          "status": "completed",
+          "lifecycle": {
+            "status": "completed"
           }
         }
       }
