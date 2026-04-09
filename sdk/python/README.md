@@ -19,6 +19,12 @@ Current package metadata:
 
 The local server still exposes legacy `/sessions` compatibility routes for existing callers, but this SDK's public contract remains `/v1/threads` only.
 
+Operator-facing truth labels for this SDK boundary:
+
+- thread snapshots expose `truth_layer = daemon_local_v1`
+- thread snapshots expose `attach_api = /v1/threads`
+- this does **not** upgrade Task / Team / Cron foundations; those remain `process_local_v1`
+
 ## Package name and import path
 
 - Distribution package name: `openyak-python-sdk-alpha`
@@ -169,7 +175,7 @@ snapshot = thread.read()
 - That reconciliation is intentionally best-effort for local attach-first, single-writer usage; if the latest snapshot shows a different active `run_id`, `run()` raises `OpenyakReconnectRequiredError` instead of pretending replay exists.
 - `run_streamed()` does **not** pretend replay exists; if live streaming fidelity is lost, it raises.
 
-This means the current Python SDK remains compatible with the local-first daemon/control-plane roadmap only at the `/v1/threads` attach-first layer: it can observe persisted interruption state, but it is not yet a client for daemon start/stop/status/recover operator APIs.
+This means the current Python SDK remains compatible with the local-first daemon/control-plane roadmap only at the `/v1/threads` attach-first layer: it can observe persisted interruption state plus the `daemon_local_v1` thread truth label, but it is not yet a client for daemon start/stop/status/recover operator APIs.
 
 ## Minimal package layout
 
