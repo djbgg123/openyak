@@ -14,6 +14,7 @@ mod common;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn openyak_root_and_subcommand_help_cover_verified_surface() {
     let _guard = env_lock();
     let sandbox = CliSandbox::new("openyak-help-surface");
@@ -111,6 +112,18 @@ fn openyak_root_and_subcommand_help_cover_verified_surface() {
         ),
         "{prompt_help}"
     );
+
+    let server_help = sandbox.run_success(&["server", "--help"]);
+    for marker in [
+        "local `/v1/threads` protocol plus legacy `/sessions` compatibility routes",
+        "workspace `.openyak/state.sqlite3` SQLite store",
+        "only supports loopback binds",
+    ] {
+        assert!(
+            server_help.contains(marker),
+            "server help should mention {marker}: {server_help}"
+        );
+    }
 }
 
 #[test]
