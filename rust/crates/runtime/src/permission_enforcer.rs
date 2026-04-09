@@ -125,12 +125,11 @@ impl PermissionEnforcer {
 /// Workspace boundary check that keeps canonical root semantics for missing targets.
 fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
     let workspace_root = Path::new(workspace_root);
-    let canonical_root = normalize_comparable_path(
-        &workspace_root
-            .canonicalize()
-            .unwrap_or_else(|_| workspace_root.to_path_buf()),
-    );
-    let candidate = normalize_comparable_path(&resolve_write_target_path(path, workspace_root));
+    let resolved_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical_root = normalize_comparable_path(&resolved_root);
+    let candidate = normalize_comparable_path(&resolve_write_target_path(path, &resolved_root));
     candidate == canonical_root || candidate.starts_with(&canonical_root)
 }
 
@@ -203,6 +202,8 @@ fn is_read_only_command(command: &str) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(windows)]
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_enforcer(mode: PermissionMode) -> PermissionEnforcer {
@@ -218,6 +219,37 @@ mod tests {
         let root = std::env::temp_dir().join(format!("openyak-permissions-{name}-{unique}"));
         fs::create_dir_all(&root).expect("temp workspace should create");
         root
+    }
+
+    #[cfg(unix)]
+    fn create_directory_alias(target: &Path, alias: &Path) {
+        std::os::unix::fs::symlink(target, alias).expect("workspace alias should create");
+    }
+
+    #[cfg(windows)]
+    fn create_directory_alias(target: &Path, alias: &Path) {
+        let output = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(alias)
+            .arg(target)
+            .output()
+            .expect("mklink should launch");
+        assert!(
+            output.status.success(),
+            "mklink /J failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn remove_directory_alias(alias: &Path) {
+        fs::remove_file(alias).expect("workspace alias cleanup should succeed");
+    }
+
+    #[cfg(windows)]
+    fn remove_directory_alias(alias: &Path) {
+        fs::remove_dir(alias).expect("workspace alias cleanup should succeed");
     }
 
     #[test]
@@ -480,6 +512,24 @@ mod tests {
         let result =
             enforcer.check_file_write("generated/output.txt", workspace.to_string_lossy().as_ref());
 
+        let _ = fs::remove_dir_all(&workspace);
+        assert_eq!(result, EnforcementResult::Allowed);
+    }
+
+    #[test]
+    fn workspace_write_allows_relative_path_when_workspace_root_is_an_alias() {
+        let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
+        let workspace = temp_workspace("alias-target");
+        let alias_parent = temp_workspace("alias-parent");
+        let alias = alias_parent.join("workspace-alias");
+
+        create_directory_alias(&workspace, &alias);
+
+        let result =
+            enforcer.check_file_write("generated/output.txt", alias.to_string_lossy().as_ref());
+
+        remove_directory_alias(&alias);
+        let _ = fs::remove_dir_all(&alias_parent);
         let _ = fs::remove_dir_all(&workspace);
         assert_eq!(result, EnforcementResult::Allowed);
     }

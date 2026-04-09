@@ -407,7 +407,11 @@ fn assert_grep_chunk_assembly(_: &HarnessWorkspace, run: &ScenarioRun) {
 fn assert_write_file_allowed(workspace: &HarnessWorkspace, run: &ScenarioRun) {
     assert_eq!(run.response["iterations"], Value::from(2));
     let tool_result = &run.response["tool_results"][0];
-    assert_eq!(tool_result["is_error"], Value::Bool(false));
+    assert_eq!(
+        tool_result["is_error"],
+        Value::Bool(false),
+        "write_file_allowed unexpectedly failed: {tool_result}"
+    );
     let tool_output = tool_result["output"].as_str().expect("tool output");
     let parsed_output: Value = serde_json::from_str(tool_output).expect("write_file output json");
     let generated = tool_output_file_path(workspace, &parsed_output);
