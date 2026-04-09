@@ -122,6 +122,13 @@ fn openyak_server_surfaces_thread_routes() {
         .as_str()
         .expect("thread_id should be present")
         .to_string();
+    assert_eq!(created["contract"]["truth_layer"], "daemon_local_v1");
+    assert_eq!(
+        created["contract"]["operator_plane"],
+        "local_loopback_operator_v1"
+    );
+    assert_eq!(created["contract"]["persistence"], "workspace_sqlite_v1");
+    assert_eq!(created["contract"]["attach_api"], "/v1/threads");
     assert!(
         child.state_db_path().exists(),
         "durable state db should exist at {}",
@@ -150,6 +157,18 @@ fn openyak_server_surfaces_thread_routes() {
     assert_eq!(
         listed["threads"][0]["contract"]["truth_layer"],
         "daemon_local_v1"
+    );
+    assert_eq!(
+        listed["threads"][0]["contract"]["operator_plane"],
+        "local_loopback_operator_v1"
+    );
+    assert_eq!(
+        listed["threads"][0]["contract"]["persistence"],
+        "workspace_sqlite_v1"
+    );
+    assert_eq!(
+        listed["threads"][0]["contract"]["attach_api"],
+        "/v1/threads"
     );
 }
 

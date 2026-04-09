@@ -371,6 +371,7 @@ skills 目录支持两种布局：
 把这组能力放到 daemon/control-plane roadmap 上理解时，当前边界应视为：
 
 - 已有：thread 级 durable snapshot、`truth_layer = daemon_local_v1` 的 thread contract、`operator_plane = local_loopback_operator_v1` / `persistence = workspace_sqlite_v1` contract labels、restart 后的 `interrupted` + `recovery_note`，以及 `failure_kind` / `recovery_kind` / `recommended_actions` 组成的结构化恢复 guidance。
+- 这批恢复字段当前只覆盖 attach-first thread truth，可视为已发货的最小 `failure taxonomy / recovery recipes` slice，而不是更宽的 daemon control plane。
 - 已有 operator-facing truth labels：thread snapshot 显式声明 `truth_layer = daemon_local_v1` 与 `attach_api = /v1/threads`；Task / Team / Cron registry payload 则继续声明 `origin = process_local_v1`。
 - 已有 shared lifecycle/failure/recovery schema family：thread truth 公开 `contract` / `state` / `recovery` 三层快照；Task / Team / Cron 则只在 `process_local_v1` 边界内复用 lifecycle metadata（`created_at`、`updated_at`、`last_error`、`disabled_reason`、`capabilities`），没有被升级成 daemon-backed recovery plane。
 - 未有：daemon-backed worker/task/team truth layer、跨 family 的 daemon lifecycle store、CLI-first daemon operator controls。
