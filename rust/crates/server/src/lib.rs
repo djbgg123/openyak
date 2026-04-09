@@ -1533,19 +1533,18 @@ fn decode_pending_request_payload(
 }
 
 fn recovery_guidance_for_note(note: &str) -> RecoveryGuidanceSnapshot {
-    let (failure_kind, recovery_kind, recommended_actions): (&str, &str, &[&str]) = if note
-        .contains("restart or shutdown")
-    {
-        (
-            "daemon_restart_interrupted_run",
-            "reattach_or_retry",
-            &[
-                "reattach to the thread and inspect the latest snapshot",
-                "retry the interrupted work from the operator plane when safe",
-            ],
-        )
-    } else if note.contains("pending user input") {
-        (
+    let (failure_kind, recovery_kind, recommended_actions): (&str, &str, &[&str]) =
+        if note.contains("restart or shutdown") {
+            (
+                "daemon_restart_interrupted_run",
+                "reattach_or_retry",
+                &[
+                    "reattach to the thread and inspect the latest snapshot",
+                    "retry the interrupted work from the operator plane when safe",
+                ],
+            )
+        } else if note.contains("pending user input") {
+            (
             "pending_user_input_state_mismatch",
             "refresh_and_resubmit_user_input",
             &[
@@ -1553,16 +1552,16 @@ fn recovery_guidance_for_note(note: &str) -> RecoveryGuidanceSnapshot {
                 "resume only after confirming the pending request matches the latest durable state",
             ],
         )
-    } else {
-        (
-            "interrupted_requires_recovery",
-            "manual_operator_recovery",
-            &[
-                "inspect the recovery note and latest thread snapshot",
-                "choose retry, resume, or abandon from the operator plane",
-            ],
-        )
-    };
+        } else {
+            (
+                "interrupted_requires_recovery",
+                "manual_operator_recovery",
+                &[
+                    "inspect the recovery note and latest thread snapshot",
+                    "choose retry, resume, or abandon from the operator plane",
+                ],
+            )
+        };
 
     RecoveryGuidanceSnapshot {
         failure_kind: failure_kind.to_string(),
@@ -2191,9 +2190,12 @@ mod tests {
 
         assert_eq!(created.thread_id, "thread-1");
         assert_eq!(created.protocol_version, "v1");
-        assert_eq!(created.contract.truth_layer, super::THREAD_TRUTH_LAYER);
         assert_eq!(
-            created.contract.operator_plane,
+            created.contract.lifecycle.truth_layer,
+            super::THREAD_TRUTH_LAYER
+        );
+        assert_eq!(
+            created.contract.lifecycle.operator_plane,
             super::THREAD_OPERATOR_PLANE
         );
         assert_eq!(created.state.status, "idle");
@@ -2201,7 +2203,7 @@ mod tests {
         assert_eq!(listed.threads.len(), 1);
         assert_eq!(listed.threads[0].thread_id, created.thread_id);
         assert_eq!(
-            listed.threads[0].contract.truth_layer,
+            listed.threads[0].contract.lifecycle.truth_layer,
             super::THREAD_TRUTH_LAYER
         );
         assert_eq!(fetched.thread_id, created.thread_id);
