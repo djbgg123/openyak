@@ -9,6 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{sleep, Duration};
 
 pub const SCENARIO_PREFIX: &str = "PARITY_SCENARIO:";
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
@@ -124,6 +125,7 @@ enum Scenario {
     BashPermissionPromptApproved,
     BashPermissionPromptDenied,
     RequestUserInputRoundtrip,
+    DelayedRequestUserInputRoundtrip,
     PluginToolRoundtrip,
 }
 
@@ -140,6 +142,7 @@ impl Scenario {
             "bash_permission_prompt_approved" => Some(Self::BashPermissionPromptApproved),
             "bash_permission_prompt_denied" => Some(Self::BashPermissionPromptDenied),
             "request_user_input_roundtrip" => Some(Self::RequestUserInputRoundtrip),
+            "delayed_request_user_input_roundtrip" => Some(Self::DelayedRequestUserInputRoundtrip),
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             _ => None,
         }
@@ -157,6 +160,7 @@ impl Scenario {
             Self::BashPermissionPromptApproved => "bash_permission_prompt_approved",
             Self::BashPermissionPromptDenied => "bash_permission_prompt_denied",
             Self::RequestUserInputRoundtrip => "request_user_input_roundtrip",
+            Self::DelayedRequestUserInputRoundtrip => "delayed_request_user_input_roundtrip",
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
         }
     }
@@ -180,6 +184,10 @@ async fn handle_connection(
         stream: request.stream,
         raw_body,
     });
+
+    if matches!(scenario, Scenario::DelayedRequestUserInputRoundtrip) {
+        sleep(Duration::from_millis(500)).await;
+    }
 
     let response = build_http_response(&request, scenario);
     socket.write_all(response.as_bytes()).await?;
@@ -470,7 +478,7 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 &[r#"{"command":"printf 'should not run'","timeout":1000}"#],
             ),
         },
-        Scenario::RequestUserInputRoundtrip => match latest_tool_result(request) {
+        Scenario::RequestUserInputRoundtrip | Scenario::DelayedRequestUserInputRoundtrip => match latest_tool_result(request) {
             Some((tool_output, _)) => final_text_sse(&format!(
                 "request-user-input completed: {}",
                 extract_user_input_content(&tool_output)
@@ -637,7 +645,7 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                 json!({"command": "printf 'should not run'", "timeout": 1000}),
             ),
         },
-        Scenario::RequestUserInputRoundtrip => match latest_tool_result(request) {
+        Scenario::RequestUserInputRoundtrip | Scenario::DelayedRequestUserInputRoundtrip => match latest_tool_result(request) {
             Some((tool_output, _)) => text_message_response(
                 "msg_request_user_input_final",
                 &format!(
@@ -687,6 +695,7 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::BashPermissionPromptApproved => "req_bash_permission_prompt_approved",
         Scenario::BashPermissionPromptDenied => "req_bash_permission_prompt_denied",
         Scenario::RequestUserInputRoundtrip => "req_request_user_input_roundtrip",
+        Scenario::DelayedRequestUserInputRoundtrip => "req_delayed_request_user_input_roundtrip",
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
     }
 }

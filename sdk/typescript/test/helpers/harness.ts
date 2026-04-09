@@ -56,11 +56,23 @@ export async function startOpenyakServer(
   env: NodeJS.ProcessEnv,
 ): Promise<OpenyakServerHarness> {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "openyak-sdk-alpha-"));
+  return startOpenyakServerIn(workspace, env, { cleanupWorkspace: true });
+}
+
+export async function startOpenyakServerIn(
+  workspace: string,
+  env: NodeJS.ProcessEnv,
+  options?: {
+    bind?: string;
+    cleanupWorkspace?: boolean;
+  },
+): Promise<OpenyakServerHarness> {
   const proc = await startProcess(
     resolveOpenyakServerCommand(),
     {
       cwd: workspace,
       env,
+      bind: options?.bind,
     },
     /^Local thread server listening on (http:\/\/.+)$/,
   );
@@ -74,7 +86,9 @@ export async function startOpenyakServer(
     workspace,
     async close() {
       await proc.close();
-      await rm(workspace, { recursive: true, force: true });
+      if (options?.cleanupWorkspace ?? false) {
+        await rm(workspace, { recursive: true, force: true });
+      }
     },
   };
 }
@@ -154,10 +168,11 @@ async function startProcess(
   options: {
     cwd?: string;
     env?: NodeJS.ProcessEnv;
+    bind?: string;
   },
   matcher: RegExp,
 ): Promise<ManagedProcess & { match: RegExpMatchArray }> {
-  const child = spawn(proc.command, proc.args.concat(["--bind", "127.0.0.1:0"]), {
+  const child = spawn(proc.command, proc.args.concat(["--bind", options.bind ?? "127.0.0.1:0"]), {
     cwd: options.cwd ?? repoRoot,
     env: options.env ?? process.env,
     stdio: ["ignore", "pipe", "pipe"],

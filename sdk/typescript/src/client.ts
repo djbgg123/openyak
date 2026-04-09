@@ -1,5 +1,6 @@
 import {
   OpenyakApiError,
+  OpenyakError,
   OpenyakCompatibilityError,
   OpenyakProtocolError,
   OpenyakReconnectRequiredError,
@@ -440,6 +441,16 @@ export class Thread {
           error,
         );
       }
+      if (isBufferedRunTransportError(error)) {
+        return this.#reconcileBufferedRun(
+          streamed.snapshot,
+          streamed.accepted.run_id,
+          events,
+          finalText,
+          latestUsage,
+          new OpenyakReconnectRequiredError(this.threadId, streamed.accepted.run_id),
+        );
+      }
       throw error;
     } finally {
       streamed.close();
@@ -454,7 +465,7 @@ export class Thread {
     partialUsage: TokenUsage | undefined,
     error: OpenyakResyncRequiredError | OpenyakReconnectRequiredError,
   ): Promise<RunResult> {
-    const latestSnapshot = await this.read().catch(() => undefined);
+    const latestSnapshot = await this.#readForReconcile();
     if (!latestSnapshot) {
       throw error;
     }
@@ -518,6 +529,20 @@ export class Thread {
     }
 
     throw new OpenyakReconnectRequiredError(this.threadId, runId, latestSnapshot);
+  }
+
+  async #readForReconcile(): Promise<ThreadSnapshot | undefined> {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      try {
+        return await this.read();
+      } catch {
+        if (attempt === 9) {
+          return undefined;
+        }
+        await sleep(50);
+      }
+    }
+    return undefined;
   }
 
   async #requestJson<T>(
@@ -793,6 +818,13 @@ function isTerminalRunEvent(event: RunEvent): boolean {
     event.type === "run.failed" ||
     event.type === "run.waiting_user_input"
   );
+}
+
+function isBufferedRunTransportError(error: unknown): boolean {
+  if (error instanceof OpenyakError) {
+    return false;
+  }
+  return error instanceof TypeError;
 }
 
 function normalizeText(value: string): string | undefined {

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, TypeVar, cast
@@ -383,6 +385,17 @@ class Thread:
                 partial_usage=latest_usage,
                 error=error,
             )
+        except httpx.HTTPError:
+            return self._reconcile_buffered_run(
+                initial_snapshot=streamed.snapshot,
+                run_id=streamed.accepted.run_id,
+                events=events,
+                partial_text="".join(final_text_parts),
+                partial_usage=latest_usage,
+                error=OpenyakReconnectRequiredError(
+                    self.thread_id, streamed.accepted.run_id
+                ),
+            )
         finally:
             streamed.close()
 
@@ -396,10 +409,7 @@ class Thread:
         partial_usage: TokenUsage | None,
         error: OpenyakResyncRequiredError | OpenyakReconnectRequiredError,
     ) -> RunResult:
-        try:
-            latest_snapshot = self.read()
-        except Exception as read_error:
-            raise error from read_error
+        latest_snapshot = _read_for_reconcile(self.read, error)
         if latest_snapshot.state.run_id is not None and latest_snapshot.state.run_id != run_id:
             raise OpenyakReconnectRequiredError(self.thread_id, run_id, latest_snapshot)
         if latest_snapshot.state.status == "running":
@@ -791,6 +801,17 @@ class AsyncThread:
                 partial_usage=latest_usage,
                 error=error,
             )
+        except httpx.HTTPError:
+            return await self._reconcile_buffered_run(
+                initial_snapshot=streamed.snapshot,
+                run_id=streamed.accepted.run_id,
+                events=events,
+                partial_text="".join(final_text_parts),
+                partial_usage=latest_usage,
+                error=OpenyakReconnectRequiredError(
+                    self.thread_id, streamed.accepted.run_id
+                ),
+            )
         finally:
             await streamed.close()
 
@@ -804,10 +825,7 @@ class AsyncThread:
         partial_usage: TokenUsage | None,
         error: OpenyakResyncRequiredError | OpenyakReconnectRequiredError,
     ) -> RunResult:
-        try:
-            latest_snapshot = await self.read()
-        except Exception as read_error:
-            raise error from read_error
+        latest_snapshot = await _read_for_reconcile_async(self.read, error)
         if latest_snapshot.state.run_id is not None and latest_snapshot.state.run_id != run_id:
             raise OpenyakReconnectRequiredError(self.thread_id, run_id, latest_snapshot)
         if latest_snapshot.state.status == "running":
@@ -936,6 +954,38 @@ def _response_error(response: httpx.Response) -> OpenyakApiError | OpenyakProtoc
 
 def _normalize_text(value: str) -> str | None:
     return value if value else None
+
+
+def _read_for_reconcile(
+    read_snapshot: Callable[[], ThreadSnapshot],
+    error: OpenyakResyncRequiredError | OpenyakReconnectRequiredError,
+) -> ThreadSnapshot:
+    last_error: httpx.HTTPError | None = None
+    for attempt in range(10):
+        try:
+            return read_snapshot()
+        except httpx.HTTPError as read_error:
+            last_error = read_error
+            if attempt == 9:
+                break
+            time.sleep(0.05)
+    raise error from last_error
+
+
+async def _read_for_reconcile_async(
+    read_snapshot: Callable[[], Any],
+    error: OpenyakResyncRequiredError | OpenyakReconnectRequiredError,
+) -> ThreadSnapshot:
+    last_error: httpx.HTTPError | None = None
+    for attempt in range(10):
+        try:
+            return await read_snapshot()
+        except httpx.HTTPError as read_error:
+            last_error = read_error
+            if attempt == 9:
+                break
+            await asyncio.sleep(0.05)
+    raise error from last_error
 
 
 def _run_result_parts(

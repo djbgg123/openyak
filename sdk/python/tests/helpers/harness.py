@@ -51,12 +51,14 @@ class OpenyakServerHarness:
     base_url: str
     workspace: Path
     managed: ManagedProcess
+    cleanup_workspace: bool = True
 
     def close(self) -> None:
         try:
             self.managed.close()
         finally:
-            shutil.rmtree(self.workspace, ignore_errors=True)
+            if self.cleanup_workspace:
+                shutil.rmtree(self.workspace, ignore_errors=True)
 
 
 @dataclass(slots=True)
@@ -102,15 +104,31 @@ def start_mock_anthropic_service() -> MockAnthropicHarness:
 
 def start_openyak_server(env: dict[str, str]) -> OpenyakServerHarness:
     workspace = Path(tempfile.mkdtemp(prefix="openyak-python-sdk-alpha-"))
+    return start_openyak_server_in(workspace, env, cleanup_workspace=True)
+
+
+def start_openyak_server_in(
+    workspace: Path,
+    env: dict[str, str],
+    *,
+    bind: str = "127.0.0.1:0",
+    cleanup_workspace: bool = False,
+) -> OpenyakServerHarness:
     managed, match = _start_process(
         _resolve_openyak_server_command(),
         {
             "cwd": workspace,
             "env": env,
+            "bind": bind,
         },
         re.compile(r"^Local thread server listening on (http://.+)$"),
     )
-    return OpenyakServerHarness(base_url=match.group(1), workspace=workspace, managed=managed)
+    return OpenyakServerHarness(
+        base_url=match.group(1),
+        workspace=workspace,
+        managed=managed,
+        cleanup_workspace=cleanup_workspace,
+    )
 
 
 def _resolve_standalone_rust_binary(name: str, env_var: str) -> list[str]:
@@ -166,7 +184,7 @@ def _start_process(
     matcher: re.Pattern[str],
 ) -> tuple[ManagedProcess, re.Match[str]]:
     process = subprocess.Popen(
-        command + ["--bind", "127.0.0.1:0"],
+        command + ["--bind", str(options.get("bind", "127.0.0.1:0"))],
         cwd=str(options.get("cwd", REPO_ROOT)),
         env=options.get("env", os.environ),
         stdout=subprocess.PIPE,

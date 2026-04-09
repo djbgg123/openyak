@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
+import tempfile
+import threading
+import time
+from urllib.parse import urlparse
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import cast
@@ -14,6 +19,7 @@ from .helpers.harness import (
     server_harness,
     start_mock_anthropic_service,
     start_openyak_server,
+    start_openyak_server_in,
 )
 
 PROVIDER_ENV_KEYS = (
@@ -38,6 +44,18 @@ def runtime_failure_server_harness() -> Iterator[ServerHarness]:
         yield harness
     finally:
         harness.close()
+
+
+def wait_for_thread_status(thread: object, expected: str, timeout_s: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    last_status = None
+    while time.monotonic() < deadline:
+        snapshot = thread.read()
+        last_status = snapshot.state.status
+        if last_status == expected:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"thread did not reach {expected!r}; last status was {last_status!r}")
 
 
 def test_attach_first_sync_client_can_create_list_get_and_stream_a_bash_run() -> None:
@@ -147,6 +165,71 @@ def test_streamed_sync_run_surfaces_runtime_failure_recovery_metadata() -> None:
                 and failed_event.payload.lifecycle.recovery.recovery_kind
                 == "inspect_error_and_retry"
             )
+
+
+def test_buffered_sync_run_recovers_interrupted_snapshot_truth_after_server_restart() -> None:
+    mock = start_mock_anthropic_service()
+    workspace = tempfile.mkdtemp(prefix="openyak-python-sdk-restart-")
+    env = {
+        **os.environ,
+        "ANTHROPIC_API_KEY": "test-sdk-key",
+        "ANTHROPIC_BASE_URL": mock.base_url,
+    }
+    server = start_openyak_server_in(workspace, env, cleanup_workspace=False)
+    base_url = server.base_url
+    bind = urlparse(base_url).netloc
+
+    try:
+        with OpenyakClient(base_url=base_url, timeout_s=30.0) as client:
+            thread = client.create_thread(
+                model="claude-sonnet-4-6",
+                allowed_tools=["read_file"],
+            )
+            watcher = client.resume_thread(thread.thread_id)
+            result_holder: dict[str, object] = {}
+
+            def run_buffered() -> None:
+                try:
+                    result_holder["result"] = thread.run(
+                        "PARITY_SCENARIO:delayed_request_user_input_roundtrip"
+                    )
+                except Exception as error:  # pragma: no cover - assertion surfaces below
+                    result_holder["error"] = error
+
+            runner = threading.Thread(target=run_buffered, daemon=True)
+            runner.start()
+            wait_for_thread_status(watcher, "running")
+
+            server.close()
+            server = start_openyak_server_in(
+                workspace,
+                env,
+                bind=bind,
+                cleanup_workspace=False,
+            )
+
+            runner.join(timeout=30)
+            assert "error" not in result_holder, result_holder.get("error")
+            result = result_holder.get("result")
+            assert result is not None
+            assert result.status == "interrupted"
+            assert result.recovered_from_snapshot is True
+            assert result.recovery_note is not None
+            assert "restart or shutdown" in result.recovery_note
+            assert result.snapshot is not None
+            assert result.snapshot.state.lifecycle is not None
+            assert (
+                result.snapshot.state.lifecycle.failure_kind
+                == "daemon_restart_interrupted_run"
+            )
+            assert result.snapshot.state.recovery is not None
+            assert (
+                result.snapshot.state.recovery.recovery_kind == "reattach_or_retry"
+            )
+    finally:
+        server.close()
+        mock.close()
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def test_buffered_sync_run_returns_awaiting_user_input_and_resume_continues_the_same_run() -> None:

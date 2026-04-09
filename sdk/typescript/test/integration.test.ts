@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import { OpenyakClient } from "../src/index.js";
-import { startMockAnthropicService, startOpenyakServer, withServerHarness } from "./helpers/harness.js";
+import {
+  startMockAnthropicService,
+  startOpenyakServer,
+  startOpenyakServerIn,
+  withServerHarness,
+} from "./helpers/harness.js";
 
 const providerEnvKeys = [
   "ANTHROPIC_API_KEY",
@@ -34,6 +42,24 @@ async function withRuntimeFailureHarness<T>(
     await server.close();
     await mock.close();
   }
+}
+
+async function waitForThreadStatus(
+  thread: { read(): Promise<{ state: { status: string } }> },
+  expected: string,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = "unknown";
+  while (Date.now() < deadline) {
+    const snapshot = await thread.read();
+    lastStatus = snapshot.state.status;
+    if (lastStatus === expected) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`thread did not reach ${expected}; last status was ${lastStatus}`);
 }
 
 test("attach-first client can create/list/get threads and stream a bash run", async () => {
@@ -197,4 +223,55 @@ test("runStreamed surfaces runtime failure recovery metadata against a real loca
       "inspect_error_and_retry",
     );
   });
+});
+
+test("buffered run recovers interrupted snapshot truth after local server restart", async () => {
+  const mock = await startMockAnthropicService();
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "openyak-sdk-restart-"));
+  const env = {
+    ...process.env,
+    ANTHROPIC_API_KEY: "test-sdk-key",
+    ANTHROPIC_BASE_URL: mock.baseUrl,
+  };
+  let server = await startOpenyakServerIn(workspace, env, { cleanupWorkspace: false });
+  const bind = new URL(server.baseUrl).host;
+
+  try {
+    const client = new OpenyakClient({
+      baseUrl: server.baseUrl,
+      timeoutMs: 30_000,
+    });
+
+    const thread = await client.createThread({
+      model: "claude-sonnet-4-6",
+      allowedTools: ["read_file"],
+    });
+    const watcher = client.resumeThread(thread.threadId);
+
+    const runPromise = thread.run("PARITY_SCENARIO:delayed_request_user_input_roundtrip");
+    await waitForThreadStatus(watcher, "running");
+
+    await server.close();
+    server = await startOpenyakServerIn(workspace, env, {
+      bind,
+      cleanupWorkspace: false,
+    });
+
+    const interrupted = await runPromise;
+    assert.equal(interrupted.status, "interrupted");
+    assert.equal(interrupted.recoveredFromSnapshot, true);
+    assert.match(interrupted.recoveryNote ?? "", /restart or shutdown/);
+    assert.equal(
+      interrupted.snapshot?.state.lifecycle?.failure_kind,
+      "daemon_restart_interrupted_run",
+    );
+    assert.equal(
+      interrupted.snapshot?.state.recovery?.recovery_kind,
+      "reattach_or_retry",
+    );
+  } finally {
+    await server.close();
+    await mock.close();
+    await rm(workspace, { recursive: true, force: true });
+  }
 });
