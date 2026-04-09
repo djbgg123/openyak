@@ -337,7 +337,7 @@ skills 目录支持两种布局：
 - 顶层命令与 REPL slash command 的本地发现和执行
 - direct slash CLI 入口（`openyak /agents`、`openyak /skills`、`openyak /foundations`）以及 `--resume` 形式的 resume-safe slash command 恢复执行
 - `openyak doctor` 对配置加载、OAuth 配置/凭据、活动模型鉴权预检，以及 GitHub CLI 可用性 / `gh auth status` readiness 做本地只读检查
-- `openyak foundations [task|team|cron|lsp|mcp]` / `/foundations [task|team|cron|lsp|mcp]` 作为只读的 discovery surface，明确说明当前 Task / Team / Cron / LSP / MCP 的 tool membership 与 `process_local_v1` / registry-backed 边界
+- `openyak foundations [task|team|cron|lsp|mcp]` / `/foundations [task|team|cron|lsp|mcp]` 作为只读的 discovery surface，明确说明当前 Task / Team / Cron / LSP / MCP 的 tool membership、truth label 与 `process_local_v1` / registry-backed 边界
 - `openyak package-release` 生成本地 release artifact 目录，供 release/upload 与脱离源码目录的 packaged-use 验证
 - 插件发现、安装、启用、禁用、卸载、更新
 - 插件工具聚合、插件 hook 聚合与生命周期
@@ -364,6 +364,8 @@ skills 目录支持两种布局：
 它们用于解释这五族当前已经发货的 operator surface，而不是把它们包装成更宽的 control plane。
 
 其中 `Session*` 是 OP6 phase-1 的 hybrid local-only surface：thread-kind mutation 通过当前本地 `openyak server` 的 `/v1/threads` 真值面完成，`managed_session` 保持只读，`agent_run` 保持只读/有限 wait；其余能力继续建立在 `runtime` 里的 in-memory registries / bridges 之上。
+
+其中 thread-kind `SessionList` / `SessionGet` / `SessionCreate` / `SessionWait` 现在会直接回显 daemon-backed contract metadata（`truth_layer` / `operator_plane` / `persistence` / `attach_api`）与恢复 guidance，避免把 daemon-backed thread truth 和 `process_local_v1` foundations 混成同一层 operator 叙事。
 
 把这组能力放到 daemon/control-plane roadmap 上理解时，当前边界应视为：
 
