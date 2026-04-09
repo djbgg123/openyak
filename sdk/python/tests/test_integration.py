@@ -58,6 +58,20 @@ def wait_for_thread_status(thread: object, expected: str, timeout_s: float = 5.0
     raise AssertionError(f"thread did not reach {expected!r}; last status was {last_status!r}")
 
 
+async def wait_for_thread_status_async(
+    thread: object, expected: str, timeout_s: float = 5.0
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    last_status = None
+    while time.monotonic() < deadline:
+        snapshot = await thread.read()
+        last_status = snapshot.state.status
+        if last_status == expected:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"thread did not reach {expected!r}; last status was {last_status!r}")
+
+
 def test_attach_first_sync_client_can_create_list_get_and_stream_a_bash_run() -> None:
     with server_harness() as harness:
         with OpenyakClient(base_url=harness.server.base_url, timeout_s=30.0) as client:
@@ -353,5 +367,132 @@ def test_buffered_async_run_returns_awaiting_user_input_and_resume_continues_the
                 completed = await thread.read()
                 assert completed.state.status == "idle"
                 assert completed.state.pending_user_input is None
+
+    asyncio.run(case())
+
+
+def test_buffered_async_run_preserves_runtime_failure_recovery_metadata() -> None:
+    async def case() -> None:
+        with runtime_failure_server_harness() as harness:
+            async with AsyncOpenyakClient(
+                base_url=harness.server.base_url,
+                timeout_s=30.0,
+            ) as client:
+                thread = await client.create_thread(
+                    model="opus",
+                    allowed_tools=[],
+                )
+
+                failed = await thread.run("provider bootstrap should fail")
+
+                assert failed.status == "failed"
+                assert failed.run_id == "run-1"
+                assert failed.error.code == "runtime_error"
+                assert failed.error.status == "failed"
+                assert failed.error.lifecycle is not None
+                assert failed.error.lifecycle.failure_kind == "daemon_thread_runtime_error"
+                assert failed.error.lifecycle.recovery is not None
+                assert failed.error.lifecycle.recovery.recovery_kind == "inspect_error_and_retry"
+                assert failed.terminal_event is not None
+                assert failed.terminal_event.payload.lifecycle is not None
+
+                completed = await thread.read()
+                assert completed.state.status == "idle"
+
+    asyncio.run(case())
+
+
+def test_streamed_async_run_surfaces_runtime_failure_recovery_metadata() -> None:
+    async def case() -> None:
+        with runtime_failure_server_harness() as harness:
+            async with AsyncOpenyakClient(
+                base_url=harness.server.base_url,
+                timeout_s=30.0,
+            ) as client:
+                thread = await client.create_thread(
+                    model="opus",
+                    allowed_tools=[],
+                )
+
+                async with await thread.run_streamed(
+                    "provider bootstrap should fail"
+                ) as streamed:
+                    event_types: list[str] = []
+                    failed_event = None
+                    async for event in streamed.events:
+                        event_types.append(event.type)
+                        if event.type == "run.failed":
+                            failed_event = cast(RunFailedEvent, event)
+                            break
+
+                assert event_types == ["run.started", "run.failed"]
+                assert failed_event is not None
+                assert failed_event.payload.lifecycle is not None
+                assert (
+                    failed_event.payload.lifecycle.failure_kind
+                    == "daemon_thread_runtime_error"
+                )
+                assert failed_event.payload.lifecycle.recovery is not None
+                assert (
+                    failed_event.payload.lifecycle.recovery.recovery_kind
+                    == "inspect_error_and_retry"
+                )
+
+    asyncio.run(case())
+
+
+def test_buffered_async_run_recovers_interrupted_snapshot_truth_after_server_restart() -> None:
+    async def case() -> None:
+        mock = start_mock_anthropic_service()
+        workspace = tempfile.mkdtemp(prefix="openyak-python-sdk-async-restart-")
+        env = {
+            **os.environ,
+            "ANTHROPIC_API_KEY": "test-sdk-key",
+            "ANTHROPIC_BASE_URL": mock.base_url,
+        }
+        server = start_openyak_server_in(workspace, env, cleanup_workspace=False)
+        base_url = server.base_url
+        bind = urlparse(base_url).netloc
+
+        try:
+            async with AsyncOpenyakClient(base_url=base_url, timeout_s=30.0) as client:
+                thread = await client.create_thread(
+                    model="claude-sonnet-4-6",
+                    allowed_tools=["read_file"],
+                )
+                watcher = client.resume_thread(thread.thread_id)
+
+                run_task = asyncio.create_task(
+                    thread.run("PARITY_SCENARIO:delayed_request_user_input_roundtrip")
+                )
+                await wait_for_thread_status_async(watcher, "running")
+
+                server.close()
+                server = start_openyak_server_in(
+                    workspace,
+                    env,
+                    bind=bind,
+                    cleanup_workspace=False,
+                )
+
+                result = await asyncio.wait_for(run_task, timeout=30.0)
+                assert result.status == "interrupted"
+                assert result.recovered_from_snapshot is True
+                assert result.recovery_note is not None
+                assert "restart or shutdown" in result.recovery_note
+                assert result.snapshot is not None
+                assert result.snapshot.state.lifecycle is not None
+                assert (
+                    result.snapshot.state.lifecycle.failure_kind
+                    == "daemon_restart_interrupted_run"
+                )
+                assert result.snapshot.state.recovery is not None
+                assert (
+                    result.snapshot.state.recovery.recovery_kind == "reattach_or_retry"
+                )
+        finally:
+            server.close()
+            mock.close()
+            shutil.rmtree(workspace, ignore_errors=True)
 
     asyncio.run(case())
