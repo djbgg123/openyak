@@ -39,6 +39,36 @@ type RecordedAssistantBatches = Arc<Mutex<Vec<Vec<AssistantEvent>>>>;
 const BROADCAST_CAPACITY: usize = 128;
 const DEFAULT_MODEL_ALIAS: &str = "opus";
 const PROTOCOL_VERSION: &str = "v1";
+pub const THREAD_TRUTH_LAYER: &str = "daemon_local_v1";
+pub const THREAD_OPERATOR_PLANE: &str = "local_loopback_operator_v1";
+pub const THREAD_PERSISTENCE_LAYER: &str = "workspace_sqlite_v1";
+pub const THREAD_ATTACH_API: &str = "/v1/threads";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadContractSnapshot {
+    pub truth_layer: String,
+    pub operator_plane: String,
+    pub persistence: String,
+    pub attach_api: String,
+}
+
+impl ThreadContractSnapshot {
+    fn current() -> Self {
+        Self {
+            truth_layer: THREAD_TRUTH_LAYER.to_string(),
+            operator_plane: THREAD_OPERATOR_PLANE.to_string(),
+            persistence: THREAD_PERSISTENCE_LAYER.to_string(),
+            attach_api: THREAD_ATTACH_API.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryGuidanceSnapshot {
+    pub failure_kind: String,
+    pub recovery_kind: String,
+    pub recommended_actions: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -214,18 +244,21 @@ impl ThreadStatus {
                 run_id: None,
                 pending_user_input: None,
                 recovery_note: None,
+                recovery: None,
             },
             Self::Running { run_id } => ThreadStateSnapshot {
                 status: "running".to_string(),
                 run_id: Some(run_id.clone()),
                 pending_user_input: None,
                 recovery_note: None,
+                recovery: None,
             },
             Self::AwaitingUserInput { run_id, request } => ThreadStateSnapshot {
                 status: "awaiting_user_input".to_string(),
                 run_id: Some(run_id.clone()),
                 pending_user_input: Some(UserInputRequestPayload::from_request(request.clone())),
                 recovery_note: None,
+                recovery: None,
             },
             Self::Interrupted {
                 run_id,
@@ -235,6 +268,7 @@ impl ThreadStatus {
                 run_id: run_id.clone(),
                 pending_user_input: None,
                 recovery_note: Some(recovery_note.clone()),
+                recovery: Some(recovery_guidance_for_note(recovery_note)),
             },
         }
     }
@@ -720,11 +754,14 @@ pub struct ThreadStateSnapshot {
     pub pending_user_input: Option<UserInputRequestPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryGuidanceSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadSnapshot {
     pub protocol_version: String,
+    pub contract: ThreadContractSnapshot,
     pub thread_id: ThreadId,
     pub created_at: u64,
     pub updated_at: u64,
@@ -735,6 +772,7 @@ pub struct ThreadSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadSummary {
+    pub contract: ThreadContractSnapshot,
     pub thread_id: ThreadId,
     pub created_at: u64,
     pub updated_at: u64,
