@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
@@ -404,13 +406,18 @@ fn assert_grep_chunk_assembly(_: &HarnessWorkspace, run: &ScenarioRun) {
 
 fn assert_write_file_allowed(workspace: &HarnessWorkspace, run: &ScenarioRun) {
     assert_eq!(run.response["iterations"], Value::from(2));
-    let generated = workspace.root.join("generated").join("output.txt");
-    let contents = fs::read_to_string(&generated).expect("generated file should exist");
+    let tool_result = &run.response["tool_results"][0];
+    assert_eq!(tool_result["is_error"], Value::Bool(false));
+    let tool_output = tool_result["output"].as_str().expect("tool output");
+    let parsed_output: Value = serde_json::from_str(tool_output).expect("write_file output json");
+    let generated = tool_output_file_path(workspace, &parsed_output);
+    let contents = wait_for_file_contents(&generated).unwrap_or_else(|error| {
+        panic!(
+            "generated file should exist at {}: {error}",
+            generated.display()
+        )
+    });
     assert_eq!(contents, "created by mock service\n");
-    assert_eq!(
-        run.response["tool_results"][0]["is_error"],
-        Value::Bool(false)
-    );
 }
 
 fn assert_write_file_denied(workspace: &HarnessWorkspace, run: &ScenarioRun) {
@@ -469,6 +476,50 @@ fn parse_json_output(stdout: &str) -> Value {
             json_slice.and_then(|candidate| serde_json::from_str(candidate).ok())
         })
         .unwrap_or_else(|| panic!("no JSON response line found in stdout:\n{stdout}"))
+}
+
+fn tool_output_file_path(workspace: &HarnessWorkspace, parsed_output: &Value) -> PathBuf {
+    let file_path = parsed_output["filePath"]
+        .as_str()
+        .expect("write_file filePath");
+    let resolved = Path::new(file_path);
+    let absolute = if resolved.is_absolute() {
+        resolved.to_path_buf()
+    } else {
+        workspace.root.join(resolved)
+    };
+    let normalized = absolute.canonicalize().unwrap_or_else(|_| absolute.clone());
+    let workspace_root = workspace
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.root.clone());
+    assert!(
+        normalized.starts_with(&workspace_root),
+        "generated file path should stay within workspace: {} vs {}",
+        normalized.display(),
+        workspace_root.display()
+    );
+    normalized
+}
+
+fn wait_for_file_contents(path: &Path) -> std::io::Result<String> {
+    let mut last_error = None;
+    for _ in 0..20 {
+        match fs::read_to_string(path) {
+            Ok(contents) => return Ok(contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(error);
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("file did not appear: {}", path.display()),
+        )
+    }))
 }
 
 fn build_scenario_report(

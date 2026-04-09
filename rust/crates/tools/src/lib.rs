@@ -9714,6 +9714,9 @@ mod tests {
 
     #[test]
     fn repl_executes_python_code() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
             "REPL",
             &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),
@@ -9727,6 +9730,9 @@ mod tests {
 
     #[test]
     fn repl_timeout_is_enforced() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
             "REPL",
             &json!({
@@ -9747,6 +9753,9 @@ mod tests {
 
     #[test]
     fn repl_timeout_allows_large_stdout_to_finish() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
             "REPL",
             &json!({
@@ -9868,7 +9877,7 @@ mod tests {
     fn write_stub_powershell(path: &std::path::Path) {
         std::fs::write(
             path,
-            "#!/bin/sh\nwhile [ \"$1\" != \"-Command\" ] && [ $# -gt 0 ]; do shift; done\nshift\nprintf 'stub:%s' \"$1\"\n",
+            "#!/bin/sh\nwhile [ \"$1\" != \"-Command\" ] && [ $# -gt 0 ]; do shift; done\nshift\nprintf 'stub:%s\\n' \"$1\"\n",
         )
         .expect("write script");
         std::process::Command::new("chmod")
