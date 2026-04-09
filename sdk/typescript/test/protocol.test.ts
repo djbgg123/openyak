@@ -132,8 +132,17 @@ test("runStreamed surfaces thread.resync_required as a dedicated error", async (
       ]),
       jsonResponse({
         protocol_version: "v1",
+        contract: {
+          truth_layer: "daemon_local_v1",
+          operator_plane: "local_loopback_operator_v1",
+          persistence: "workspace_sqlite_v1",
+          attach_api: "/v1/threads",
+        },
         thread_id: "thread-1",
         run_id: "run-1",
+        lifecycle: {
+          status: "accepted",
+        },
         status: "accepted",
       }),
     ]),
@@ -198,8 +207,17 @@ test("run recovers awaiting_user_input from the latest snapshot after a dropped 
       ]),
       jsonResponse({
         protocol_version: "v1",
+        contract: {
+          truth_layer: "daemon_local_v1",
+          operator_plane: "local_loopback_operator_v1",
+          persistence: "workspace_sqlite_v1",
+          attach_api: "/v1/threads",
+        },
         thread_id: "thread-1",
         run_id: "run-1",
+        lifecycle: {
+          status: "accepted",
+        },
         status: "accepted",
       }),
       jsonResponse({
@@ -247,8 +265,17 @@ test("run fails predictably when reconciliation sees a different active run", as
       ]),
       jsonResponse({
         protocol_version: "v1",
+        contract: {
+          truth_layer: "daemon_local_v1",
+          operator_plane: "local_loopback_operator_v1",
+          persistence: "workspace_sqlite_v1",
+          attach_api: "/v1/threads",
+        },
         thread_id: "thread-1",
         run_id: "run-1",
+        lifecycle: {
+          status: "accepted",
+        },
         status: "accepted",
       }),
       jsonResponse({
@@ -298,8 +325,17 @@ test("run recovers interrupted lifecycle metadata from latest snapshot", async (
       ]),
       jsonResponse({
         protocol_version: "v1",
+        contract: {
+          truth_layer: "daemon_local_v1",
+          operator_plane: "local_loopback_operator_v1",
+          persistence: "workspace_sqlite_v1",
+          attach_api: "/v1/threads",
+        },
         thread_id: "thread-1",
         run_id: "run-1",
+        lifecycle: {
+          status: "accepted",
+        },
         status: "accepted",
       }),
       jsonResponse({

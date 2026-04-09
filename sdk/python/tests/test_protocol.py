@@ -87,7 +87,13 @@ def test_fixture_matrix_decodes_locked_v1_contract() -> None:
     assert listed.threads[0].thread_id == "thread-1"
     assert listed.threads[0].contract is not None
     assert turn_accepted.run_id == "run-1"
+    assert turn_accepted.contract is not None
+    assert turn_accepted.lifecycle is not None
+    assert turn_accepted.lifecycle.status == "accepted"
     assert user_input_accepted.request_id == "req-user-input-roundtrip"
+    assert user_input_accepted.contract is not None
+    assert user_input_accepted.lifecycle is not None
+    assert user_input_accepted.lifecycle.status == "accepted"
     assert bash_events[0].type == "thread.snapshot"
     assert bash_events[-1].type == "run.completed"
     assert bash_events[-1].payload.cumulative_usage.input_tokens == 26

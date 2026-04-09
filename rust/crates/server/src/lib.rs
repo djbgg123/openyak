@@ -772,17 +772,21 @@ pub struct ListThreadsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TurnAcceptedResponse {
     pub protocol_version: String,
+    pub contract: ThreadContractSnapshot,
     pub thread_id: ThreadId,
     pub run_id: RunId,
+    pub lifecycle: LifecycleStateSnapshot,
     pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserInputAcceptedResponse {
     pub protocol_version: String,
+    pub contract: ThreadContractSnapshot,
     pub thread_id: ThreadId,
     pub run_id: RunId,
     pub request_id: String,
+    pub lifecycle: LifecycleStateSnapshot,
     pub status: String,
 }
 
@@ -928,8 +932,10 @@ async fn start_thread_turn(
         StatusCode::ACCEPTED,
         Json(TurnAcceptedResponse {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            contract: ThreadContractSnapshot::current(),
             thread_id: id,
             run_id,
+            lifecycle: LifecycleStateSnapshot::daemon_thread("accepted", None),
             status: "accepted".to_string(),
         }),
     ))
@@ -967,9 +973,11 @@ async fn submit_thread_user_input(
         StatusCode::ACCEPTED,
         Json(UserInputAcceptedResponse {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            contract: ThreadContractSnapshot::current(),
             thread_id: id,
             run_id,
             request_id: payload.request_id,
+            lifecycle: LifecycleStateSnapshot::daemon_thread("accepted", None),
             status: "accepted".to_string(),
         }),
     ))

@@ -133,16 +133,20 @@ export interface ListThreadsResponse {
 
 export interface TurnAcceptedResponse {
   protocol_version: ProtocolVersion;
+  contract?: ThreadContractSnapshot;
   thread_id: string;
   run_id: string;
+  lifecycle?: LifecycleStateSnapshot;
   status: "accepted";
 }
 
 export interface UserInputAcceptedResponse {
   protocol_version: ProtocolVersion;
+  contract?: ThreadContractSnapshot;
   thread_id: string;
   run_id: string;
   request_id: string;
+  lifecycle?: LifecycleStateSnapshot;
   status: "accepted";
 }
 

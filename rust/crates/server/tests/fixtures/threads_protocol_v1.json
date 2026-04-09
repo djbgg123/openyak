@@ -102,15 +102,33 @@
     },
     "turn_accepted": {
       "protocol_version": "v1",
+      "contract": {
+        "truth_layer": "daemon_local_v1",
+        "operator_plane": "local_loopback_operator_v1",
+        "persistence": "workspace_sqlite_v1",
+        "attach_api": "/v1/threads"
+      },
       "thread_id": "thread-1",
       "run_id": "run-1",
+      "lifecycle": {
+        "status": "accepted"
+      },
       "status": "accepted"
     },
     "user_input_accepted": {
       "protocol_version": "v1",
+      "contract": {
+        "truth_layer": "daemon_local_v1",
+        "operator_plane": "local_loopback_operator_v1",
+        "persistence": "workspace_sqlite_v1",
+        "attach_api": "/v1/threads"
+      },
       "thread_id": "thread-2",
       "run_id": "run-2",
       "request_id": "req-user-input-roundtrip",
+      "lifecycle": {
+        "status": "accepted"
+      },
       "status": "accepted"
     }
   },

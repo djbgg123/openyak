@@ -176,17 +176,21 @@ class ListThreadsResponse:
 @dataclass(frozen=True, slots=True)
 class TurnAcceptedResponse:
     protocol_version: ProtocolVersion
+    contract: ThreadContractSnapshot | None
     thread_id: str
     run_id: str
+    lifecycle: LifecycleStateSnapshot | None
     status: Literal["accepted"]
 
 
 @dataclass(frozen=True, slots=True)
 class UserInputAcceptedResponse:
     protocol_version: ProtocolVersion
+    contract: ThreadContractSnapshot | None
     thread_id: str
     run_id: str
     request_id: str
+    lifecycle: LifecycleStateSnapshot | None
     status: Literal["accepted"]
 
 
@@ -463,8 +467,18 @@ def parse_turn_accepted_response(
     record = _as_mapping(value, context)
     return TurnAcceptedResponse(
         protocol_version=_parse_protocol_version(record, context),
+        contract=(
+            parse_thread_contract_snapshot(record.get("contract"), f"{context}.contract")
+            if record.get("contract") is not None
+            else None
+        ),
         thread_id=_require_str(record, "thread_id", context),
         run_id=_require_str(record, "run_id", context),
+        lifecycle=(
+            parse_lifecycle_state_snapshot(record.get("lifecycle"), f"{context}.lifecycle")
+            if record.get("lifecycle") is not None
+            else None
+        ),
         status=_require_accepted(record, context),
     )
 
@@ -475,9 +489,19 @@ def parse_user_input_accepted_response(
     record = _as_mapping(value, context)
     return UserInputAcceptedResponse(
         protocol_version=_parse_protocol_version(record, context),
+        contract=(
+            parse_thread_contract_snapshot(record.get("contract"), f"{context}.contract")
+            if record.get("contract") is not None
+            else None
+        ),
         thread_id=_require_str(record, "thread_id", context),
         run_id=_require_str(record, "run_id", context),
         request_id=_require_str(record, "request_id", context),
+        lifecycle=(
+            parse_lifecycle_state_snapshot(record.get("lifecycle"), f"{context}.lifecycle")
+            if record.get("lifecycle") is not None
+            else None
+        ),
         status=_require_accepted(record, context),
     )
 
