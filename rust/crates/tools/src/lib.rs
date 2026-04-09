@@ -10330,6 +10330,7 @@ mod tests {
             .find(|entry| entry["kind"] == "thread")
             .expect("thread session present");
         assert_eq!(thread["id"], "thread-7");
+        assert_eq!(thread["contract"]["truth_layer"], "daemon_local_v1");
         assert!(thread["capabilities"]
             .as_array()
             .expect("thread capabilities")
@@ -10362,6 +10363,10 @@ mod tests {
         let thread_get = execute_tool("SessionGet", &json!({"kind": "thread", "id": "thread-7"}))
             .expect("SessionGet thread should succeed");
         let thread_get_value: Value = serde_json::from_str(&thread_get).expect("thread get json");
+        assert_eq!(
+            thread_get_value["contract"]["operator_plane"],
+            "local_loopback_operator_v1"
+        );
         assert_eq!(thread_get_value["config"]["model"], "opus");
         assert_eq!(thread_get_value["message_count"], 2);
 
@@ -10369,6 +10374,7 @@ mod tests {
             .expect("SessionCreate should succeed");
         let created_value: Value = serde_json::from_str(&created).expect("session create json");
         assert_eq!(created_value["id"], "thread-8");
+        assert_eq!(created_value["contract"]["attach_api"], "/v1/threads");
         assert_eq!(created_value["status"], "idle");
 
         let sent = execute_tool(

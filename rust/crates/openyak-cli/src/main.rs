@@ -7797,11 +7797,13 @@ mod tests {
         assert!(inventory.contains("openyak foundations [task|team|cron|lsp|mcp]"));
         assert!(inventory.contains("TaskCreate"));
         assert!(inventory.contains("process_local_v1"));
+        assert!(inventory.contains("process_local_v1 runtime-only truth"));
         assert!(inventory.contains("registry-backed"));
 
         let detail = render_foundations_report(Some("mcp")).expect("mcp detail should render");
         assert!(detail.contains("Family           mcp"));
         assert!(detail.contains("ListMcpServers"));
+        assert!(detail.contains("Operator label   registry-backed MCP visibility"));
         assert!(detail.contains("MB5"));
 
         let error =
