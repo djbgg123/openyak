@@ -891,6 +891,7 @@ async fn list_threads(State(state): State<AppState>) -> Json<ListThreadsResponse
         .map(|record| {
             let snapshot = record.snapshot();
             ThreadSummary {
+                contract: snapshot.contract.clone(),
                 thread_id: snapshot.thread_id,
                 created_at: snapshot.created_at,
                 updated_at: snapshot.updated_at,
@@ -1772,6 +1773,7 @@ fn take_recorded_batches(recorded_batches: &RecordedAssistantBatches) -> Vec<Vec
 fn snapshot_from_inner(inner: &ThreadInner) -> ThreadSnapshot {
     ThreadSnapshot {
         protocol_version: PROTOCOL_VERSION.to_string(),
+        contract: ThreadContractSnapshot::current(),
         thread_id: inner.id.clone(),
         created_at: inner.created_at,
         updated_at: inner.updated_at,
@@ -2211,10 +2213,13 @@ mod tests {
 
         assert_eq!(created.thread_id, "thread-1");
         assert_eq!(created.protocol_version, "v1");
+        assert_eq!(created.contract.truth_layer, THREAD_TRUTH_LAYER);
+        assert_eq!(created.contract.operator_plane, THREAD_OPERATOR_PLANE);
         assert_eq!(created.state.status, "idle");
         assert!(created.session.messages.is_empty());
         assert_eq!(listed.threads.len(), 1);
         assert_eq!(listed.threads[0].thread_id, created.thread_id);
+        assert_eq!(listed.threads[0].contract.truth_layer, THREAD_TRUTH_LAYER);
         assert_eq!(fetched.thread_id, created.thread_id);
         assert_eq!(fetched.config.permission_mode, "danger-full-access");
         assert!(!fetched.config.allowed_tools.is_empty());
@@ -2708,6 +2713,19 @@ mod tests {
             .recovery_note
             .expect("recovery note should be present")
             .contains("restart or shutdown"));
+        let recovery = recovered
+            .state
+            .recovery
+            .expect("recovery guidance should be present");
+        assert_eq!(recovery.failure_kind, "daemon_restart_interrupted_run");
+        assert_eq!(recovery.recovery_kind, "reattach_or_retry");
+        assert!(
+            recovery
+                .recommended_actions
+                .iter()
+                .any(|value| value.contains("reattach")),
+            "{recovery:?}"
+        );
 
         let _ = std::fs::remove_dir_all(workspace);
     }

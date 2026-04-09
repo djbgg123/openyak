@@ -206,6 +206,10 @@ fn write_thread_server_info(
         serde_json::to_string_pretty(&json!({
             "baseUrl": format!("http://{local_addr}"),
             "pid": pid,
+            "truthLayer": server::THREAD_TRUTH_LAYER,
+            "operatorPlane": server::THREAD_OPERATOR_PLANE,
+            "persistence": server::THREAD_PERSISTENCE_LAYER,
+            "attachApi": server::THREAD_ATTACH_API,
         }))?,
     )?;
     Ok(ThreadServerInfoGuard { path, pid })
