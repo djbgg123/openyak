@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::LifecycleContractSnapshot;
+use crate::{LifecycleContractSnapshot, LifecycleStateSnapshot};
 use serde::{Deserialize, Serialize};
 
 const REGISTRY_ORIGIN: &str = crate::PROCESS_LOCAL_TRUTH_LAYER;
@@ -48,6 +48,7 @@ pub struct Team {
     pub name: String,
     pub task_ids: Vec<String>,
     pub status: TeamStatus,
+    pub lifecycle: LifecycleStateSnapshot,
     pub created_at: u64,
     pub updated_at: u64,
     pub last_error: Option<String>,
@@ -103,6 +104,7 @@ impl TeamRegistry {
             name: name.to_owned(),
             task_ids,
             status: TeamStatus::Created,
+            lifecycle: LifecycleStateSnapshot::process_local_team("created"),
             created_at: ts,
             updated_at: ts,
             last_error: None,
@@ -135,9 +137,11 @@ impl TeamRegistry {
         if team.status == TeamStatus::Deleted {
             let error = format!("team already deleted: {team_id}");
             team.last_error = Some(error.clone());
+            team.lifecycle = LifecycleStateSnapshot::process_local_team_error("deleted");
             return Err(error);
         }
         team.status = TeamStatus::Deleted;
+        team.lifecycle = LifecycleStateSnapshot::process_local_team("deleted");
         team.updated_at = now_secs();
         team.last_error = None;
         Ok(team.clone())
@@ -167,6 +171,7 @@ pub struct CronEntry {
     pub prompt: String,
     pub description: Option<String>,
     pub enabled: bool,
+    pub lifecycle: LifecycleStateSnapshot,
     pub created_at: u64,
     pub updated_at: u64,
     pub last_run_at: Option<u64>,
@@ -206,6 +211,7 @@ impl CronRegistry {
             prompt: prompt.to_owned(),
             description: description.map(str::to_owned),
             enabled: true,
+            lifecycle: LifecycleStateSnapshot::process_local_cron_enabled(),
             created_at: ts,
             updated_at: ts,
             last_run_at: None,
@@ -239,10 +245,12 @@ impl CronRegistry {
 
     pub fn delete(&self, cron_id: &str) -> Result<CronEntry, String> {
         let mut inner = self.inner.lock().expect("cron registry lock poisoned");
-        inner
+        let mut entry = inner
             .entries
             .remove(cron_id)
-            .ok_or_else(|| format!("cron not found: {cron_id}"))
+            .ok_or_else(|| format!("cron not found: {cron_id}"))?;
+        entry.lifecycle = LifecycleStateSnapshot::process_local_cron_deleted();
+        Ok(entry)
     }
 
     /// Disable a cron entry without removing it.
@@ -255,9 +263,11 @@ impl CronRegistry {
         if !entry.enabled {
             let error = format!("cron already disabled: {cron_id}");
             entry.last_error = Some(error.clone());
+            entry.lifecycle = LifecycleStateSnapshot::process_local_cron_error("disabled");
             return Err(error);
         }
         entry.enabled = false;
+        entry.lifecycle = LifecycleStateSnapshot::process_local_cron_disabled();
         entry.updated_at = now_secs();
         entry.last_error = None;
         entry.disabled_reason = Some(String::from("disabled_by_operator_request"));
@@ -274,9 +284,11 @@ impl CronRegistry {
         if entry.enabled {
             let error = format!("cron already enabled: {cron_id}");
             entry.last_error = Some(error.clone());
+            entry.lifecycle = LifecycleStateSnapshot::process_local_cron_error("enabled");
             return Err(error);
         }
         entry.enabled = true;
+        entry.lifecycle = LifecycleStateSnapshot::process_local_cron_enabled();
         entry.updated_at = now_secs();
         entry.last_error = None;
         entry.disabled_reason = None;
@@ -293,10 +305,12 @@ impl CronRegistry {
         if !entry.enabled {
             let error = format!("cron is disabled: {cron_id}");
             entry.last_error = Some(error.clone());
+            entry.lifecycle = LifecycleStateSnapshot::process_local_cron_error("disabled");
             return Err(error);
         }
         entry.last_run_at = Some(now_secs());
         entry.run_count += 1;
+        entry.lifecycle = LifecycleStateSnapshot::process_local_cron_enabled();
         entry.updated_at = now_secs();
         entry.last_error = None;
         Ok(())
@@ -327,6 +341,7 @@ mod tests {
         assert_eq!(team.name, "Alpha Squad");
         assert_eq!(team.task_ids.len(), 2);
         assert_eq!(team.status, TeamStatus::Created);
+        assert_eq!(team.lifecycle.status, "created");
 
         let fetched = registry.get(&team.team_id).expect("team should exist");
         assert_eq!(fetched.team_id, team.team_id);
@@ -343,6 +358,7 @@ mod tests {
 
         let deleted = registry.delete(&t1.team_id).expect("delete should succeed");
         assert_eq!(deleted.status, TeamStatus::Deleted);
+        assert_eq!(deleted.lifecycle.status, "deleted");
 
         // Team is still listable (soft delete)
         let still_there = registry.get(&t1.team_id).unwrap();
@@ -386,6 +402,7 @@ mod tests {
         assert!(entry.enabled);
         assert_eq!(entry.run_count, 0);
         assert!(entry.last_run_at.is_none());
+        assert_eq!(entry.lifecycle.status, "enabled");
 
         let fetched = registry.get(&entry.cron_id).expect("cron should exist");
         assert_eq!(fetched.cron_id, entry.cron_id);
@@ -502,6 +519,7 @@ mod tests {
 
         assert_eq!(team.origin, REGISTRY_ORIGIN);
         assert_eq!(team.contract.truth_layer, REGISTRY_ORIGIN);
+        assert_eq!(team.lifecycle.status, "created");
         assert_eq!(
             team.contract.operator_plane,
             crate::LOCAL_RUNTIME_FOUNDATION_OPERATOR_PLANE
@@ -585,6 +603,7 @@ mod tests {
         assert_eq!(entry.last_error, None);
         assert_eq!(entry.disabled_reason, None);
         assert_eq!(entry.origin, REGISTRY_ORIGIN);
+        assert_eq!(entry.lifecycle.status, "enabled");
         assert_eq!(entry.contract.truth_layer, REGISTRY_ORIGIN);
         assert_eq!(
             entry.contract.persistence,
@@ -649,6 +668,7 @@ mod tests {
             fetched.disabled_reason.as_deref(),
             Some("disabled_by_operator_request")
         );
+        assert_eq!(fetched.lifecycle.status, "disabled");
     }
 
     #[test]
@@ -667,6 +687,10 @@ mod tests {
 
         let fetched = registry.get(&entry.cron_id).expect("entry should exist");
         assert_eq!(fetched.last_error.as_deref(), Some(error.as_str()));
+        assert_eq!(
+            fetched.lifecycle.failure_kind.as_deref(),
+            Some("process_local_cron_conflict")
+        );
     }
 
     #[test]
@@ -686,6 +710,7 @@ mod tests {
             .expect("entry should still exist");
         assert!(fetched.enabled);
         assert!(fetched.updated_at >= entry.updated_at);
+        assert_eq!(fetched.lifecycle.status, "enabled");
     }
 
     #[test]
@@ -697,6 +722,11 @@ mod tests {
             .enable(&entry.cron_id)
             .expect_err("enabling an already enabled cron should fail");
         assert_eq!(error, format!("cron already enabled: {}", entry.cron_id));
+        let fetched = registry.get(&entry.cron_id).expect("entry should exist");
+        assert_eq!(
+            fetched.lifecycle.failure_kind.as_deref(),
+            Some("process_local_cron_conflict")
+        );
     }
 
     #[test]
@@ -715,6 +745,10 @@ mod tests {
 
         let fetched = registry.get(&entry.cron_id).expect("entry should exist");
         assert_eq!(fetched.last_error.as_deref(), Some(error.as_str()));
+        assert_eq!(
+            fetched.lifecycle.failure_kind.as_deref(),
+            Some("process_local_cron_conflict")
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::LifecycleContractSnapshot;
+use crate::{LifecycleContractSnapshot, LifecycleStateSnapshot};
 use serde::{Deserialize, Serialize};
 
 const TASK_REGISTRY_ORIGIN: &str = crate::PROCESS_LOCAL_TRUTH_LAYER;
@@ -54,6 +54,7 @@ pub struct Task {
     pub prompt: String,
     pub description: Option<String>,
     pub status: TaskStatus,
+    pub lifecycle: LifecycleStateSnapshot,
     pub created_at: u64,
     pub updated_at: u64,
     pub last_error: Option<String>,
@@ -113,6 +114,7 @@ impl TaskRegistry {
             prompt: prompt.to_owned(),
             description: description.map(str::to_owned),
             status: TaskStatus::Created,
+            lifecycle: LifecycleStateSnapshot::process_local_task("created"),
             created_at: ts,
             updated_at: ts,
             last_error: None,
@@ -158,12 +160,15 @@ impl TaskRegistry {
                     task.status
                 );
                 task.last_error = Some(error.clone());
+                task.lifecycle =
+                    LifecycleStateSnapshot::process_local_task_error(&task.status.to_string());
                 return Err(error);
             }
             _ => {}
         }
 
         task.status = TaskStatus::Stopped;
+        task.lifecycle = LifecycleStateSnapshot::process_local_task("stopped");
         task.updated_at = now_secs();
         task.last_error = None;
         Ok(task.clone())
@@ -181,6 +186,7 @@ impl TaskRegistry {
             content: message.to_owned(),
             timestamp: now_secs(),
         });
+        task.lifecycle = LifecycleStateSnapshot::process_local_task(&task.status.to_string());
         task.updated_at = now_secs();
         task.last_error = None;
         Ok(task.clone())
@@ -202,6 +208,7 @@ impl TaskRegistry {
             .get_mut(task_id)
             .ok_or_else(|| format!("task not found: {task_id}"))?;
         task.output.push_str(output);
+        task.lifecycle = LifecycleStateSnapshot::process_local_task(&task.status.to_string());
         task.updated_at = now_secs();
         task.last_error = None;
         Ok(())
@@ -214,6 +221,11 @@ impl TaskRegistry {
             .get_mut(task_id)
             .ok_or_else(|| format!("task not found: {task_id}"))?;
         task.status = status;
+        task.lifecycle = if status == TaskStatus::Failed {
+            LifecycleStateSnapshot::process_local_task_failure()
+        } else {
+            LifecycleStateSnapshot::process_local_task(&status.to_string())
+        };
         task.updated_at = now_secs();
         if status != TaskStatus::Failed {
             task.last_error = None;
@@ -228,6 +240,7 @@ impl TaskRegistry {
             .get_mut(task_id)
             .ok_or_else(|| format!("task not found: {task_id}"))?;
         task.status = TaskStatus::Failed;
+        task.lifecycle = LifecycleStateSnapshot::process_local_task_failure();
         task.updated_at = now_secs();
         task.last_error = Some(error.to_owned());
         Ok(task.clone())
@@ -242,13 +255,17 @@ impl TaskRegistry {
         if let Some(existing_team_id) = task.team_id.as_deref() {
             if existing_team_id == team_id {
                 task.last_error = None;
+                task.lifecycle = LifecycleStateSnapshot::process_local_task(&task.status.to_string());
                 return Ok(());
             }
             let error = format!("task {task_id} is already assigned to team {existing_team_id}");
             task.last_error = Some(error.clone());
+            task.lifecycle =
+                LifecycleStateSnapshot::process_local_task_error(&task.status.to_string());
             return Err(error);
         }
         task.team_id = Some(team_id.to_owned());
+        task.lifecycle = LifecycleStateSnapshot::process_local_task(&task.status.to_string());
         task.updated_at = now_secs();
         task.last_error = None;
         Ok(())
@@ -263,6 +280,7 @@ impl TaskRegistry {
         match task.team_id.as_deref() {
             Some(existing_team_id) if existing_team_id == team_id => {
                 task.team_id = None;
+                task.lifecycle = LifecycleStateSnapshot::process_local_task(&task.status.to_string());
                 task.updated_at = now_secs();
                 task.last_error = None;
                 Ok(())
@@ -271,10 +289,13 @@ impl TaskRegistry {
                 let error =
                     format!("task {task_id} is assigned to team {existing_team_id}, not {team_id}");
                 task.last_error = Some(error.clone());
+                task.lifecycle =
+                    LifecycleStateSnapshot::process_local_task_error(&task.status.to_string());
                 Err(error)
             }
             None => {
                 task.last_error = None;
+                task.lifecycle = LifecycleStateSnapshot::process_local_task(&task.status.to_string());
                 Ok(())
             }
         }
@@ -306,6 +327,7 @@ mod tests {
         let registry = TaskRegistry::new();
         let task = registry.create("Do something", Some("A test task"));
         assert_eq!(task.status, TaskStatus::Created);
+        assert_eq!(task.lifecycle.status, "created");
         assert_eq!(task.prompt, "Do something");
         assert_eq!(task.description.as_deref(), Some("A test task"));
 
@@ -343,6 +365,7 @@ mod tests {
 
         let stopped = registry.stop(&task.task_id).expect("stop should succeed");
         assert_eq!(stopped.status, TaskStatus::Stopped);
+        assert_eq!(stopped.lifecycle.status, "stopped");
 
         // Stopping again should fail
         let result = registry.stop(&task.task_id);
@@ -451,6 +474,12 @@ mod tests {
         let error = result.expect_err("completed task should be rejected");
         assert!(error.contains("already in terminal state"));
         assert!(error.contains("completed"));
+        let fetched = registry.get(&task.task_id).expect("task should exist");
+        assert_eq!(fetched.lifecycle.status, "completed");
+        assert_eq!(
+            fetched.lifecycle.failure_kind.as_deref(),
+            Some("process_local_task_conflict")
+        );
     }
 
     #[test]
@@ -469,6 +498,12 @@ mod tests {
         let error = result.expect_err("failed task should be rejected");
         assert!(error.contains("already in terminal state"));
         assert!(error.contains("failed"));
+        let fetched = registry.get(&task.task_id).expect("task should exist");
+        assert_eq!(fetched.lifecycle.status, "failed");
+        assert_eq!(
+            fetched.lifecycle.failure_kind.as_deref(),
+            Some("process_local_task_conflict")
+        );
     }
 
     #[test]
@@ -515,6 +550,8 @@ mod tests {
         assert_eq!(task.team_id, None);
         assert_eq!(task.origin, TASK_REGISTRY_ORIGIN);
         assert_eq!(task.contract.truth_layer, TASK_REGISTRY_ORIGIN);
+        assert_eq!(task.lifecycle.status, "created");
+        assert_eq!(task.lifecycle.failure_kind, None);
         assert_eq!(
             task.contract.operator_plane,
             crate::LOCAL_RUNTIME_FOUNDATION_OPERATOR_PLANE
@@ -575,6 +612,11 @@ mod tests {
 
         let fetched = registry.get(&task.task_id).expect("task should exist");
         assert_eq!(fetched.last_error.as_deref(), Some(error.as_str()));
+        assert_eq!(fetched.lifecycle.status, "created");
+        assert_eq!(
+            fetched.lifecycle.failure_kind.as_deref(),
+            Some("process_local_task_conflict")
+        );
     }
 
     #[test]
@@ -620,6 +662,11 @@ mod tests {
 
         assert_eq!(failed.status, TaskStatus::Failed);
         assert_eq!(failed.last_error.as_deref(), Some("worker crashed"));
+        assert_eq!(failed.lifecycle.status, "failed");
+        assert_eq!(
+            failed.lifecycle.failure_kind.as_deref(),
+            Some("process_local_task_failed")
+        );
     }
 
     #[test]
