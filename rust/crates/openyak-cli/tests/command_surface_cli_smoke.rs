@@ -239,6 +239,27 @@ fn daemon_truth_docs_keep_threads_and_foundations_split() {
 }
 
 #[test]
+fn attach_first_sdk_docs_stay_narrow_about_daemon_operator_plane() {
+    let repo_root = repo_root();
+
+    for relative_path in ["sdk/python/README.md", "sdk/typescript/README.md"] {
+        let readme =
+            fs::read_to_string(repo_root.join(relative_path)).expect("SDK README should exist");
+        for marker in [
+            "legacy `/sessions` compatibility routes",
+            "public contract remains `/v1/threads` only",
+            "attach-first",
+            "not yet a client for daemon start/stop/status/recover operator APIs",
+        ] {
+            assert!(
+                readme.contains(marker),
+                "{relative_path} missing {marker}: {readme}"
+            );
+        }
+    }
+}
+
+#[test]
 fn openyak_skills_lifecycle_uses_packaged_registry_with_temp_config_home() {
     let _guard = env_lock();
     let sandbox = CliSandbox::new("openyak-skills-lifecycle");
