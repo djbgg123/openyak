@@ -182,7 +182,7 @@ fn openyak_direct_commands_match_verified_smoke_paths() {
     assert!(foundations.contains("TaskCreate"), "{foundations}");
     assert!(foundations.contains("process_local_v1"), "{foundations}");
     assert!(
-        foundations.contains("without implying durable registries"),
+        foundations.contains("it does not create a new control plane"),
         "{foundations}"
     );
 
@@ -201,10 +201,11 @@ fn openyak_direct_commands_match_verified_smoke_paths() {
 #[test]
 fn daemon_truth_docs_keep_threads_and_foundations_split() {
     let repo_root = repo_root();
-    let readme = fs::read_to_string(repo_root.join("README.md")).expect("README should exist");
-    let contributing = fs::read_to_string(repo_root.join("CONTRIBUTING.md"))
-        .expect("CONTRIBUTING should exist");
-    let parity_doc = fs::read_to_string(repo_root.join("docs/parity-foundation-registries.md"))
+    let rust_root = repo_root.join("rust");
+    let readme = fs::read_to_string(rust_root.join("README.md")).expect("README should exist");
+    let contributing =
+        fs::read_to_string(rust_root.join("CONTRIBUTING.md")).expect("CONTRIBUTING should exist");
+    let parity_doc = fs::read_to_string(rust_root.join("docs/parity-foundation-registries.md"))
         .expect("parity foundation doc should exist");
 
     for marker in [
