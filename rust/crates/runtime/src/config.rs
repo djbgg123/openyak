@@ -1542,7 +1542,9 @@ mod tests {
     }
 
     fn normalized_path(path: &std::path::Path) -> String {
-        let raw = path.to_string_lossy();
+        let resolved = super::canonicalize_allow_missing(path, "test path normalization")
+            .unwrap_or_else(|_| path.to_path_buf());
+        let raw = resolved.to_string_lossy();
         raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
     }
 

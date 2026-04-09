@@ -124,36 +124,77 @@ impl PermissionEnforcer {
 
 /// Workspace boundary check that keeps canonical root semantics for missing targets.
 fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
-    let workspace_root = Path::new(workspace_root);
-    let resolved_root = workspace_root
+    let raw_workspace_root = Path::new(workspace_root);
+    let resolved_root = raw_workspace_root
         .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
+        .unwrap_or_else(|_| raw_workspace_root.to_path_buf());
     let canonical_root = normalize_comparable_path(&resolved_root);
-    let candidate = normalize_comparable_path(&resolve_write_target_path(path, &resolved_root));
+    let candidate = normalize_comparable_path(&resolve_write_target_path(
+        path,
+        raw_workspace_root,
+        &resolved_root,
+    ));
     candidate == canonical_root || candidate.starts_with(&canonical_root)
 }
 
-fn resolve_write_target_path(path: &str, workspace_root: &Path) -> PathBuf {
+fn resolve_write_target_path(
+    path: &str,
+    raw_workspace_root: &Path,
+    resolved_workspace_root: &Path,
+) -> PathBuf {
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
-        workspace_root.join(path)
+        resolved_workspace_root.join(path)
     };
 
     if let Ok(canonical) = candidate.canonicalize() {
         return canonical;
     }
 
+    if let Some(rewritten) =
+        rewrite_workspace_alias_path(&candidate, raw_workspace_root, resolved_workspace_root)
+    {
+        return rewritten;
+    }
+
     if let Some(parent) = candidate.parent() {
-        let canonical_parent = parent
-            .canonicalize()
-            .unwrap_or_else(|_| parent.to_path_buf());
+        let canonical_parent = parent.canonicalize().ok().or_else(|| {
+            rewrite_workspace_alias_path(parent, raw_workspace_root, resolved_workspace_root)
+        });
         if let Some(name) = candidate.file_name() {
-            return canonical_parent.join(name);
+            return canonical_parent
+                .unwrap_or_else(|| parent.to_path_buf())
+                .join(name);
         }
     }
 
     candidate
+}
+
+fn rewrite_workspace_alias_path(
+    candidate: &Path,
+    raw_workspace_root: &Path,
+    resolved_workspace_root: &Path,
+) -> Option<PathBuf> {
+    relative_path_within_root(candidate, raw_workspace_root)
+        .or_else(|| relative_path_within_root(candidate, resolved_workspace_root))
+        .map(|relative| resolved_workspace_root.join(relative))
+}
+
+fn relative_path_within_root(candidate: &Path, root: &Path) -> Option<PathBuf> {
+    let relative = candidate.strip_prefix(root).ok()?;
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    Some(relative.to_path_buf())
 }
 
 #[cfg(windows)]
@@ -527,6 +568,29 @@ mod tests {
 
         let result =
             enforcer.check_file_write("generated/output.txt", alias.to_string_lossy().as_ref());
+
+        remove_directory_alias(&alias);
+        let _ = fs::remove_dir_all(&alias_parent);
+        let _ = fs::remove_dir_all(&workspace);
+        assert_eq!(result, EnforcementResult::Allowed);
+    }
+
+    #[test]
+    fn workspace_write_allows_absolute_missing_path_when_workspace_root_is_an_alias() {
+        let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
+        let workspace = temp_workspace("alias-target-absolute");
+        let alias_parent = temp_workspace("alias-parent-absolute");
+        let alias = alias_parent.join("workspace-alias");
+
+        create_directory_alias(&workspace, &alias);
+
+        let result = enforcer.check_file_write(
+            alias
+                .join("generated/output.txt")
+                .to_string_lossy()
+                .as_ref(),
+            alias.to_string_lossy().as_ref(),
+        );
 
         remove_directory_alias(&alias);
         let _ = fs::remove_dir_all(&alias_parent);
