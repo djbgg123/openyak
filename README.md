@@ -13,6 +13,7 @@
 - 主产品实现面是 `rust/`，可直接构建、运行并打包 `openyak` CLI。
 - 当前主线已接通 REPL、单次 prompt、skills/agents、`openyak doctor`、`openyak foundations`、`openyak onboard`、`openyak package-release` 和 `openyak server`。
 - `openyak server` 是 local-only 的 thread/session HTTP/SSE server，当前公共协议边界锁定在 `/v1/threads`；它不是 hosted control plane，也不是 codex-style full app-server。
+- daemon/control-plane roadmap 当前仍处于 local-first 演进阶段：现有 `/v1/threads` 服务已经把线程状态持久化到工作区 `.openyak/state.sqlite3`，并会在 server 重启后把中断中的线程恢复成带 `recovery_note` 的 `interrupted` 快照，但这还不是独立的 daemon truth layer，也还没有 start/stop/status/recover 一整套 operator plane。
 - `sdk/python` 和 `sdk/typescript` 是 attach-first、本地-only 的 alpha SDK，直接连接当前 `/v1/threads` 协议。
 - 最近一次 fresh release-binary 命令面巡检完成于 `2026-04-09`，共覆盖 59 个真实 release-binary help/命令/子命令步骤，包含顶层 help、直接命令、skills lifecycle、direct slash CLI、resume-safe slash command 链路，以及环境依赖路径的受控失败。
 
@@ -111,6 +112,7 @@ cd ../..
 - 交互式 REPL、单次 prompt、会话恢复、配置加载、插件管理、skills/agents 枚举都已接通。
 - MCP、OAuth 与 Git/GitHub 工作流已经具备主实现；LSP/MCP 当前以 registry-backed operator surface 为主。
 - `openyak server` 已作为本地 HTTP/SSE thread server 对外 surfaced，暴露 `/v1/threads` 与 legacy `/sessions` compatibility routes，把线程状态持久化到工作区 `.openyak/state.sqlite3`，并将 bind 范围限制在 loopback 地址。
+- 当前 thread persistence / restart-recovery 只覆盖 thread 级 attach-first 状态：当 server 在 run 中途重启时，线程会恢复为 `interrupted` 并带 `recovery_note`；这为后续 daemon/control-plane 路线提供恢复原语，但还没有把 Task / Team / Cron 等 foundation slices 提升成 daemon-backed orchestration truth。
 - 同一工作区存在重叠生命周期的多个 `openyak server` 实例时，本地 thread discovery 文件会按写入 `pid` 做 owner-safe 清理；较早退出的实例不会再误删较新实例的发现入口。
 - thread/session 工具现在会同时尝试当前工作区路径和 canonical 工作区路径下的 thread discovery 文件；通过 symlink、junction 或其他等价路径进入同一工作区时，仍能发现正在运行的本地 `openyak server`。
 - 已新增 attach-first、本地-only 的 SDK alpha：
@@ -448,6 +450,7 @@ pnpm build
 - `openyak doctor` 当前只做本地只读预检，不提供自动修复、配置迁移或远程服务探测。
 - Task/Team/Cron registry 的 V1 contract 仍然只提供进程内临时状态，不承诺跨进程持久化、恢复、租约或共享服务语义。
 - `openyak server` 当前是 bind 范围限制在 loopback 地址的本地 thread/session server，不是 codex-style full app-server 或远程控制面。
+- daemon/control-plane 路线仍未进入独立 operator plane 阶段：当前没有 daemon service install/start/stop/status/recover 的稳定 public surface，也没有远程 operator access。
 - 当前补齐的 LSP/MCP 仍以 operator-facing bridge 为主；完整独立 LSP main entry 仍未作为稳定用户入口能力发货。
 - `0.x` 阶段的命令面和交互细节仍可能继续演进。
 

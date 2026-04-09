@@ -144,8 +144,11 @@ const snapshot = await thread.read();
 - `thread.resync_required` becomes `OpenyakResyncRequiredError` in `runStreamed()`.
 - `run()` may reconcile from `thread.read()` after a dropped stream and marks the result with `recoveredFromSnapshot: true`.
 - If the local server fails before runtime/provider bootstrap completes, the latest thread snapshot still preserves the submitted turn or user-input response instead of silently dropping it.
+- If the server restarts mid-run, the latest snapshot may come back as `status="interrupted"` with a `recovery_note`; the SDK exposes that persisted truth, but it does not invent daemon-side replay or recovery actions.
 - That reconciliation is intentionally best-effort for local attach-first, single-writer usage; if the latest snapshot shows a different active `run_id`, `run()` throws `OpenyakReconnectRequiredError` instead of pretending replay exists.
 - `runStreamed()` does **not** pretend replay exists; if live streaming fidelity is lost, it throws.
+
+So the current TypeScript SDK is compatible with the daemon/control-plane roadmap only at the `/v1/threads` attach-first boundary: it can observe persisted interruption state, but it is not yet a client for daemon start/stop/status/recover operator APIs.
 
 ## Scripts
 
