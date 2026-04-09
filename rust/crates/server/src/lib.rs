@@ -17,9 +17,9 @@ use axum::{Json, Router};
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage,
     ConversationRuntime, MessageRole, PendingUserInputRequest, PermissionEnforcer, PermissionMode,
-    PermissionPolicy, ResolvedPermissionMode, RuntimeError, Session as RuntimeSession, ToolError,
-    ToolExecutor, TurnSummary, UserInputOutcome, UserInputPrompter, UserInputRequest,
-    UserInputResponse,
+    PermissionPolicy, RecoveryGuidanceSnapshot, ResolvedPermissionMode, RuntimeError,
+    Session as RuntimeSession, ThreadContractSnapshot, ToolError, ToolExecutor, TurnSummary,
+    UserInputOutcome, UserInputPrompter, UserInputRequest, UserInputResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -39,36 +39,10 @@ type RecordedAssistantBatches = Arc<Mutex<Vec<Vec<AssistantEvent>>>>;
 const BROADCAST_CAPACITY: usize = 128;
 const DEFAULT_MODEL_ALIAS: &str = "opus";
 const PROTOCOL_VERSION: &str = "v1";
-pub const THREAD_TRUTH_LAYER: &str = "daemon_local_v1";
-pub const THREAD_OPERATOR_PLANE: &str = "local_loopback_operator_v1";
-pub const THREAD_PERSISTENCE_LAYER: &str = "workspace_sqlite_v1";
-pub const THREAD_ATTACH_API: &str = "/v1/threads";
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ThreadContractSnapshot {
-    pub truth_layer: String,
-    pub operator_plane: String,
-    pub persistence: String,
-    pub attach_api: String,
-}
-
-impl ThreadContractSnapshot {
-    fn current() -> Self {
-        Self {
-            truth_layer: THREAD_TRUTH_LAYER.to_string(),
-            operator_plane: THREAD_OPERATOR_PLANE.to_string(),
-            persistence: THREAD_PERSISTENCE_LAYER.to_string(),
-            attach_api: THREAD_ATTACH_API.to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RecoveryGuidanceSnapshot {
-    pub failure_kind: String,
-    pub recovery_kind: String,
-    pub recommended_actions: Vec<String>,
-}
+pub const THREAD_TRUTH_LAYER: &str = runtime::DAEMON_LOCAL_TRUTH_LAYER;
+pub const THREAD_OPERATOR_PLANE: &str = runtime::LOCAL_LOOPBACK_OPERATOR_PLANE;
+pub const THREAD_PERSISTENCE_LAYER: &str = runtime::WORKSPACE_SQLITE_PERSISTENCE_LAYER;
+pub const THREAD_ATTACH_API: &str = runtime::THREAD_ATTACH_API;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1559,40 +1533,44 @@ fn decode_pending_request_payload(
 }
 
 fn recovery_guidance_for_note(note: &str) -> RecoveryGuidanceSnapshot {
-    let (failure_kind, recovery_kind, recommended_actions): (&str, &str, &[&str]) =
-        if note.contains("restart or shutdown") {
-            (
-                "daemon_restart_interrupted_run",
-                "reattach_or_retry",
-                &[
-                    "reattach to the thread and inspect the latest snapshot",
-                    "retry the interrupted work from the operator plane when safe",
-                ],
-            )
-        } else if note.contains("pending user input") {
-            (
-                "pending_user_input_state_mismatch",
-                "refresh_and_resubmit_user_input",
-                &[
-                    "refresh the thread snapshot before resubmitting user input",
-                    "resume only after confirming the pending request matches the latest durable state",
-                ],
-            )
-        } else {
-            (
-                "interrupted_requires_recovery",
-                "manual_operator_recovery",
-                &[
-                    "inspect the recovery note and latest thread snapshot",
-                    "choose retry, resume, or abandon from the operator plane",
-                ],
-            )
-        };
+    let (failure_kind, recovery_kind, recommended_actions): (&str, &str, &[&str]) = if note
+        .contains("restart or shutdown")
+    {
+        (
+            "daemon_restart_interrupted_run",
+            "reattach_or_retry",
+            &[
+                "reattach to the thread and inspect the latest snapshot",
+                "retry the interrupted work from the operator plane when safe",
+            ],
+        )
+    } else if note.contains("pending user input") {
+        (
+            "pending_user_input_state_mismatch",
+            "refresh_and_resubmit_user_input",
+            &[
+                "refresh the thread snapshot before resubmitting user input",
+                "resume only after confirming the pending request matches the latest durable state",
+            ],
+        )
+    } else {
+        (
+            "interrupted_requires_recovery",
+            "manual_operator_recovery",
+            &[
+                "inspect the recovery note and latest thread snapshot",
+                "choose retry, resume, or abandon from the operator plane",
+            ],
+        )
+    };
 
     RecoveryGuidanceSnapshot {
         failure_kind: failure_kind.to_string(),
         recovery_kind: recovery_kind.to_string(),
-        recommended_actions: recommended_actions.iter().map(|value| (*value).to_string()).collect(),
+        recommended_actions: recommended_actions
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
     }
 }
 

@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::LifecycleContractSnapshot;
 use serde::{Deserialize, Serialize};
 
-const TASK_REGISTRY_ORIGIN: &str = "process_local_v1";
+const TASK_REGISTRY_ORIGIN: &str = crate::PROCESS_LOCAL_TRUTH_LAYER;
 
 fn task_capabilities() -> Vec<String> {
     [
@@ -57,6 +58,7 @@ pub struct Task {
     pub updated_at: u64,
     pub last_error: Option<String>,
     pub origin: String,
+    pub contract: LifecycleContractSnapshot,
     pub capabilities: Vec<String>,
     pub messages: Vec<TaskMessage>,
     pub output: String,
@@ -115,6 +117,7 @@ impl TaskRegistry {
             updated_at: ts,
             last_error: None,
             origin: TASK_REGISTRY_ORIGIN.to_owned(),
+            contract: LifecycleContractSnapshot::process_local_foundation(),
             capabilities: task_capabilities(),
             messages: Vec::new(),
             output: String::new(),
@@ -511,6 +514,15 @@ mod tests {
         assert!(task.output.is_empty());
         assert_eq!(task.team_id, None);
         assert_eq!(task.origin, TASK_REGISTRY_ORIGIN);
+        assert_eq!(task.contract.truth_layer, TASK_REGISTRY_ORIGIN);
+        assert_eq!(
+            task.contract.operator_plane,
+            crate::LOCAL_RUNTIME_FOUNDATION_OPERATOR_PLANE
+        );
+        assert_eq!(
+            task.contract.persistence,
+            crate::PROCESS_MEMORY_PERSISTENCE_LAYER
+        );
         assert_eq!(task.last_error, None);
         assert!(task.capabilities.contains(&"stop".to_string()));
     }
