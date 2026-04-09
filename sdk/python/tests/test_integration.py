@@ -11,7 +11,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import cast
 
-from openyak_sdk import AsyncOpenyakClient, OpenyakClient
+import pytest
+
+from openyak_sdk import AsyncOpenyakClient, OpenyakClient, OpenyakReconnectRequiredError
 from openyak_sdk._models import RunFailedEvent
 
 from .helpers.harness import (
@@ -240,6 +242,46 @@ def test_buffered_sync_run_recovers_interrupted_snapshot_truth_after_server_rest
             assert (
                 result.snapshot.state.recovery.recovery_kind == "reattach_or_retry"
             )
+    finally:
+        server.close()
+        mock.close()
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_streamed_sync_run_surfaces_reconnect_required_after_server_restart() -> None:
+    mock = start_mock_anthropic_service()
+    workspace = tempfile.mkdtemp(prefix="openyak-python-sdk-stream-restart-")
+    env = {
+        **os.environ,
+        "ANTHROPIC_API_KEY": "test-sdk-key",
+        "ANTHROPIC_BASE_URL": mock.base_url,
+    }
+    server = start_openyak_server_in(workspace, env, cleanup_workspace=False)
+    base_url = server.base_url
+    bind = urlparse(base_url).netloc
+
+    try:
+        with OpenyakClient(base_url=base_url, timeout_s=30.0) as client:
+            thread = client.create_thread(
+                model="claude-sonnet-4-6",
+                allowed_tools=["read_file"],
+            )
+            with thread.run_streamed(
+                "PARITY_SCENARIO:delayed_request_user_input_roundtrip"
+            ) as streamed:
+                first_event = next(streamed.events)
+                assert first_event.type == "run.started"
+
+                server.close()
+                server = start_openyak_server_in(
+                    workspace,
+                    env,
+                    bind=bind,
+                    cleanup_workspace=False,
+                )
+
+                with pytest.raises(OpenyakReconnectRequiredError):
+                    list(streamed.events)
     finally:
         server.close()
         mock.close()
@@ -490,6 +532,50 @@ def test_buffered_async_run_recovers_interrupted_snapshot_truth_after_server_res
                 assert (
                     result.snapshot.state.recovery.recovery_kind == "reattach_or_retry"
                 )
+        finally:
+            server.close()
+            mock.close()
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    asyncio.run(case())
+
+
+def test_streamed_async_run_surfaces_reconnect_required_after_server_restart() -> None:
+    async def case() -> None:
+        mock = start_mock_anthropic_service()
+        workspace = tempfile.mkdtemp(prefix="openyak-python-sdk-async-stream-restart-")
+        env = {
+            **os.environ,
+            "ANTHROPIC_API_KEY": "test-sdk-key",
+            "ANTHROPIC_BASE_URL": mock.base_url,
+        }
+        server = start_openyak_server_in(workspace, env, cleanup_workspace=False)
+        base_url = server.base_url
+        bind = urlparse(base_url).netloc
+
+        try:
+            async with AsyncOpenyakClient(base_url=base_url, timeout_s=30.0) as client:
+                thread = await client.create_thread(
+                    model="claude-sonnet-4-6",
+                    allowed_tools=["read_file"],
+                )
+                async with await thread.run_streamed(
+                    "PARITY_SCENARIO:delayed_request_user_input_roundtrip"
+                ) as streamed:
+                    first_event = await anext(streamed.events)
+                    assert first_event.type == "run.started"
+
+                    server.close()
+                    server = start_openyak_server_in(
+                        workspace,
+                        env,
+                        bind=bind,
+                        cleanup_workspace=False,
+                    )
+
+                    with pytest.raises(OpenyakReconnectRequiredError):
+                        async for _event in streamed.events:
+                            pass
         finally:
             server.close()
             mock.close()

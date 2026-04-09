@@ -67,13 +67,20 @@ export async function startOpenyakServerIn(
     cleanupWorkspace?: boolean;
   },
 ): Promise<OpenyakServerHarness> {
+  const processOptions: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    bind?: string;
+  } = {
+    cwd: workspace,
+    env,
+  };
+  if (options?.bind) {
+    processOptions.bind = options.bind;
+  }
   const proc = await startProcess(
     resolveOpenyakServerCommand(),
-    {
-      cwd: workspace,
-      env,
-      bind: options?.bind,
-    },
+    processOptions,
     /^Local thread server listening on (http:\/\/.+)$/,
   );
   const baseUrl = proc.match[1];

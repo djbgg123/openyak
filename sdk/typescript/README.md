@@ -157,6 +157,7 @@ const snapshot = await thread.read();
 - The same snapshot contract also exposes `operator_plane`, `persistence`, and structured recovery fields (`failure_kind`, `recovery_kind`, `recommended_actions`) so attach-first clients can render operator guidance without implying broader daemon controls.
 - That reconciliation is intentionally best-effort for local attach-first, single-writer usage; if the latest snapshot shows a different active `run_id`, `run()` throws `OpenyakReconnectRequiredError` instead of pretending replay exists.
 - `runStreamed()` does **not** pretend replay exists; if live streaming fidelity is lost, it throws.
+- 真实本地 server 重启导致的 streamed 断流现在也有 live integration 锁定，并会按当前 attach-first 合约抛出 reconnect-required 语义，而不是假装 replay。
 
 So the current TypeScript SDK is compatible with the daemon/control-plane roadmap only at the `/v1/threads` attach-first boundary: it can observe persisted interruption state plus the `daemon_local_v1` thread truth label, but it is not yet a client for daemon start/stop/status/recover operator APIs.
 

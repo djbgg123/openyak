@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { OpenyakClient } from "../src/index.js";
+import { OpenyakClient, OpenyakReconnectRequiredError } from "../src/index.js";
 import {
   startMockAnthropicService,
   startOpenyakServer,
@@ -268,6 +268,62 @@ test("buffered run recovers interrupted snapshot truth after local server restar
     assert.equal(
       interrupted.snapshot?.state.recovery?.recovery_kind,
       "reattach_or_retry",
+    );
+  } finally {
+    await server.close();
+    await mock.close();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("runStreamed surfaces reconnect-required truth after local server restart", async () => {
+  const mock = await startMockAnthropicService();
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "openyak-sdk-stream-restart-"));
+  const env = {
+    ...process.env,
+    ANTHROPIC_API_KEY: "test-sdk-key",
+    ANTHROPIC_BASE_URL: mock.baseUrl,
+  };
+  let server = await startOpenyakServerIn(workspace, env, { cleanupWorkspace: false });
+  const bind = new URL(server.baseUrl).host;
+
+  try {
+    const client = new OpenyakClient({
+      baseUrl: server.baseUrl,
+      timeoutMs: 30_000,
+    });
+
+    const thread = await client.createThread({
+      model: "claude-sonnet-4-6",
+      allowedTools: ["read_file"],
+    });
+
+    const streamed = await thread.runStreamed(
+      "PARITY_SCENARIO:delayed_request_user_input_roundtrip",
+    );
+    const iterator = streamed.events[Symbol.asyncIterator]();
+    const first = await iterator.next();
+    assert.equal(first.value?.type, "run.started");
+
+    await server.close();
+    server = await startOpenyakServerIn(workspace, env, {
+      bind,
+      cleanupWorkspace: false,
+    });
+
+    await assert.rejects(
+      (async () => {
+        while (true) {
+          const next = await iterator.next();
+          if (next.done) {
+            break;
+          }
+        }
+      })(),
+      (error: unknown) =>
+        error instanceof OpenyakReconnectRequiredError &&
+        error.threadId === thread.threadId &&
+        error.runId === "run-1",
     );
   } finally {
     await server.close();

@@ -311,18 +311,21 @@ class Thread:
         run_id: str,
     ) -> Iterator[RunEvent]:
         try:
-            for event in iterator:
-                if event.type == "thread.resync_required":
-                    raise OpenyakResyncRequiredError(cast(ThreadResyncRequiredEvent, event))
-                if event.type == "thread.snapshot":
-                    self._last_snapshot = cast(ThreadSnapshotEvent, event).payload
-                    continue
-                if event.run_id != run_id:
-                    continue
-                run_event = cast(RunEvent, event)
-                yield run_event
-                if is_terminal_run_event(run_event):
-                    return
+            try:
+                for event in iterator:
+                    if event.type == "thread.resync_required":
+                        raise OpenyakResyncRequiredError(cast(ThreadResyncRequiredEvent, event))
+                    if event.type == "thread.snapshot":
+                        self._last_snapshot = cast(ThreadSnapshotEvent, event).payload
+                        continue
+                    if event.run_id != run_id:
+                        continue
+                    run_event = cast(RunEvent, event)
+                    yield run_event
+                    if is_terminal_run_event(run_event):
+                        return
+            except httpx.HTTPError as error:
+                raise OpenyakReconnectRequiredError(self.thread_id, run_id) from error
         finally:
             response.close()
         raise OpenyakReconnectRequiredError(self.thread_id, run_id)
@@ -727,18 +730,21 @@ class AsyncThread:
         run_id: str,
     ) -> AsyncIterator[RunEvent]:
         try:
-            async for event in iterator:
-                if event.type == "thread.resync_required":
-                    raise OpenyakResyncRequiredError(cast(ThreadResyncRequiredEvent, event))
-                if event.type == "thread.snapshot":
-                    self._last_snapshot = cast(ThreadSnapshotEvent, event).payload
-                    continue
-                if event.run_id != run_id:
-                    continue
-                run_event = cast(RunEvent, event)
-                yield run_event
-                if is_terminal_run_event(run_event):
-                    return
+            try:
+                async for event in iterator:
+                    if event.type == "thread.resync_required":
+                        raise OpenyakResyncRequiredError(cast(ThreadResyncRequiredEvent, event))
+                    if event.type == "thread.snapshot":
+                        self._last_snapshot = cast(ThreadSnapshotEvent, event).payload
+                        continue
+                    if event.run_id != run_id:
+                        continue
+                    run_event = cast(RunEvent, event)
+                    yield run_event
+                    if is_terminal_run_event(run_event):
+                        return
+            except httpx.HTTPError as error:
+                raise OpenyakReconnectRequiredError(self.thread_id, run_id) from error
         finally:
             await response.aclose()
         raise OpenyakReconnectRequiredError(self.thread_id, run_id)

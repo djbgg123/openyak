@@ -345,26 +345,33 @@ export class Thread {
     iterator: AsyncIterator<ThreadEvent>,
     runId: string,
   ): AsyncGenerator<RunEvent> {
-    while (true) {
-      const next = await iterator.next();
-      if (next.done) {
-        break;
+    try {
+      while (true) {
+        const next = await iterator.next();
+        if (next.done) {
+          break;
+        }
+        const event = next.value;
+        if (event.type === "thread.resync_required") {
+          throw new OpenyakResyncRequiredError(event);
+        }
+        if (event.type === "thread.snapshot") {
+          this.#lastSnapshot = event.payload;
+          continue;
+        }
+        if (event.run_id !== runId) {
+          continue;
+        }
+        yield event;
+        if (isTerminalRunEvent(event)) {
+          return;
+        }
       }
-      const event = next.value;
-      if (event.type === "thread.resync_required") {
-        throw new OpenyakResyncRequiredError(event);
+    } catch (error) {
+      if (isBufferedRunTransportError(error)) {
+        throw new OpenyakReconnectRequiredError(this.threadId, runId);
       }
-      if (event.type === "thread.snapshot") {
-        this.#lastSnapshot = event.payload;
-        continue;
-      }
-      if (event.run_id !== runId) {
-        continue;
-      }
-      yield event;
-      if (isTerminalRunEvent(event)) {
-        return;
-      }
+      throw error;
     }
     throw new OpenyakReconnectRequiredError(this.threadId, runId);
   }
