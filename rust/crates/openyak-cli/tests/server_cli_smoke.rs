@@ -300,6 +300,99 @@ fn openyak_server_rejects_non_loopback_bind() {
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
+#[test]
+fn openyak_server_status_reports_running_operator_surface() {
+    let workspace = unique_temp_dir("openyak-server-status-running");
+    std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+    let mut child = ChildGuard::spawn_in(workspace.clone(), false);
+    let address = child.advertised_address();
+
+    let text_output = Command::new(common::openyak_binary())
+        .args(["server", "status"])
+        .current_dir(child.workspace())
+        .output()
+        .expect("server status should run");
+    assert!(text_output.status.success(), "server status should succeed");
+    let stdout = String::from_utf8(text_output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("Status           running"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("Base URL         http://{address}")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Truth layer      daemon_local_v1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Operator plane   local_loopback_operator_v1"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Attach API       /v1/threads"), "{stdout}");
+
+    let json_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "status"])
+        .current_dir(child.workspace())
+        .output()
+        .expect("json server status should run");
+    assert!(
+        json_output.status.success(),
+        "json server status should succeed"
+    );
+    let report: Value =
+        serde_json::from_slice(&json_output.stdout).expect("json server status should parse");
+    assert_eq!(report["status"], "running");
+    assert_eq!(report["base_url"], format!("http://{address}"));
+    assert_eq!(report["reachable"], true);
+    assert_eq!(report["state_db_present"], true);
+    assert_eq!(report["contract"]["truth_layer"], "daemon_local_v1");
+    assert_eq!(
+        report["contract"]["operator_plane"],
+        "local_loopback_operator_v1"
+    );
+    assert_eq!(report["contract"]["persistence"], "workspace_sqlite_v1");
+    assert_eq!(report["contract"]["attach_api"], "/v1/threads");
+
+    drop(child);
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn openyak_server_status_reports_not_running_workspace_guidance() {
+    let workspace = unique_temp_dir("openyak-server-status-missing");
+    std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+    let output = Command::new(common::openyak_binary())
+        .args(["server", "status"])
+        .current_dir(&workspace)
+        .output()
+        .expect("server status should run");
+    assert!(output.status.success(), "server status should succeed");
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("Status           not_running"), "{stdout}");
+    assert!(
+        stdout.contains("openyak server --bind 127.0.0.1:0"),
+        "{stdout}"
+    );
+
+    let json_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "status"])
+        .current_dir(&workspace)
+        .output()
+        .expect("json server status should run");
+    assert!(
+        json_output.status.success(),
+        "json server status should succeed"
+    );
+    let report: Value =
+        serde_json::from_slice(&json_output.stdout).expect("json server status should parse");
+    assert_eq!(report["status"], "not_running");
+    assert_eq!(report["reachable"], false);
+    assert_eq!(report["state_db_present"], false);
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     let nanos = SystemTime::now()

@@ -8,7 +8,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
-use std::net::{TcpListener, ToSocketAddrs};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -225,6 +225,327 @@ fn thread_server_info_matches_pid(path: &Path, pid: u32) -> bool {
     info.get("pid").and_then(serde_json::Value::as_u64) == Some(u64::from(pid))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadServerInfoRecord {
+    base_url: String,
+    pid: u32,
+    truth_layer: String,
+    operator_plane: String,
+    persistence: String,
+    attach_api: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadServerStatusReport {
+    status: &'static str,
+    workspace_root: PathBuf,
+    workspace_state_root: PathBuf,
+    state_db_path: PathBuf,
+    state_db_present: bool,
+    discovery_path: Option<PathBuf>,
+    discovery_source: Option<&'static str>,
+    reachable: bool,
+    base_url: Option<String>,
+    pid: Option<u32>,
+    truth_layer: Option<String>,
+    operator_plane: Option<String>,
+    persistence: Option<String>,
+    attach_api: Option<String>,
+    problem: Option<String>,
+    recommended_actions: Vec<String>,
+}
+
+fn thread_server_info_candidates(cwd: &Path) -> Vec<(PathBuf, &'static str)> {
+    let mut candidates = vec![(
+        cwd.join(".openyak").join(THREAD_SERVER_INFO_FILENAME),
+        "cwd",
+    )];
+    if let Ok(canonical_cwd) = cwd.canonicalize() {
+        let canonical_path = canonical_cwd
+            .join(".openyak")
+            .join(THREAD_SERVER_INFO_FILENAME);
+        if !candidates
+            .iter()
+            .any(|(candidate, _)| candidate == &canonical_path)
+        {
+            candidates.push((canonical_path, "canonical_cwd"));
+        }
+    }
+    candidates
+}
+
+fn read_thread_server_info(path: &Path) -> Result<ThreadServerInfoRecord, String> {
+    let value: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(path)
+            .map_err(|error| format!("failed to read `{}`: {error}", path.display()))?,
+    )
+    .map_err(|error| format!("failed to parse `{}`: {error}", path.display()))?;
+
+    let require_string = |key: &str| -> Result<String, String> {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| format!("`{}` is missing string field `{key}`", path.display()))
+    };
+
+    let pid = value
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("`{}` is missing integer field `pid`", path.display()))
+        .and_then(|pid| {
+            u32::try_from(pid)
+                .map_err(|_| format!("`{}` has out-of-range `pid` value {pid}", path.display()))
+        })?;
+
+    Ok(ThreadServerInfoRecord {
+        base_url: require_string("baseUrl")?,
+        pid,
+        truth_layer: require_string("truthLayer")?,
+        operator_plane: require_string("operatorPlane")?,
+        persistence: require_string("persistence")?,
+        attach_api: require_string("attachApi")?,
+    })
+}
+
+fn probe_local_thread_server(base_url: &str) -> Result<bool, String> {
+    let authority = base_url
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("thread server URL `{base_url}` must start with http://"))?;
+    let addresses = authority
+        .to_socket_addrs()
+        .map_err(|error| format!("thread server URL `{base_url}` could not be resolved: {error}"))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(format!(
+            "thread server URL `{base_url}` did not resolve to any socket address"
+        ));
+    }
+    if addresses.iter().any(|address| !address.ip().is_loopback()) {
+        return Err(format!(
+            "thread server URL `{base_url}` is not loopback-only; early operator status only supports local discovery"
+        ));
+    }
+    Ok(addresses
+        .iter()
+        .any(|address| TcpStream::connect_timeout(address, Duration::from_millis(200)).is_ok()))
+}
+
+fn inspect_thread_server_status_for(
+    cwd: &Path,
+) -> Result<ThreadServerStatusReport, Box<dyn std::error::Error>> {
+    let workspace_root = cwd.canonicalize()?;
+    let workspace_state_root = workspace_root.join(".openyak");
+    let state_db_path = workspace_state_root.join("state.sqlite3");
+    let state_db_present = state_db_path.is_file();
+
+    for (path, source) in thread_server_info_candidates(cwd) {
+        if !path.is_file() {
+            continue;
+        }
+
+        let info = match read_thread_server_info(&path) {
+            Ok(info) => info,
+            Err(problem) => {
+                return Ok(ThreadServerStatusReport {
+                    status: "invalid_registration",
+                    workspace_root,
+                    workspace_state_root,
+                    state_db_path,
+                    state_db_present,
+                    discovery_path: Some(path),
+                    discovery_source: Some(source),
+                    reachable: false,
+                    base_url: None,
+                    pid: None,
+                    truth_layer: None,
+                    operator_plane: None,
+                    persistence: None,
+                    attach_api: None,
+                    problem: Some(problem),
+                    recommended_actions: vec![
+                        "rewrite the discovery file by starting `openyak server --bind 127.0.0.1:0` in this workspace".to_string(),
+                    ],
+                });
+            }
+        };
+
+        let reachability = probe_local_thread_server(&info.base_url);
+        let (status, reachable, problem, recommended_actions) = match reachability {
+            Ok(true) => ("running", true, None, Vec::new()),
+            Ok(false) => (
+                "stale_registration",
+                false,
+                Some(format!(
+                    "thread server discovery points to `{}` but the local loopback listener is not reachable",
+                    info.base_url
+                )),
+                vec![
+                    "restart `openyak server --bind 127.0.0.1:0` in this workspace to refresh the discovery record".to_string(),
+                ],
+            ),
+            Err(problem) => (
+                "invalid_registration",
+                false,
+                Some(problem),
+                vec![
+                    "rewrite the discovery file by starting `openyak server --bind 127.0.0.1:0` in this workspace".to_string(),
+                ],
+            ),
+        };
+
+        return Ok(ThreadServerStatusReport {
+            status,
+            workspace_root,
+            workspace_state_root,
+            state_db_path,
+            state_db_present,
+            discovery_path: Some(path),
+            discovery_source: Some(source),
+            reachable,
+            base_url: Some(info.base_url),
+            pid: Some(info.pid),
+            truth_layer: Some(info.truth_layer),
+            operator_plane: Some(info.operator_plane),
+            persistence: Some(info.persistence),
+            attach_api: Some(info.attach_api),
+            problem,
+            recommended_actions,
+        });
+    }
+
+    let recommended_action = if state_db_present {
+        "start `openyak server --bind 127.0.0.1:0` in this workspace to reattach the persisted thread truth"
+            .to_string()
+    } else {
+        "start `openyak server --bind 127.0.0.1:0` in this workspace to create the local loopback thread server"
+            .to_string()
+    };
+
+    Ok(ThreadServerStatusReport {
+        status: "not_running",
+        workspace_root,
+        workspace_state_root,
+        state_db_path,
+        state_db_present,
+        discovery_path: None,
+        discovery_source: None,
+        reachable: false,
+        base_url: None,
+        pid: None,
+        truth_layer: None,
+        operator_plane: None,
+        persistence: None,
+        attach_api: None,
+        problem: None,
+        recommended_actions: vec![recommended_action],
+    })
+}
+
+fn thread_server_status_json(report: &ThreadServerStatusReport) -> serde_json::Value {
+    json!({
+        "status": report.status,
+        "workspace_root": report.workspace_root.display().to_string(),
+        "workspace_state_root": report.workspace_state_root.display().to_string(),
+        "state_db_path": report.state_db_path.display().to_string(),
+        "state_db_present": report.state_db_present,
+        "discovery_path": report.discovery_path.as_ref().map(|path| path.display().to_string()),
+        "discovery_source": report.discovery_source,
+        "reachable": report.reachable,
+        "base_url": report.base_url.as_deref(),
+        "pid": report.pid,
+        "contract": {
+            "truth_layer": report.truth_layer.as_deref(),
+            "operator_plane": report.operator_plane.as_deref(),
+            "persistence": report.persistence.as_deref(),
+            "attach_api": report.attach_api.as_deref(),
+        },
+        "problem": report.problem.as_deref(),
+        "recommended_actions": &report.recommended_actions,
+    })
+}
+
+fn render_thread_server_status(report: &ThreadServerStatusReport) -> String {
+    let mut lines = vec![
+        "Local thread server status".to_string(),
+        format!("  Status           {}", report.status),
+        format!("  Workspace        {}", report.workspace_root.display()),
+        format!(
+            "  State root       {}",
+            report.workspace_state_root.display()
+        ),
+        format!(
+            "  State DB         {} ({})",
+            report.state_db_path.display(),
+            if report.state_db_present {
+                "present"
+            } else {
+                "missing"
+            }
+        ),
+    ];
+
+    if let Some(source) = report.discovery_source {
+        lines.push(format!("  Discovery source {source}"));
+    }
+    if let Some(path) = &report.discovery_path {
+        lines.push(format!("  Discovery file   {}", path.display()));
+    }
+    if let Some(base_url) = &report.base_url {
+        lines.push(format!("  Base URL         {base_url}"));
+    }
+    lines.push(format!(
+        "  Reachable        {}",
+        if report.reachable { "yes" } else { "no" }
+    ));
+    if let Some(pid) = report.pid {
+        lines.push(format!("  PID              {pid}"));
+    }
+    if let Some(truth_layer) = &report.truth_layer {
+        lines.push(format!("  Truth layer      {truth_layer}"));
+    }
+    if let Some(operator_plane) = &report.operator_plane {
+        lines.push(format!("  Operator plane   {operator_plane}"));
+    }
+    if let Some(persistence) = &report.persistence {
+        lines.push(format!("  Persistence      {persistence}"));
+    }
+    if let Some(attach_api) = &report.attach_api {
+        lines.push(format!("  Attach API       {attach_api}"));
+    }
+    if let Some(problem) = &report.problem {
+        lines.push(format!("  Problem          {problem}"));
+    }
+    for (index, action) in report.recommended_actions.iter().enumerate() {
+        let label = if index == 0 {
+            "  Try              "
+        } else {
+            "                   "
+        };
+        lines.push(format!("{label}{action}"));
+    }
+    lines.push(
+        "  Scope            read-only local operator status; no start/stop/recover control yet"
+            .to_string(),
+    );
+    format!("{}\n", lines.join("\n"))
+}
+
+fn run_server_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let report = inspect_thread_server_status_for(&cwd)?;
+    match output_format {
+        CliOutputFormat::Text => print!("{}", render_thread_server_status(&report)),
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&thread_server_status_json(&report))?
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_server_bind_target(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
     let addresses = bind
         .to_socket_addrs()
@@ -384,6 +705,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_package_release(binary.as_deref(), &output_dir)?;
         }
         CliAction::Server { bind } => run_server(&bind)?,
+        CliAction::ServerStatus { output_format } => run_server_status(output_format)?,
         CliAction::Repl {
             model,
             requested_policy,
@@ -442,6 +764,9 @@ enum CliAction {
     },
     Server {
         bind: String,
+    },
+    ServerStatus {
+        output_format: CliOutputFormat,
     },
     Repl {
         model: Option<String>,
@@ -684,7 +1009,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "doctor" => parse_doctor_args(&rest[1..], model),
         "foundations" => parse_foundations_args(&rest[1..]),
         "package-release" => parse_package_release_args(&rest[1..]),
-        "server" => parse_server_args(&rest[1..]),
+        "server" => parse_server_args(&rest[1..], output_format),
         "prompt" => {
             if rest
                 .get(1)
@@ -773,9 +1098,18 @@ fn parse_foundations_args(args: &[String]) -> Result<CliAction, String> {
     })
 }
 
-fn parse_server_args(args: &[String]) -> Result<CliAction, String> {
+fn parse_server_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     if is_help_args(args) {
         return Ok(CliAction::Help(HelpTopic::Server));
+    }
+    if matches!(args.first().map(String::as_str), Some("status")) {
+        if args.len() == 1 {
+            return Ok(CliAction::ServerStatus { output_format });
+        }
+        if is_help_args(&args[1..]) {
+            return Ok(CliAction::Help(HelpTopic::Server));
+        }
+        return Err(format!("unknown server status argument: {}", args[1]));
     }
 
     let mut bind = DEFAULT_SERVER_BIND.to_string();
@@ -6943,6 +7277,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  openyak server [--bind HOST:PORT]        Run the local HTTP/SSE thread server"
     )?;
+    writeln!(
+        out,
+        "  openyak server status                    Inspect local thread-server discovery + operator status"
+    )?;
     writeln!(out)?;
     writeln!(out, "Flags")?;
     writeln!(
@@ -7022,6 +7360,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  openyak foundations")?;
     writeln!(out, "  openyak package-release --output-dir dist")?;
     writeln!(out, "  openyak server --bind 127.0.0.1:0")?;
+    writeln!(out, "  openyak server status")?;
     Ok(())
 }
 
@@ -7066,7 +7405,7 @@ fn render_help_topic(topic: HelpTopic) -> &'static str {
             "Usage: openyak package-release [--output-dir PATH] [--binary PATH]\n\nStage a release artifact directory containing the packaged openyak binary plus generated install metadata.\nBy default the command packages the currently running openyak executable into ./dist."
         }
         HelpTopic::Server => {
-            "Usage: openyak server [--bind HOST:PORT]\n\nRun the local HTTP/SSE thread server backed by the `server` crate.\nThe server exposes the local `/v1/threads` protocol plus legacy `/sessions` compatibility routes, persists thread state in the workspace `.openyak/state.sqlite3` SQLite store, prints the actual bound address on startup, keeps serving until interrupted, and only supports loopback binds."
+            "Usage: openyak server [--bind HOST:PORT]\n       openyak server status\n\nRun the local HTTP/SSE thread server backed by the `server` crate, or inspect the current workspace's local thread-server discovery/liveness metadata.\nThe server exposes the local `/v1/threads` protocol plus legacy `/sessions` compatibility routes, persists thread state in the workspace `.openyak/state.sqlite3` SQLite store, prints the actual bound address on startup, keeps serving until interrupted, and only supports loopback binds.\n`openyak server status` stays read-only and reports local loopback operator truth; it does not add daemon start/stop/recover controls yet."
         }
         HelpTopic::Prompt => {
             "Usage: openyak prompt [--tool-profile NAME] <text>\n       openyak -p [--tool-profile NAME] <text>\n\nRun one non-interactive prompt and exit.\nUse --tool-profile to apply a named local tool-profile ceiling for this process only.\nHidden optional browser tools such as BrowserObserve and BrowserInteract still require browserControl.enabled=true plus explicit --allowedTools BrowserObserve or --allowedTools BrowserInteract.\nIf the model requests structured follow-up input, this mode fails explicitly instead of guessing a reply."
@@ -7086,15 +7425,16 @@ mod tests {
         format_plan_permissions_blocked_report, format_resume_report, format_status_report,
         format_tool_call_start, format_tool_result, git_args_excluding_local_artifacts,
         git_branch_diff_summary, git_workspace_diff_summary_for_commit_prompt, initialize_repo,
-        load_session_from_reference, normalize_permission_mode, parse_args,
-        parse_commit_push_pr_draft, parse_git_status_metadata, parse_manual_oauth_callback_input,
-        parse_user_input_submission, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_foundations_report,
-        render_git_command_requires_repo, render_help_topic, render_last_tool_debug_report,
-        render_memory_report, render_repl_help, render_unknown_repl_command,
-        resolve_effective_model, resolve_model_alias, response_to_events,
-        resume_supported_slash_commands, run_github_titled_body_create, run_resume_command,
-        sessions_dir, slash_command_completion_candidates, stage_release_artifact, status_context,
+        inspect_thread_server_status_for, load_session_from_reference, normalize_permission_mode,
+        parse_args, parse_commit_push_pr_draft, parse_git_status_metadata,
+        parse_manual_oauth_callback_input, parse_user_input_submission, permission_policy,
+        print_help_to, push_output_block, render_config_report, render_diff_report,
+        render_foundations_report, render_git_command_requires_repo, render_help_topic,
+        render_last_tool_debug_report, render_memory_report, render_repl_help,
+        render_thread_server_status, render_unknown_repl_command, resolve_effective_model,
+        resolve_model_alias, response_to_events, resume_supported_slash_commands,
+        run_github_titled_body_create, run_resume_command, sessions_dir,
+        slash_command_completion_candidates, stage_release_artifact, status_context,
         status_context_or_fallback_for_cwd, summarize_command_stderr, validate_server_bind_target,
         write_temp_text_file, CliAction, CliOutputFormat, CliUserInputPrompter, ConfigLoader,
         DefaultRuntimeClient, DoctorCheckStatus, HelpTopic, InternalPromptProgressEvent,
@@ -7788,6 +8128,7 @@ mod tests {
             render_help_topic(HelpTopic::PackageRelease).contains("Usage: openyak package-release")
         );
         assert!(render_help_topic(HelpTopic::Server).contains("Usage: openyak server"));
+        assert!(render_help_topic(HelpTopic::Server).contains("openyak server status"));
         assert!(render_help_topic(HelpTopic::Server).contains("loopback binds"));
     }
 
@@ -7905,10 +8246,21 @@ mod tests {
                 output_dir: PathBuf::from("artifacts"),
             }
         );
+    }
+
+    #[test]
+    fn parses_server_subcommands() {
         assert_eq!(
             parse_args(&["server".to_string()]).expect("server should parse"),
             CliAction::Server {
                 bind: DEFAULT_SERVER_BIND.to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(&["server".to_string(), "status".to_string()])
+                .expect("server status should parse"),
+            CliAction::ServerStatus {
+                output_format: CliOutputFormat::Text,
             }
         );
         assert_eq!(
@@ -7918,6 +8270,95 @@ mod tests {
                 bind: "127.0.0.1:0".to_string(),
             }
         );
+        assert_eq!(
+            parse_args(&[
+                "--output-format".to_string(),
+                "json".to_string(),
+                "server".to_string(),
+                "status".to_string(),
+            ])
+            .expect("json server status should parse"),
+            CliAction::ServerStatus {
+                output_format: CliOutputFormat::Json,
+            }
+        );
+    }
+
+    #[test]
+    fn thread_server_status_reports_not_running_with_start_guidance() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-server-status-missing");
+        fs::create_dir_all(&root).expect("workspace should exist");
+
+        let report = {
+            let _cwd = CurrentDirGuard::set(&root);
+            inspect_thread_server_status_for(&root).expect("status inspection should succeed")
+        };
+
+        assert_eq!(report.status, "not_running");
+        assert!(!report.state_db_present);
+        assert!(report.discovery_path.is_none());
+        assert!(
+            report.recommended_actions[0].contains("openyak server --bind 127.0.0.1:0"),
+            "{report:?}"
+        );
+
+        let rendered = render_thread_server_status(&report);
+        assert!(
+            rendered.contains("Status           not_running"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("State DB"), "{rendered}");
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn thread_server_status_reports_stale_registration_without_hiding_state_db() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-server-status-stale");
+        let openyak_dir = root.join(".openyak");
+        fs::create_dir_all(&openyak_dir).expect("openyak dir should exist");
+        fs::write(openyak_dir.join("state.sqlite3"), b"stub").expect("state db should write");
+        fs::write(
+            openyak_dir.join(THREAD_SERVER_INFO_FILENAME),
+            serde_json::to_string_pretty(&json!({
+                "baseUrl": "http://127.0.0.1:9",
+                "pid": 4242_u32,
+                "truthLayer": "daemon_local_v1",
+                "operatorPlane": "local_loopback_operator_v1",
+                "persistence": "workspace_sqlite_v1",
+                "attachApi": "/v1/threads",
+            }))
+            .expect("thread server info should serialize"),
+        )
+        .expect("thread server info should write");
+
+        let report = {
+            let _cwd = CurrentDirGuard::set(&root);
+            inspect_thread_server_status_for(&root).expect("status inspection should succeed")
+        };
+
+        assert_eq!(report.status, "stale_registration");
+        assert!(report.state_db_present);
+        assert_eq!(report.base_url.as_deref(), Some("http://127.0.0.1:9"));
+        assert_eq!(report.truth_layer.as_deref(), Some("daemon_local_v1"));
+        assert!(
+            report.recommended_actions[0].contains("refresh the discovery record"),
+            "{report:?}"
+        );
+
+        let rendered = render_thread_server_status(&report);
+        assert!(
+            rendered.contains("Status           stale_registration"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Base URL         http://127.0.0.1:9"),
+            "{rendered}"
+        );
+
+        crate::cleanup_temp_dir(&root);
     }
 
     #[test]
