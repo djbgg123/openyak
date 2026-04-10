@@ -44,6 +44,7 @@ pub const THREAD_TRUTH_LAYER: &str = runtime::DAEMON_LOCAL_TRUTH_LAYER;
 pub const THREAD_OPERATOR_PLANE: &str = runtime::LOCAL_LOOPBACK_OPERATOR_PLANE;
 pub const THREAD_PERSISTENCE_LAYER: &str = runtime::WORKSPACE_SQLITE_PERSISTENCE_LAYER;
 pub const THREAD_ATTACH_API: &str = runtime::THREAD_ATTACH_API;
+pub const THREAD_OPERATOR_IDENTITY_API: &str = "/v1/operator/identity";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -113,6 +114,18 @@ impl AppState {
 
     fn insert_thread(&self, record: Arc<ThreadRecord>) {
         write_lock(&self.threads).insert(record.thread_id(), record);
+    }
+
+    fn operator_identity(&self) -> ThreadServerOperatorIdentity {
+        ThreadServerOperatorIdentity {
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            pid: std::process::id(),
+            workspace_root: self.cwd.display().to_string(),
+            truth_layer: THREAD_TRUTH_LAYER.to_string(),
+            operator_plane: THREAD_OPERATOR_PLANE.to_string(),
+            persistence: THREAD_PERSISTENCE_LAYER.to_string(),
+            attach_api: THREAD_ATTACH_API.to_string(),
+        }
     }
 
     fn thread(&self, id: &str) -> Result<Arc<ThreadRecord>, ApiError> {
@@ -749,7 +762,7 @@ impl RunCompletedPayload {
             iterations: summary.iterations,
             assistant_message_count: summary.assistant_messages.len(),
             tool_result_count: summary.tool_results.len(),
-            cumulative_usage: summary.usage.clone(),
+            cumulative_usage: summary.usage,
             status: "completed".to_string(),
             lifecycle: LifecycleStateSnapshot::status("completed"),
         }
@@ -862,6 +875,17 @@ pub struct ListThreadsResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadServerOperatorIdentity {
+    pub protocol_version: String,
+    pub pid: u32,
+    pub workspace_root: String,
+    pub truth_layer: String,
+    pub operator_plane: String,
+    pub persistence: String,
+    pub attach_api: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TurnAcceptedResponse {
     pub protocol_version: String,
     pub contract: ThreadContractSnapshot,
@@ -930,6 +954,7 @@ pub struct SubmitUserInputRequest {
 
 pub fn app(state: AppState) -> Router {
     Router::new()
+        .route(THREAD_OPERATOR_IDENTITY_API, get(get_operator_identity))
         .route("/v1/threads", post(create_thread).get(list_threads))
         .route("/v1/threads/{id}", get(get_thread))
         .route("/v1/threads/{id}/events", get(stream_thread_events))
@@ -947,6 +972,12 @@ pub fn app(state: AppState) -> Router {
 
 pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::io::Result<()> {
     axum::serve(listener, app(state)).await
+}
+
+async fn get_operator_identity(
+    State(state): State<AppState>,
+) -> Json<ThreadServerOperatorIdentity> {
+    Json(state.operator_identity())
 }
 
 async fn create_thread(
@@ -2354,6 +2385,39 @@ mod tests {
         assert!(!fetched.config.allowed_tools.is_empty());
     }
 
+    #[tokio::test]
+    async fn operator_identity_endpoint_reports_workspace_and_contract() {
+        let server = TestServer::spawn().await;
+        let client = Client::new();
+
+        let identity = client
+            .get(server.url(super::THREAD_OPERATOR_IDENTITY_API))
+            .send()
+            .await
+            .expect("identity request should succeed")
+            .error_for_status()
+            .expect("identity request should return success")
+            .json::<super::ThreadServerOperatorIdentity>()
+            .await
+            .expect("identity response should parse");
+
+        assert_eq!(identity.protocol_version, super::PROTOCOL_VERSION);
+        assert_eq!(identity.pid, std::process::id());
+        assert_eq!(
+            identity.workspace_root,
+            server
+                .workspace
+                .canonicalize()
+                .expect("workspace should canonicalize")
+                .display()
+                .to_string()
+        );
+        assert_eq!(identity.truth_layer, super::THREAD_TRUTH_LAYER);
+        assert_eq!(identity.operator_plane, super::THREAD_OPERATOR_PLANE);
+        assert_eq!(identity.persistence, super::THREAD_PERSISTENCE_LAYER);
+        assert_eq!(identity.attach_api, super::THREAD_ATTACH_API);
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn threads_protocol_fixture_matches_current_v1_contract() {
@@ -2361,7 +2425,7 @@ mod tests {
         let mock_service = MockAnthropicService::spawn()
             .await
             .expect("mock service should start");
-        let _env = EnvGuard::set(&mock_service.base_url());
+        let env_guard = EnvGuard::set(&mock_service.base_url());
         let server = TestServer::spawn().await;
         let client = Client::new();
 
@@ -2584,7 +2648,7 @@ mod tests {
             }
         }
 
-        drop(_env);
+        drop(env_guard);
         let _removed = RemovedEnvGuard::remove(PROVIDER_ENV_KEYS);
         let runtime_failure_created = create_thread(
             &client,

@@ -8,7 +8,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -344,7 +344,9 @@ fn validate_thread_server_info_contract(
     Ok(())
 }
 
-fn probe_local_thread_server(base_url: &str) -> Result<bool, String> {
+fn resolve_loopback_thread_server_addresses(
+    base_url: &str,
+) -> Result<(String, Vec<SocketAddr>), String> {
     let authority = base_url
         .strip_prefix("http://")
         .ok_or_else(|| format!("thread server URL `{base_url}` must start with http://"))?;
@@ -362,9 +364,137 @@ fn probe_local_thread_server(base_url: &str) -> Result<bool, String> {
             "thread server URL `{base_url}` is not loopback-only; early operator status only supports local discovery"
         ));
     }
+    Ok((authority.to_string(), addresses))
+}
+
+fn probe_local_thread_server(base_url: &str) -> Result<bool, String> {
+    let (_, addresses) = resolve_loopback_thread_server_addresses(base_url)?;
     Ok(addresses
         .iter()
         .any(|address| TcpStream::connect_timeout(address, Duration::from_millis(200)).is_ok()))
+}
+
+fn http_response_body(response: &[u8]) -> Result<&[u8], String> {
+    let delimiter = b"\r\n\r\n";
+    let header_end = response
+        .windows(delimiter.len())
+        .position(|window| window == delimiter)
+        .ok_or_else(|| "missing HTTP response header delimiter".to_string())?;
+    Ok(&response[(header_end + delimiter.len())..])
+}
+
+fn read_thread_server_operator_identity(
+    base_url: &str,
+) -> Result<server::ThreadServerOperatorIdentity, String> {
+    let (authority, addresses) = resolve_loopback_thread_server_addresses(base_url)?;
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        server::THREAD_OPERATOR_IDENTITY_API
+    );
+    let mut last_error = None;
+    for address in addresses {
+        let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(200)) {
+            Ok(stream) => stream,
+            Err(error) => {
+                last_error = Some(format!(
+                    "failed to connect to `{base_url}` for operator identity: {error}"
+                ));
+                continue;
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .map_err(|error| {
+                format!("failed to configure read timeout for `{base_url}`: {error}")
+            })?;
+        stream
+            .set_write_timeout(Some(Duration::from_millis(500)))
+            .map_err(|error| {
+                format!("failed to configure write timeout for `{base_url}`: {error}")
+            })?;
+        if let Err(error) = stream.write_all(request.as_bytes()) {
+            last_error = Some(format!(
+                "failed to request operator identity from `{base_url}`: {error}"
+            ));
+            continue;
+        }
+        let mut response = Vec::new();
+        if let Err(error) = stream.read_to_end(&mut response) {
+            last_error = Some(format!(
+                "failed to read operator identity response from `{base_url}`: {error}"
+            ));
+            continue;
+        }
+        let status_line = String::from_utf8_lossy(&response)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if !status_line.contains(" 200 ") {
+            last_error = Some(format!(
+                "operator identity endpoint on `{base_url}` returned unexpected status `{status_line}`"
+            ));
+            continue;
+        }
+        let body = http_response_body(&response)?;
+        let identity: server::ThreadServerOperatorIdentity =
+            serde_json::from_slice(body).map_err(|error| {
+                format!("failed to parse operator identity response from `{base_url}`: {error}")
+            })?;
+        return Ok(identity);
+    }
+    Err(last_error
+        .unwrap_or_else(|| format!("failed to contact operator identity endpoint on `{base_url}`")))
+}
+
+fn validate_reachable_thread_server_identity(
+    workspace_root: &Path,
+    info: &ThreadServerInfoRecord,
+) -> Result<(), String> {
+    let identity = read_thread_server_operator_identity(&info.base_url)?;
+    if identity.pid != info.pid {
+        return Err(format!(
+            "reachable listener `{}` reported pid {} but discovery recorded pid {}",
+            info.base_url, identity.pid, info.pid
+        ));
+    }
+    let expected_workspace_root = workspace_root.display().to_string();
+    if identity.workspace_root != expected_workspace_root {
+        return Err(format!(
+            "reachable listener `{}` reported workspace `{}` but discovery belongs to `{expected_workspace_root}`",
+            info.base_url, identity.workspace_root
+        ));
+    }
+    for (field, actual, expected) in [
+        (
+            "truth_layer",
+            identity.truth_layer.as_str(),
+            info.truth_layer.as_str(),
+        ),
+        (
+            "operator_plane",
+            identity.operator_plane.as_str(),
+            info.operator_plane.as_str(),
+        ),
+        (
+            "persistence",
+            identity.persistence.as_str(),
+            info.persistence.as_str(),
+        ),
+        (
+            "attach_api",
+            identity.attach_api.as_str(),
+            info.attach_api.as_str(),
+        ),
+    ] {
+        if actual != expected {
+            return Err(format!(
+                "reachable listener `{}` reported {field} `{actual}` but discovery recorded `{expected}`",
+                info.base_url
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn invalid_thread_server_status_report(
@@ -409,7 +539,17 @@ fn status_report_from_thread_server_info(
 ) -> ThreadServerStatusReport {
     let reachability = probe_local_thread_server(&info.base_url);
     let (status, reachable, problem, recommended_actions) = match reachability {
-        Ok(true) => ("running", true, None, Vec::new()),
+        Ok(true) => match validate_reachable_thread_server_identity(workspace_root, &info) {
+            Ok(()) => ("running", true, None, Vec::new()),
+            Err(problem) => (
+                "invalid_registration",
+                true,
+                Some(problem),
+                vec![
+                    "rewrite the discovery file by restarting `openyak server --bind 127.0.0.1:0` in this workspace".to_string(),
+                ],
+            ),
+        },
         Ok(false) => (
             "stale_registration",
             false,
@@ -7877,7 +8017,7 @@ fn render_help_topic(topic: HelpTopic) -> &'static str {
             "Usage: openyak package-release [--output-dir PATH] [--binary PATH]\n\nStage a release artifact directory containing the packaged openyak binary plus generated install metadata.\nBy default the command packages the currently running openyak executable into ./dist."
         }
         HelpTopic::Server => {
-            "Usage: openyak server [--bind HOST:PORT]\n       openyak server status\n       openyak server stop\n\nRun the local HTTP/SSE thread server backed by the `server` crate, inspect the current workspace's local thread-server discovery/liveness metadata, or stop the current workspace server via its local discovery record.\nThe server exposes the local `/v1/threads` protocol plus legacy `/sessions` compatibility routes, persists thread state in the workspace `.openyak/state.sqlite3` SQLite store, prints the actual bound address on startup, keeps serving until interrupted, and only supports loopback binds.\n`openyak server status` stays read-only and reports local loopback operator truth.\n`openyak server stop` stays local-only, uses workspace discovery + pid safeguards, and does not add broader daemon start/recover control yet."
+            "Usage: openyak server [--bind HOST:PORT]\n       openyak server status\n       openyak server stop\n\nRun the local HTTP/SSE thread server backed by the `server` crate, inspect the current workspace's local thread-server discovery/liveness metadata, or stop the current workspace server via its local discovery record.\nThe server exposes the local `/v1/threads` protocol plus legacy `/sessions` compatibility routes, persists thread state in the workspace `.openyak/state.sqlite3` SQLite store, prints the actual bound address on startup, keeps serving until interrupted, and only supports loopback binds.\n`openyak server status` stays read-only and reports local loopback operator truth.\n`openyak server stop` stays local-only, validates the reachable operator identity against workspace discovery before signaling a pid, and does not add broader daemon start/recover control yet."
         }
         HelpTopic::Prompt => {
             "Usage: openyak prompt [--tool-profile NAME] <text>\n       openyak -p [--tool-profile NAME] <text>\n\nRun one non-interactive prompt and exit.\nUse --tool-profile to apply a named local tool-profile ceiling for this process only.\nHidden optional browser tools such as BrowserObserve and BrowserInteract still require browserControl.enabled=true plus explicit --allowedTools BrowserObserve or --allowedTools BrowserInteract.\nIf the model requests structured follow-up input, this mode fails explicitly instead of guessing a reply."

@@ -343,7 +343,7 @@ skills 目录支持两种布局：
 - `openyak foundations [task|team|cron|lsp|mcp]` / `/foundations [task|team|cron|lsp|mcp]` 作为只读的 discovery surface，明确说明当前 Task / Team / Cron / LSP / MCP 的 tool membership、truth label 与 `process_local_v1` / registry-backed 边界
 - `openyak package-release` 生成本地 release artifact 目录，供 release/upload 与脱离源码目录的 packaged-use 验证
 - `openyak server status` 作为首个最小 CLI-first daemon/operator inspection：只读回显当前工作区 thread server 的 discovery、reachability、`daemon_local_v1` contract labels 与本地状态库存在性
-- `openyak server stop` 作为第一个 local-only operator action：只会根据当前工作区 discovery + pid 信息停止本地 thread server，并在 stale registration 场景下清理旧发现记录
+- `openyak server stop` 作为第一个 local-only operator action：只会在验证 reachable operator identity 与当前工作区 discovery/pid 一致后停止本地 thread server，并在 stale registration 场景下清理旧发现记录
 - 插件发现、安装、启用、禁用、卸载、更新
 - 插件工具聚合、插件 hook 聚合与生命周期
 - mock parity harness 基础设施，以及一批 registry-backed parity foundation tools（Task/Team/Cron + LSP/MCP registry surface）

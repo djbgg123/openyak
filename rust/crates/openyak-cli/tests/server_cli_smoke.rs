@@ -58,6 +58,10 @@ impl ChildGuard {
         &self.workspace
     }
 
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     fn advertised_address(&mut self) -> String {
         let mut stdout = self.stdout_reader();
         let mut line = String::new();
@@ -546,6 +550,79 @@ fn openyak_server_stop_rejects_unsafe_registration() {
     );
 
     let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn openyak_server_stop_rejects_reachable_listener_with_mismatched_pid() {
+    let workspace = unique_temp_dir("openyak-server-stop-mismatched-pid");
+    std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+    let spare_workspace = unique_temp_dir("openyak-server-stop-mismatched-pid-spare");
+    std::fs::create_dir_all(&spare_workspace).expect("spare workspace should create");
+
+    let mut target = ChildGuard::spawn_in(workspace.clone(), false);
+    let target_address = target.advertised_address();
+
+    let mut spare = ChildGuard::spawn_in(spare_workspace.clone(), false);
+    let _spare_address = spare.advertised_address();
+
+    let discovery_path = target.server_info_path();
+    std::fs::write(
+        &discovery_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "baseUrl": format!("http://{target_address}"),
+            "pid": spare.pid(),
+            "truthLayer": "daemon_local_v1",
+            "operatorPlane": "local_loopback_operator_v1",
+            "persistence": "workspace_sqlite_v1",
+            "attachApi": "/v1/threads"
+        }))
+        .expect("thread server info should serialize"),
+    )
+    .expect("thread server info should write");
+
+    let output = Command::new(common::openyak_binary())
+        .args(["server", "stop"])
+        .current_dir(&workspace)
+        .output()
+        .expect("server stop should run");
+    assert!(
+        !output.status.success(),
+        "server stop should reject mismatched reachable pid ownership"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        stdout.contains("Status           invalid_registration"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("reported pid"), "{stdout}");
+    assert!(
+        discovery_path.exists(),
+        "mismatched discovery should remain"
+    );
+    assert!(
+        TcpStream::connect(&target_address).is_ok(),
+        "target server should still be reachable"
+    );
+    assert!(
+        target
+            .child
+            .try_wait()
+            .expect("target try_wait should succeed")
+            .is_none(),
+        "target server should still be running"
+    );
+    assert!(
+        spare
+            .child
+            .try_wait()
+            .expect("spare try_wait should succeed")
+            .is_none(),
+        "spare server should still be running"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace);
+    let _ = std::fs::remove_dir_all(spare_workspace);
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
