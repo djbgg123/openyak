@@ -132,6 +132,7 @@ for event in thread.stream_events():
 - consumes the initial `thread.snapshot`
 - submits the turn
 - then yields only events for the accepted `run_id`
+- a fresh `stream_events()` attach also starts from the latest persisted `thread.snapshot`, including restart-recovered `awaiting_user_input` or `interrupted` truth
 
 ```python
 with thread.run_streamed("PARITY_SCENARIO:bash_stdout_roundtrip") as streamed:

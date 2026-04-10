@@ -112,6 +112,7 @@ for await (const event of thread.streamEvents()) {
 - consumes the initial `thread.snapshot`
 - submits the turn
 - then yields only events for the accepted `run_id`
+- a fresh `streamEvents()` attach also starts from the latest persisted `thread.snapshot`, including restart-recovered `awaiting_user_input` or `interrupted` truth
 
 ```ts
 const streamed = await thread.runStreamed("PARITY_SCENARIO:bash_stdout_roundtrip");
