@@ -16,6 +16,10 @@ struct ChildGuard {
     cleanup_workspace: bool,
 }
 
+struct DetachedWorkspaceGuard {
+    workspace: PathBuf,
+}
+
 impl ChildGuard {
     fn spawn() -> Self {
         Self::spawn_in(unique_temp_dir("openyak-server-smoke"), true)
@@ -94,6 +98,30 @@ impl Drop for ChildGuard {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if self.cleanup_workspace {
+            let _ = std::fs::remove_dir_all(&self.workspace);
+        }
+    }
+}
+
+impl DetachedWorkspaceGuard {
+    fn new(prefix: &str) -> Self {
+        let workspace = unique_temp_dir(prefix);
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        Self { workspace }
+    }
+
+    fn workspace(&self) -> &PathBuf {
+        &self.workspace
+    }
+}
+
+impl Drop for DetachedWorkspaceGuard {
+    fn drop(&mut self) {
+        if self.workspace.exists() {
+            let _ = Command::new(common::openyak_binary())
+                .args(["server", "stop"])
+                .current_dir(&self.workspace)
+                .output();
             let _ = std::fs::remove_dir_all(&self.workspace);
         }
     }
@@ -385,7 +413,7 @@ fn openyak_server_status_reports_not_running_workspace_guidance() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(stdout.contains("Status           not_running"), "{stdout}");
     assert!(
-        stdout.contains("openyak server --bind 127.0.0.1:0"),
+        stdout.contains("openyak server start --detach --bind 127.0.0.1:0"),
         "{stdout}"
     );
 
@@ -405,6 +433,180 @@ fn openyak_server_status_reports_not_running_workspace_guidance() {
     assert_eq!(report["state_db_present"], false);
 
     let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn openyak_server_start_detached_launches_local_server() {
+    let workspace = DetachedWorkspaceGuard::new("openyak-server-start-detached");
+
+    let output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "start", "--detach"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("server start --detach should run");
+    assert!(
+        output.status.success(),
+        "server start --detach should succeed"
+    );
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("json server start should parse");
+    assert_eq!(report["status"], "started");
+    assert_eq!(report["requested_bind"], "127.0.0.1:0");
+    assert_eq!(report["stale_registration_cleared"], false);
+    let base_url = report["base_url"]
+        .as_str()
+        .expect("started report should include base_url");
+    let pid = report["pid"]
+        .as_u64()
+        .expect("started report should include pid");
+    assert_eq!(report["contract"]["truth_layer"], "daemon_local_v1");
+    assert_eq!(
+        report["contract"]["operator_plane"],
+        "local_loopback_operator_v1"
+    );
+    assert_eq!(report["contract"]["persistence"], "workspace_sqlite_v1");
+    assert_eq!(report["contract"]["attach_api"], "/v1/threads");
+    let address = base_url
+        .strip_prefix("http://")
+        .expect("base_url should be http");
+
+    let identity = http_request_with_retry(
+        address,
+        &format!(
+            "GET /v1/operator/identity HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(
+        identity.starts_with("HTTP/1.1 200"),
+        "identity response should be 200, got: {identity}"
+    );
+    let identity_value: Value =
+        serde_json::from_str(response_body(&identity)).expect("identity body should be json");
+    assert_eq!(identity_value["pid"], pid);
+    assert_eq!(identity_value["attach_api"], "/v1/threads");
+
+    let status_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "status"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("server status should run");
+    assert!(
+        status_output.status.success(),
+        "server status should succeed"
+    );
+    let status_report: Value =
+        serde_json::from_slice(&status_output.stdout).expect("json status should parse");
+    assert_eq!(status_report["status"], "running");
+    assert_eq!(status_report["pid"], pid);
+    assert_eq!(status_report["base_url"], base_url);
+}
+
+#[test]
+fn openyak_server_start_detached_is_idempotent_while_running() {
+    let workspace = DetachedWorkspaceGuard::new("openyak-server-start-detached-idempotent");
+
+    let first_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "start", "--detach"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("first detached start should run");
+    assert!(
+        first_output.status.success(),
+        "first detached start should succeed"
+    );
+    let first_report: Value =
+        serde_json::from_slice(&first_output.stdout).expect("first start json should parse");
+
+    let second_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "start", "--detach"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("second detached start should run");
+    assert!(
+        second_output.status.success(),
+        "second detached start should succeed idempotently"
+    );
+    let second_report: Value =
+        serde_json::from_slice(&second_output.stdout).expect("second start json should parse");
+    assert_eq!(second_report["status"], "already_running");
+    assert_eq!(second_report["requested_bind"], "127.0.0.1:0");
+    assert_eq!(second_report["stale_registration_cleared"], false);
+    assert_eq!(second_report["pid"], first_report["pid"]);
+    assert_eq!(second_report["base_url"], first_report["base_url"]);
+}
+
+#[test]
+fn openyak_server_start_detached_replaces_stale_registration() {
+    let workspace = DetachedWorkspaceGuard::new("openyak-server-start-detached-stale");
+    let openyak_dir = workspace.workspace().join(".openyak");
+    std::fs::create_dir_all(&openyak_dir).expect("openyak dir should create");
+    std::fs::write(
+        openyak_dir.join("thread-server.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "baseUrl": "http://127.0.0.1:9",
+            "pid": 4242_u32,
+            "truthLayer": "daemon_local_v1",
+            "operatorPlane": "local_loopback_operator_v1",
+            "persistence": "workspace_sqlite_v1",
+            "attachApi": "/v1/threads"
+        }))
+        .expect("thread server info should serialize"),
+    )
+    .expect("thread server info should write");
+
+    let output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "start", "--detach"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("detached start should run");
+    assert!(
+        output.status.success(),
+        "detached start should succeed from stale registration"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("start json should parse");
+    assert_eq!(report["status"], "started");
+    assert_eq!(report["stale_registration_cleared"], true);
+    assert_ne!(report["base_url"], "http://127.0.0.1:9");
+}
+
+#[test]
+fn openyak_server_start_detached_rejects_unsafe_registration() {
+    let workspace = DetachedWorkspaceGuard::new("openyak-server-start-detached-unsafe");
+    let openyak_dir = workspace.workspace().join(".openyak");
+    std::fs::create_dir_all(&openyak_dir).expect("openyak dir should create");
+    let discovery_path = openyak_dir.join("thread-server.json");
+    std::fs::write(
+        &discovery_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "baseUrl": "http://127.0.0.1:4100",
+            "pid": 4242_u32,
+            "truthLayer": "process_local_v1",
+            "operatorPlane": "local_loopback_operator_v1",
+            "persistence": "workspace_sqlite_v1",
+            "attachApi": "/v1/threads"
+        }))
+        .expect("thread server info should serialize"),
+    )
+    .expect("thread server info should write");
+
+    let output = Command::new(common::openyak_binary())
+        .args(["server", "start", "--detach"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("detached start should run");
+    assert!(
+        !output.status.success(),
+        "detached start should reject unsafe discovery"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        stdout.contains("Status           invalid_registration"),
+        "{stdout}"
+    );
+    assert!(
+        discovery_path.exists(),
+        "unsafe discovery should remain for inspection"
+    );
 }
 
 #[test]

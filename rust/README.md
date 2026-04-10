@@ -312,6 +312,7 @@ skills 目录支持两种布局：
 - `openyak foundations [task|team|cron|lsp|mcp]`
 - `openyak package-release [--output-dir PATH] [--binary PATH]`
 - `openyak server [--bind HOST:PORT]`
+- `openyak server start --detach [--bind HOST:PORT]`
 - `openyak server status`
 - `openyak server stop`
 - `openyak dump-manifests`
@@ -342,6 +343,7 @@ skills 目录支持两种布局：
 - `openyak doctor` 对配置加载、OAuth 配置/凭据、活动模型鉴权预检，以及 GitHub CLI 可用性 / `gh auth status` readiness 做本地只读检查
 - `openyak foundations [task|team|cron|lsp|mcp]` / `/foundations [task|team|cron|lsp|mcp]` 作为只读的 discovery surface，明确说明当前 Task / Team / Cron / LSP / MCP 的 tool membership、truth label 与 `process_local_v1` / registry-backed 边界
 - `openyak package-release` 生成本地 release artifact 目录，供 release/upload 与脱离源码目录的 packaged-use 验证
+- `openyak server start --detach` 作为第一个 local-only operator start action：只会在 detached launch 前做 workspace discovery preflight，并在确认 running discovery record 可用后返回
 - `openyak server status` 作为首个最小 CLI-first daemon/operator inspection：只读回显当前工作区 thread server 的 discovery、reachability、`daemon_local_v1` contract labels 与本地状态库存在性
 - `openyak server stop` 作为第一个 local-only operator action：只会在验证 reachable operator identity 与当前工作区 discovery/pid 一致后停止本地 thread server，并在 stale registration 场景下清理旧发现记录
 - 插件发现、安装、启用、禁用、卸载、更新
@@ -380,9 +382,10 @@ skills 目录支持两种布局：
 - 已有 shared lifecycle/failure/recovery schema family：thread truth 公开 `contract` / `state` / `recovery` 三层快照；Task / Team / Cron 则只在 `process_local_v1` 边界内复用 lifecycle metadata（`created_at`、`updated_at`、`last_error`、`disabled_reason`、`capabilities`），没有被升级成 daemon-backed recovery plane。
 - `/v1/threads/{id}/events` 的 `run.*` SSE payload 现在也会 additive 地回传 `status + lifecycle` 元数据，用于把运行中/完成/等待输入/失败语义锁进同一套 shared schema，而不是引入新的 daemon service lifecycle plane。
 - `run.failed` 的 runtime/storage 两类失败路径现在也有 fixture + live regression 锁定，统一落到 shared `failure_kind / recovery_kind / recommended_actions` taxonomy，而不是继续漂移成 event-local 错误形状。
+- 已有：`openyak server start --detach` 作为 local-only 的最小 CLI-first detached start surface。
 - 已有：`openyak server status` 作为只读、local-only 的最小 CLI-first daemon operator inspection。
 - 已有：`openyak server stop` 作为第一个最小 local-only operator action，但仍然只覆盖当前工作区 thread server。
-- 未有：daemon-backed worker/task/team truth layer、跨 family 的 daemon lifecycle store、CLI-first daemon operator controls beyond local thread server status/stop。
+- 未有：daemon-backed worker/task/team truth layer、跨 family 的 daemon lifecycle store、CLI-first daemon operator controls beyond local thread server start/status/stop。
 
 当前 V1 contract 已冻结的核心口径：
 
@@ -454,7 +457,7 @@ pnpm build
 - `openyak dump-manifests`、`openyak bootstrap-plan`、`openyak agents`、`openyak skills`、`openyak foundations`、`openyak system-prompt`、`openyak logout`、`openyak init`、`openyak doctor`、`openyak package-release` 的直接执行路径
 - `openyak skills list/available/info/install/update/uninstall`
 - `openyak /agents`、`openyak /skills`、`openyak /foundations`、`openyak /skills help`，以及 `openyak --resume ...` 的 resume-safe slash command 链路
-- `openyak server --bind 127.0.0.1:0` 的真实启动探测
+- `openyak server --bind 127.0.0.1:0` 与 `openyak server start --detach --bind 127.0.0.1:0` 的真实启动探测
 - `openyak server --bind 0.0.0.0:0` 的非 loopback bind 拒绝路径
 - `openyak login`、`openyak onboard`、`openyak prompt` 与 self-target `openyak package-release` 的受控失败路径
 
@@ -476,7 +479,7 @@ Mock harness 的运行说明见：[`MOCK_PARITY_HARNESS.md`](./MOCK_PARITY_HARNE
 - `openyak doctor` 当前只做本地只读预检，不提供自动修复、迁移或远程探测。
 - Task / Team / Cron registry 当前仍是进程内临时状态，不提供 durability / restore / lease 语义。
 - `openyak server` 当前提供 bind 范围限制在 loopback 地址的本地 thread/session HTTP/SSE 路由，不是完整 app-server 或远程控制面。
-- daemon/control-plane 路线仍未发货独立的 service install/start/recover surface；当前只有 local-only `openyak server status` / `openyak server stop`。现在的恢复语义仍只覆盖 thread attach-first compatibility，不等同于完整 daemon lifecycle management。
+- daemon/control-plane 路线仍未发货独立的 service install/recover surface；当前只有 local-only `openyak server start --detach` / `openyak server status` / `openyak server stop`。现在的恢复语义仍只覆盖 thread attach-first compatibility，不等同于完整 daemon lifecycle management。
 - 当前补齐的 LSP/MCP 仍以 registry-backed tool/operator surface 为主；完整独立 LSP main entry 继续作为分阶段 follow-up。
 - 在 `0.x` 阶段，命令面和交互细节仍可能继续演进。
 

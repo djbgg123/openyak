@@ -34,6 +34,7 @@ fn openyak_root_and_subcommand_help_cover_verified_surface() {
         "openyak foundations",
         "openyak package-release",
         "openyak server",
+        "openyak server start --detach",
         "openyak server status",
         "openyak server stop",
         "--tool-profile NAME",
@@ -118,6 +119,7 @@ fn openyak_root_and_subcommand_help_cover_verified_surface() {
     let server_help = sandbox.run_success(&["server", "--help"]);
     for marker in [
         "local `/v1/threads` protocol plus legacy `/sessions` compatibility routes",
+        "openyak server start --detach",
         "openyak server stop",
         "workspace `.openyak/state.sqlite3` SQLite store",
         "only supports loopback binds",
