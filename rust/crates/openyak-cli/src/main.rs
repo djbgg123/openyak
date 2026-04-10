@@ -137,7 +137,12 @@ pub(crate) fn cleanup_temp_dir(path: impl AsRef<Path>) {
         match fs::remove_dir_all(path) {
             Ok(()) => return,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            Err(error) if cfg!(windows) && attempt < 9 => {
+            Err(error)
+                if attempt < 9
+                    && (cfg!(windows)
+                        || error.kind() == io::ErrorKind::DirectoryNotEmpty
+                        || error.raw_os_error() == Some(39)) =>
+            {
                 let _ = error;
                 thread::sleep(Duration::from_millis(50));
             }
