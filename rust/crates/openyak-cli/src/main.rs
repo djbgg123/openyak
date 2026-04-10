@@ -3147,6 +3147,8 @@ pub(crate) fn collect_doctor_report_with_loader(
         None => checks.push(doctor_skipped_check("active model auth")),
     }
 
+    checks.push(doctor_local_daemon_check(cwd));
+
     checks.push(doctor_github_cli_check());
 
     DoctorReport {
@@ -3284,6 +3286,92 @@ fn doctor_active_model_auth_check(
             Some(doctor_auth_hint(provider)),
         ),
     }
+}
+
+fn doctor_local_daemon_check(cwd: &Path) -> DoctorCheck {
+    match inspect_thread_server_status_for(cwd) {
+        Ok(report) => match report.status {
+            "running" => DoctorCheck::ok(
+                "local daemon",
+                format!(
+                    "Workspace local thread server is reachable at {} and advertises {}.",
+                    report.base_url.as_deref().unwrap_or("<unknown>"),
+                    report.truth_layer.as_deref().unwrap_or("daemon_local_v1")
+                ),
+                Some(
+                    "Run `openyak server status` for full operator details, or `openyak server stop` if you need to shut it down."
+                        .to_string(),
+                ),
+            ),
+            "not_running" => {
+                let summary = if report.state_db_present {
+                    format!(
+                        "No workspace local thread server is running, but persisted thread truth is present at {}.",
+                        report.state_db_path.display()
+                    )
+                } else {
+                    "No workspace local thread server is running for this workspace.".to_string()
+                };
+                DoctorCheck::ok("local daemon", summary, Some(doctor_local_daemon_hint(&report)))
+            }
+            "stale_registration" => DoctorCheck::warning(
+                "local daemon",
+                format!(
+                    "Workspace discovery points to a stale daemon_local_v1 record{}{}.",
+                    report
+                        .base_url
+                        .as_deref()
+                        .map_or(String::new(), |base_url| format!(" at {base_url}")),
+                    report
+                        .pid
+                        .map_or(String::new(), |pid| format!(" (pid {pid})"))
+                ),
+                Some(doctor_local_daemon_hint(&report)),
+            ),
+            "invalid_registration" => DoctorCheck::error(
+                "local daemon",
+                format!(
+                    "Workspace discovery is not safe to treat as daemon_local_v1: {}",
+                    report.problem.as_deref().unwrap_or("unexpected contract mismatch")
+                ),
+                Some(doctor_local_daemon_hint(&report)),
+            ),
+            other => DoctorCheck::warning(
+                "local daemon",
+                format!("Workspace local daemon inspection returned unexpected status `{other}`."),
+                Some(
+                    "Run `openyak server status` in this workspace to inspect the local discovery record."
+                        .to_string(),
+                ),
+            ),
+        },
+        Err(error) => DoctorCheck::error(
+            "local daemon",
+            format!("Failed to inspect the workspace local thread server: {error}"),
+            Some(
+                "Run `openyak server status` in this workspace to inspect the local discovery record."
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
+fn doctor_local_daemon_hint(report: &ThreadServerStatusReport) -> String {
+    let mut actions = report.recommended_actions.clone();
+    if report.status == "stale_registration"
+        && !actions
+            .iter()
+            .any(|action| action.contains("openyak server stop"))
+    {
+        actions.push(
+            "run `openyak server stop` in this workspace if you only want to clear the stale discovery record"
+                .to_string(),
+        );
+    }
+    actions.push(
+        "run `openyak server status` in this workspace for the full discovery snapshot".to_string(),
+    );
+    actions.join(" ")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8406,7 +8494,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  openyak doctor                           Check local config, auth, and runtime health"
+        "  openyak doctor                           Check local config, auth, and local daemon/runtime health"
     )?;
     writeln!(
         out,
@@ -8549,7 +8637,7 @@ fn render_help_topic(topic: HelpTopic) -> &'static str {
             "Usage: openyak onboard\n\nRun the explicit interactive onboarding wizard.\nThe flow is local-only, reuses `openyak init`, persisted user-model setup, provider-aware auth guidance, and `openyak doctor`, and exits safely without writes in non-interactive terminals."
         }
         HelpTopic::Doctor => {
-            "Usage: openyak doctor\n       openyak --model MODEL doctor\n\nRun local read-only health checks for config loading, OAuth setup, active model auth bootstrap, and GitHub CLI availability/auth readiness. Pass --model to verify the exact provider/auth path you plan to use for prompt, REPL, or GitHub workflows."
+            "Usage: openyak doctor\n       openyak --model MODEL doctor\n\nRun local read-only health checks for config loading, OAuth setup, active model auth bootstrap, current-workspace local daemon/thread-server discovery readiness, and GitHub CLI availability/auth readiness. Pass --model to verify the exact provider/auth path you plan to use for prompt, REPL, or GitHub workflows."
         }
         HelpTopic::Foundations => {
             "Usage: openyak foundations [task|team|cron|lsp|mcp]\n\nShow the shipped read-only foundation families for the current CLI mainline.\nThis surface explains tool membership and current boundaries for Task / Team / Cron / LSP / MCP without implying durable registries, a standalone LSP host, or a broader control plane."
@@ -10648,6 +10736,21 @@ mod tests {
             doctor_check(&report, "active model auth").status,
             DoctorCheckStatus::Ok
         );
+        let local_daemon_check = doctor_check(&report, "local daemon");
+        assert_eq!(local_daemon_check.status, DoctorCheckStatus::Ok);
+        assert!(
+            local_daemon_check
+                .summary
+                .contains("No workspace local thread server is running"),
+            "{local_daemon_check:?}"
+        );
+        assert!(
+            local_daemon_check
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("openyak server start --detach")),
+            "{local_daemon_check:?}"
+        );
         assert_eq!(
             doctor_check(&report, "github cli").status,
             DoctorCheckStatus::Ok
@@ -10730,6 +10833,129 @@ mod tests {
                 .as_deref()
                 .is_some_and(|hint| hint.contains("gh auth login --web")),
             "{github_check:?}"
+        );
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn doctor_report_warns_on_stale_local_daemon_registration() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-doctor-stale-daemon");
+        let cwd = root.join("workspace");
+        let config_home = root.join("openyak-home");
+        let bin_dir = root.join("bin");
+        let openyak_dir = cwd.join(".openyak");
+        fs::create_dir_all(&openyak_dir).expect("workspace state dir should exist");
+        fs::create_dir_all(&config_home).expect("config home should exist");
+        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        fs::write(openyak_dir.join("state.sqlite3"), b"stub").expect("state db should write");
+        fs::write(
+            openyak_dir.join(THREAD_SERVER_INFO_FILENAME),
+            serde_json::to_string_pretty(&json!({
+                "baseUrl": "http://127.0.0.1:9",
+                "pid": 4242_u32,
+                "truthLayer": "daemon_local_v1",
+                "operatorPlane": "local_loopback_operator_v1",
+                "persistence": "workspace_sqlite_v1",
+                "attachApi": "/v1/threads",
+            }))
+            .expect("thread server info should serialize"),
+        )
+        .expect("thread server info should write");
+        write_fake_command(&bin_dir, "gh");
+        let config_home_env = config_home.to_string_lossy().to_string();
+        let path_env = std::env::join_paths([bin_dir.as_path()])
+            .expect("path should join")
+            .to_string_lossy()
+            .to_string();
+        let _openyak_home = EnvVarGuard::set("OPENYAK_CONFIG_HOME", Some(&config_home_env));
+        let _path = EnvVarGuard::set("PATH", Some(&path_env));
+        let _api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", Some("doctor-test-key"));
+        let _auth_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+
+        let report = super::collect_doctor_report(&cwd);
+        let local_daemon_check = doctor_check(&report, "local daemon");
+
+        assert!(
+            !report.has_errors(),
+            "stale discovery should warn without becoming a blocking doctor error"
+        );
+        assert_eq!(local_daemon_check.status, DoctorCheckStatus::Warning);
+        assert!(
+            local_daemon_check
+                .summary
+                .contains("stale daemon_local_v1 record"),
+            "{local_daemon_check:?}"
+        );
+        assert!(
+            local_daemon_check
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("refresh the discovery record")),
+            "{local_daemon_check:?}"
+        );
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn doctor_report_flags_invalid_local_daemon_registration() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-doctor-invalid-daemon");
+        let cwd = root.join("workspace");
+        let config_home = root.join("openyak-home");
+        let bin_dir = root.join("bin");
+        let openyak_dir = cwd.join(".openyak");
+        fs::create_dir_all(&openyak_dir).expect("workspace state dir should exist");
+        fs::create_dir_all(&config_home).expect("config home should exist");
+        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        fs::write(
+            openyak_dir.join(THREAD_SERVER_INFO_FILENAME),
+            serde_json::to_string_pretty(&json!({
+                "baseUrl": "http://127.0.0.1:4100",
+                "pid": 4242_u32,
+                "truthLayer": "process_local_v1",
+                "operatorPlane": "local_loopback_operator_v1",
+                "persistence": "workspace_sqlite_v1",
+                "attachApi": "/v1/threads",
+            }))
+            .expect("thread server info should serialize"),
+        )
+        .expect("thread server info should write");
+        write_fake_command(&bin_dir, "gh");
+        let config_home_env = config_home.to_string_lossy().to_string();
+        let path_env = std::env::join_paths([bin_dir.as_path()])
+            .expect("path should join")
+            .to_string_lossy()
+            .to_string();
+        let _openyak_home = EnvVarGuard::set("OPENYAK_CONFIG_HOME", Some(&config_home_env));
+        let _path = EnvVarGuard::set("PATH", Some(&path_env));
+        let _api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", Some("doctor-test-key"));
+        let _auth_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+
+        let report = super::collect_doctor_report(&cwd);
+        let local_daemon_check = doctor_check(&report, "local daemon");
+
+        assert!(
+            report.has_errors(),
+            "invalid daemon discovery should block doctor"
+        );
+        assert_eq!(local_daemon_check.status, DoctorCheckStatus::Error);
+        assert!(
+            local_daemon_check.summary.contains("daemon_local_v1"),
+            "{local_daemon_check:?}"
+        );
+        assert!(
+            local_daemon_check.summary.contains("truthLayer"),
+            "{local_daemon_check:?}"
+        );
+        assert!(
+            local_daemon_check
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("openyak server start --detach")),
+            "{local_daemon_check:?}"
         );
 
         crate::cleanup_temp_dir(&root);

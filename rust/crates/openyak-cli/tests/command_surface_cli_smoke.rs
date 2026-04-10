@@ -116,6 +116,17 @@ fn openyak_root_and_subcommand_help_cover_verified_surface() {
         "{prompt_help}"
     );
 
+    let doctor_help = sandbox.run_success(&["doctor", "--help"]);
+    for marker in [
+        "current-workspace local daemon/thread-server discovery readiness",
+        "openyak --model MODEL doctor",
+    ] {
+        assert!(
+            doctor_help.contains(marker),
+            "doctor help should mention {marker}: {doctor_help}"
+        );
+    }
+
     let server_help = sandbox.run_success(&["server", "--help"]);
     for marker in [
         "local `/v1/threads` protocol plus legacy `/sessions` compatibility routes",
