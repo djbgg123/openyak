@@ -79,9 +79,25 @@ async def wait_for_thread_status_async(
     raise AssertionError(f"thread did not reach {expected!r}; last status was {last_status!r}")
 
 
+def sync_client(server: object) -> OpenyakClient:
+    return OpenyakClient(
+        base_url=server.base_url,
+        operator_token=server.operator_token,
+        timeout_s=30.0,
+    )
+
+
+def async_client(server: object) -> AsyncOpenyakClient:
+    return AsyncOpenyakClient(
+        base_url=server.base_url,
+        operator_token=server.operator_token,
+        timeout_s=30.0,
+    )
+
+
 def test_attach_first_sync_client_can_create_list_get_and_stream_a_bash_run() -> None:
     with server_harness() as harness:
-        with OpenyakClient(base_url=harness.server.base_url, timeout_s=30.0) as client:
+        with sync_client(harness.server) as client:
             thread = client.create_thread(
                 model="claude-sonnet-4-6",
                 allowed_tools=["bash"],
@@ -133,7 +149,7 @@ def test_attach_first_sync_client_can_create_list_get_and_stream_a_bash_run() ->
 
 def test_buffered_sync_run_preserves_runtime_failure_recovery_metadata() -> None:
     with runtime_failure_server_harness() as harness:
-        with OpenyakClient(base_url=harness.server.base_url, timeout_s=30.0) as client:
+        with sync_client(harness.server) as client:
             thread = client.create_thread(
                 model="opus",
                 allowed_tools=[],
@@ -162,7 +178,7 @@ def test_buffered_sync_run_preserves_runtime_failure_recovery_metadata() -> None
 
 def test_streamed_sync_run_surfaces_runtime_failure_recovery_metadata() -> None:
     with runtime_failure_server_harness() as harness:
-        with OpenyakClient(base_url=harness.server.base_url, timeout_s=30.0) as client:
+        with sync_client(harness.server) as client:
             thread = client.create_thread(
                 model="opus",
                 allowed_tools=[],
@@ -188,7 +204,7 @@ def test_streamed_sync_run_surfaces_runtime_failure_recovery_metadata() -> None:
             )
 
 
-def test_buffered_sync_run_recovers_interrupted_snapshot_truth_after_server_restart() -> None:
+def test_buffered_sync_run_requires_reconnect_after_server_restart() -> None:
     mock = start_mock_anthropic_service()
     workspace = tempfile.mkdtemp(prefix="openyak-python-sdk-restart-")
     env = {
@@ -201,7 +217,7 @@ def test_buffered_sync_run_recovers_interrupted_snapshot_truth_after_server_rest
     bind = urlparse(base_url).netloc
 
     try:
-        with OpenyakClient(base_url=base_url, timeout_s=30.0) as client:
+        with sync_client(server) as client:
             thread = client.create_thread(
                 model="claude-sonnet-4-6",
                 allowed_tools=["read_file"],
@@ -230,23 +246,8 @@ def test_buffered_sync_run_recovers_interrupted_snapshot_truth_after_server_rest
             )
 
             runner.join(timeout=30)
-            assert "error" not in result_holder, result_holder.get("error")
-            result = result_holder.get("result")
-            assert result is not None
-            assert result.status == "interrupted"
-            assert result.recovered_from_snapshot is True
-            assert result.recovery_note is not None
-            assert "restart or shutdown" in result.recovery_note
-            assert result.snapshot is not None
-            assert result.snapshot.state.lifecycle is not None
-            assert (
-                result.snapshot.state.lifecycle.failure_kind
-                == "daemon_restart_interrupted_run"
-            )
-            assert result.snapshot.state.recovery is not None
-            assert (
-                result.snapshot.state.recovery.recovery_kind == "reattach_or_retry"
-            )
+            assert "result" not in result_holder, result_holder.get("result")
+            assert isinstance(result_holder.get("error"), OpenyakReconnectRequiredError)
     finally:
         server.close()
         mock.close()
@@ -266,7 +267,7 @@ def test_streamed_sync_run_surfaces_reconnect_required_after_server_restart() ->
     bind = urlparse(base_url).netloc
 
     try:
-        with OpenyakClient(base_url=base_url, timeout_s=30.0) as client:
+        with sync_client(server) as client:
             thread = client.create_thread(
                 model="claude-sonnet-4-6",
                 allowed_tools=["read_file"],
@@ -305,16 +306,16 @@ def test_streamed_sync_run_surfaces_live_resync_required_after_lag() -> None:
         }
     )
     try:
-        with OpenyakClient(base_url=server.base_url, timeout_s=30.0) as client:
+        with sync_client(server) as client:
             thread = client.create_thread(model="claude-sonnet-4-6")
 
             with thread.run_streamed("PARITY_SCENARIO:lagged_stream_resync") as streamed:
-                first = next(streamed.events)
-                assert first.type == "run.started"
-                time.sleep(0.5)
-
+                iterator = iter(streamed.events)
                 with pytest.raises(OpenyakResyncRequiredError) as error:
-                    list(streamed.events)
+                    first = next(iterator)
+                    assert first.type == "run.started"
+                    time.sleep(0.5)
+                    list(iterator)
 
             assert error.value.event.thread_id == thread.thread_id
             assert error.value.event.payload.skipped > 0
@@ -336,7 +337,7 @@ def test_attach_first_sync_stream_restart_yields_awaiting_snapshot() -> None:
     bind = urlparse(server.base_url).netloc
 
     try:
-        with OpenyakClient(base_url=server.base_url, timeout_s=30.0) as client:
+        with sync_client(server) as client:
             thread = client.create_thread(
                 model="claude-sonnet-4-6",
                 allowed_tools=["read_file"],
@@ -358,7 +359,7 @@ def test_attach_first_sync_stream_restart_yields_awaiting_snapshot() -> None:
             cleanup_workspace=False,
         )
 
-        with OpenyakClient(base_url=server.base_url, timeout_s=30.0) as restarted_client:
+        with sync_client(server) as restarted_client:
             reattached = restarted_client.resume_thread(thread_id)
             events = reattached.stream_events()
             try:
@@ -390,7 +391,7 @@ def test_attach_first_sync_stream_restart_yields_interrupted_snapshot() -> None:
     bind = urlparse(server.base_url).netloc
 
     try:
-        with OpenyakClient(base_url=server.base_url, timeout_s=30.0) as client:
+        with sync_client(server) as client:
             thread = client.create_thread(
                 model="claude-sonnet-4-6",
                 allowed_tools=["read_file"],
@@ -407,7 +408,7 @@ def test_attach_first_sync_stream_restart_yields_interrupted_snapshot() -> None:
             cleanup_workspace=False,
         )
 
-        with OpenyakClient(base_url=server.base_url, timeout_s=30.0) as restarted_client:
+        with sync_client(server) as restarted_client:
             reattached = restarted_client.resume_thread(thread_id)
             events = reattached.stream_events()
             try:
@@ -446,7 +447,7 @@ def test_attach_first_sync_restart_preserves_awaiting_user_input_truth() -> None
     bind = urlparse(server.base_url).netloc
 
     try:
-        with OpenyakClient(base_url=server.base_url, timeout_s=30.0) as client:
+        with sync_client(server) as client:
             thread = client.create_thread(
                 model="claude-sonnet-4-6",
                 allowed_tools=["read_file"],
@@ -468,7 +469,7 @@ def test_attach_first_sync_restart_preserves_awaiting_user_input_truth() -> None
             cleanup_workspace=False,
         )
 
-        with OpenyakClient(base_url=server.base_url, timeout_s=30.0) as restarted_client:
+        with sync_client(server) as restarted_client:
             reattached = restarted_client.resume_thread(thread_id)
             recovered = reattached.read()
             assert recovered.state.status == "awaiting_user_input"
@@ -512,7 +513,7 @@ def test_attach_first_sync_restart_preserves_interrupted_truth() -> None:
     bind = urlparse(server.base_url).netloc
 
     try:
-        with OpenyakClient(base_url=server.base_url, timeout_s=30.0) as client:
+        with sync_client(server) as client:
             thread = client.create_thread(
                 model="claude-sonnet-4-6",
                 allowed_tools=["read_file"],
@@ -529,7 +530,7 @@ def test_attach_first_sync_restart_preserves_interrupted_truth() -> None:
             cleanup_workspace=False,
         )
 
-        with OpenyakClient(base_url=server.base_url, timeout_s=30.0) as restarted_client:
+        with sync_client(server) as restarted_client:
             reattached = restarted_client.resume_thread(thread_id)
             wait_for_thread_status(reattached, "interrupted")
             recovered = reattached.read()
@@ -567,7 +568,7 @@ def test_attach_first_sync_restart_preserves_interrupted_truth() -> None:
 
 def test_buffered_sync_run_returns_awaiting_user_input_and_resume_continues_the_same_run() -> None:
     with server_harness() as harness:
-        with OpenyakClient(base_url=harness.server.base_url, timeout_s=30.0) as client:
+        with sync_client(harness.server) as client:
             thread = client.create_thread(
                 model="claude-sonnet-4-6",
                 allowed_tools=["read_file"],
@@ -601,10 +602,7 @@ def test_buffered_sync_run_returns_awaiting_user_input_and_resume_continues_the_
 def test_attach_first_async_client_can_create_list_get_and_stream_a_bash_run() -> None:
     async def case() -> None:
         with server_harness() as harness:
-            async with AsyncOpenyakClient(
-                base_url=harness.server.base_url,
-                timeout_s=30.0,
-            ) as client:
+            async with async_client(harness.server) as client:
                 created = await client.create_thread(
                     model="claude-sonnet-4-6",
                     allowed_tools=["bash"],
@@ -655,10 +653,7 @@ def test_attach_first_async_client_can_create_list_get_and_stream_a_bash_run() -
 def test_buffered_async_run_returns_awaiting_user_input_and_resume_continues_the_same_run() -> None:
     async def case() -> None:
         with server_harness() as harness:
-            async with AsyncOpenyakClient(
-                base_url=harness.server.base_url,
-                timeout_s=30.0,
-            ) as client:
+            async with async_client(harness.server) as client:
                 thread = await client.create_thread(
                     model="claude-sonnet-4-6",
                     allowed_tools=["read_file"],
@@ -693,10 +688,7 @@ def test_buffered_async_run_returns_awaiting_user_input_and_resume_continues_the
 def test_buffered_async_run_preserves_runtime_failure_recovery_metadata() -> None:
     async def case() -> None:
         with runtime_failure_server_harness() as harness:
-            async with AsyncOpenyakClient(
-                base_url=harness.server.base_url,
-                timeout_s=30.0,
-            ) as client:
+            async with async_client(harness.server) as client:
                 thread = await client.create_thread(
                     model="opus",
                     allowed_tools=[],
@@ -724,10 +716,7 @@ def test_buffered_async_run_preserves_runtime_failure_recovery_metadata() -> Non
 def test_streamed_async_run_surfaces_runtime_failure_recovery_metadata() -> None:
     async def case() -> None:
         with runtime_failure_server_harness() as harness:
-            async with AsyncOpenyakClient(
-                base_url=harness.server.base_url,
-                timeout_s=30.0,
-            ) as client:
+            async with async_client(harness.server) as client:
                 thread = await client.create_thread(
                     model="opus",
                     allowed_tools=[],
@@ -760,7 +749,7 @@ def test_streamed_async_run_surfaces_runtime_failure_recovery_metadata() -> None
     asyncio.run(case())
 
 
-def test_buffered_async_run_recovers_interrupted_snapshot_truth_after_server_restart() -> None:
+def test_buffered_async_run_requires_reconnect_after_server_restart() -> None:
     async def case() -> None:
         mock = start_mock_anthropic_service()
         workspace = tempfile.mkdtemp(prefix="openyak-python-sdk-async-restart-")
@@ -774,7 +763,7 @@ def test_buffered_async_run_recovers_interrupted_snapshot_truth_after_server_res
         bind = urlparse(base_url).netloc
 
         try:
-            async with AsyncOpenyakClient(base_url=base_url, timeout_s=30.0) as client:
+            async with async_client(server) as client:
                 thread = await client.create_thread(
                     model="claude-sonnet-4-6",
                     allowed_tools=["read_file"],
@@ -794,21 +783,8 @@ def test_buffered_async_run_recovers_interrupted_snapshot_truth_after_server_res
                     cleanup_workspace=False,
                 )
 
-                result = await asyncio.wait_for(run_task, timeout=30.0)
-                assert result.status == "interrupted"
-                assert result.recovered_from_snapshot is True
-                assert result.recovery_note is not None
-                assert "restart or shutdown" in result.recovery_note
-                assert result.snapshot is not None
-                assert result.snapshot.state.lifecycle is not None
-                assert (
-                    result.snapshot.state.lifecycle.failure_kind
-                    == "daemon_restart_interrupted_run"
-                )
-                assert result.snapshot.state.recovery is not None
-                assert (
-                    result.snapshot.state.recovery.recovery_kind == "reattach_or_retry"
-                )
+                with pytest.raises(OpenyakReconnectRequiredError):
+                    await asyncio.wait_for(run_task, timeout=30.0)
         finally:
             server.close()
             mock.close()
@@ -831,7 +807,7 @@ def test_streamed_async_run_surfaces_reconnect_required_after_server_restart() -
         bind = urlparse(base_url).netloc
 
         try:
-            async with AsyncOpenyakClient(base_url=base_url, timeout_s=30.0) as client:
+            async with async_client(server) as client:
                 thread = await client.create_thread(
                     model="claude-sonnet-4-6",
                     allowed_tools=["read_file"],
@@ -874,21 +850,18 @@ def test_streamed_async_run_surfaces_live_resync_required_after_lag() -> None:
             }
         )
         try:
-            async with AsyncOpenyakClient(
-                base_url=server.base_url,
-                timeout_s=30.0,
-            ) as client:
+            async with async_client(server) as client:
                 thread = await client.create_thread(model="claude-sonnet-4-6")
 
                 async with await thread.run_streamed(
                     "PARITY_SCENARIO:lagged_stream_resync"
                 ) as streamed:
-                    first = await anext(streamed.events)
-                    assert first.type == "run.started"
-                    await asyncio.sleep(0.5)
-
+                    iterator = streamed.events
                     with pytest.raises(OpenyakResyncRequiredError) as error:
-                        async for _event in streamed.events:
+                        first = await anext(iterator)
+                        assert first.type == "run.started"
+                        await asyncio.sleep(0.5)
+                        async for _event in iterator:
                             pass
 
                 assert error.value.event.thread_id == thread.thread_id
@@ -914,7 +887,7 @@ def test_attach_first_async_stream_restart_yields_awaiting_snapshot() -> None:
         bind = urlparse(server.base_url).netloc
 
         try:
-            async with AsyncOpenyakClient(base_url=server.base_url, timeout_s=30.0) as client:
+            async with async_client(server) as client:
                 thread = await client.create_thread(
                     model="claude-sonnet-4-6",
                     allowed_tools=["read_file"],
@@ -936,10 +909,7 @@ def test_attach_first_async_stream_restart_yields_awaiting_snapshot() -> None:
                 cleanup_workspace=False,
             )
 
-            async with AsyncOpenyakClient(
-                base_url=server.base_url,
-                timeout_s=30.0,
-            ) as restarted_client:
+            async with async_client(server) as restarted_client:
                 reattached = restarted_client.resume_thread(thread_id)
                 events = reattached.stream_events()
                 try:
@@ -974,7 +944,7 @@ def test_attach_first_async_stream_restart_yields_interrupted_snapshot() -> None
         bind = urlparse(server.base_url).netloc
 
         try:
-            async with AsyncOpenyakClient(base_url=server.base_url, timeout_s=30.0) as client:
+            async with async_client(server) as client:
                 thread = await client.create_thread(
                     model="claude-sonnet-4-6",
                     allowed_tools=["read_file"],
@@ -993,10 +963,7 @@ def test_attach_first_async_stream_restart_yields_interrupted_snapshot() -> None
                 cleanup_workspace=False,
             )
 
-            async with AsyncOpenyakClient(
-                base_url=server.base_url,
-                timeout_s=30.0,
-            ) as restarted_client:
+            async with async_client(server) as restarted_client:
                 reattached = restarted_client.resume_thread(thread_id)
                 events = reattached.stream_events()
                 try:
@@ -1038,7 +1005,7 @@ def test_attach_first_async_restart_preserves_awaiting_user_input_truth() -> Non
         bind = urlparse(server.base_url).netloc
 
         try:
-            async with AsyncOpenyakClient(base_url=server.base_url, timeout_s=30.0) as client:
+            async with async_client(server) as client:
                 thread = await client.create_thread(
                     model="claude-sonnet-4-6",
                     allowed_tools=["read_file"],
@@ -1060,10 +1027,7 @@ def test_attach_first_async_restart_preserves_awaiting_user_input_truth() -> Non
                 cleanup_workspace=False,
             )
 
-            async with AsyncOpenyakClient(
-                base_url=server.base_url,
-                timeout_s=30.0,
-            ) as restarted_client:
+            async with async_client(server) as restarted_client:
                 reattached = restarted_client.resume_thread(thread_id)
                 recovered = await reattached.read()
                 assert recovered.state.status == "awaiting_user_input"
@@ -1110,7 +1074,7 @@ def test_attach_first_async_restart_preserves_interrupted_truth() -> None:
         bind = urlparse(server.base_url).netloc
 
         try:
-            async with AsyncOpenyakClient(base_url=server.base_url, timeout_s=30.0) as client:
+            async with async_client(server) as client:
                 thread = await client.create_thread(
                     model="claude-sonnet-4-6",
                     allowed_tools=["read_file"],
@@ -1129,10 +1093,7 @@ def test_attach_first_async_restart_preserves_interrupted_truth() -> None:
                 cleanup_workspace=False,
             )
 
-            async with AsyncOpenyakClient(
-                base_url=server.base_url,
-                timeout_s=30.0,
-            ) as restarted_client:
+            async with async_client(server) as restarted_client:
                 reattached = restarted_client.resume_thread(thread_id)
                 await wait_for_thread_status_async(reattached, "interrupted")
                 recovered = await reattached.read()

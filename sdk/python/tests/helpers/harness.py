@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
@@ -49,6 +50,7 @@ class MockAnthropicHarness:
 @dataclass(slots=True)
 class OpenyakServerHarness:
     base_url: str
+    operator_token: str
     workspace: Path
     managed: ManagedProcess
     cleanup_workspace: bool = True
@@ -114,6 +116,7 @@ def start_openyak_server_in(
     bind: str = "127.0.0.1:0",
     cleanup_workspace: bool = False,
 ) -> OpenyakServerHarness:
+    workspace = Path(workspace)
     managed, match = _start_process(
         _resolve_openyak_server_command(),
         {
@@ -125,6 +128,7 @@ def start_openyak_server_in(
     )
     return OpenyakServerHarness(
         base_url=match.group(1),
+        operator_token=_read_operator_token(workspace),
         workspace=workspace,
         managed=managed,
         cleanup_workspace=cleanup_workspace,
@@ -224,6 +228,15 @@ def _start_process(
     raise RuntimeError(
         f"process did not emit startup line within 90s: {''.join(stderr_chunks)}"
     )
+
+
+def _read_operator_token(workspace: Path) -> str:
+    workspace = Path(workspace)
+    record = json.loads((workspace / ".openyak" / "thread-server.json").read_text("utf-8"))
+    operator_token = record.get("operatorToken")
+    if not isinstance(operator_token, str) or not operator_token:
+        raise RuntimeError("thread-server discovery did not include operatorToken")
+    return operator_token
 
 
 def _pump_stdout(process: subprocess.Popen[str], sink: queue.Queue[str]) -> None:

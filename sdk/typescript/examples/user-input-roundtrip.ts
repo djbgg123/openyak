@@ -4,8 +4,12 @@ const baseUrl = process.env.OPENYAK_BASE_URL;
 if (!baseUrl) {
   throw new Error("Set OPENYAK_BASE_URL to a running local `openyak server` address.");
 }
+const operatorToken = process.env.OPENYAK_OPERATOR_TOKEN;
 
-const client = new OpenyakClient({ baseUrl });
+const client = new OpenyakClient({
+  baseUrl,
+  ...(operatorToken === undefined ? {} : { operatorToken }),
+});
 const thread = await client.createThread({
   model: "claude-sonnet-4-6",
   allowedTools: ["read_file"],

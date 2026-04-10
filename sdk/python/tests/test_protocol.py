@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
 from openyak_sdk import (
@@ -141,6 +142,23 @@ def test_fixture_matrix_decodes_locked_v1_contract() -> None:
         conflict.details["status"]["lifecycle"]["status"]  # type: ignore[index]
         == "awaiting_user_input"
     )
+
+
+def test_sync_client_sends_bearer_token_when_operator_token_is_configured() -> None:
+    seen_headers: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_headers.update(request.headers)
+        return json_response({"protocol_version": "v1", "threads": []}).build(request)
+
+    with OpenyakClient(
+        base_url="http://local.test",
+        operator_token="token-123",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        client.list_threads()
+
+    assert seen_headers["authorization"] == "Bearer token-123"
 
 
 def test_list_threads_rejects_unsupported_protocol_versions() -> None:

@@ -69,18 +69,20 @@ class OpenyakClient:
         self,
         *,
         base_url: str,
+        operator_token: str | None = None,
         timeout_s: float = 10.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         trimmed = base_url.rstrip("/")
         if not trimmed:
             raise OpenyakProtocolError("base_url is required")
+        normalized_operator_token = _normalize_operator_token(operator_token)
         self.base_url = trimmed
         self._client = httpx.Client(
             base_url=self.base_url,
             timeout=timeout_s,
             transport=transport,
-            headers={"accept": "application/json, text/event-stream"},
+            headers=_default_headers(normalized_operator_token),
         )
 
     def close(self) -> None:
@@ -482,18 +484,20 @@ class AsyncOpenyakClient:
         self,
         *,
         base_url: str,
+        operator_token: str | None = None,
         timeout_s: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         trimmed = base_url.rstrip("/")
         if not trimmed:
             raise OpenyakProtocolError("base_url is required")
+        normalized_operator_token = _normalize_operator_token(operator_token)
         self.base_url = trimmed
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout_s,
             transport=transport,
-            headers={"accept": "application/json, text/event-stream"},
+            headers=_default_headers(normalized_operator_token),
         )
 
     async def aclose(self) -> None:
@@ -909,6 +913,22 @@ def _create_thread_body(options: CreateThreadOptions) -> dict[str, JsonValue]:
     return body
 
 
+def _normalize_operator_token(operator_token: str | None) -> str | None:
+    if operator_token is None:
+        return None
+    normalized = operator_token.strip()
+    if not normalized:
+        raise OpenyakProtocolError("operator_token must not be blank")
+    return normalized
+
+
+def _default_headers(operator_token: str | None) -> dict[str, str]:
+    headers = {"accept": "application/json, text/event-stream"}
+    if operator_token is not None:
+        headers["authorization"] = f"Bearer {operator_token}"
+    return headers
+
+
 def _quote(thread_id: str) -> str:
     return quote(thread_id, safe="")
 
@@ -966,11 +986,11 @@ def _read_for_reconcile(
     read_snapshot: Callable[[], ThreadSnapshot],
     error: OpenyakResyncRequiredError | OpenyakReconnectRequiredError,
 ) -> ThreadSnapshot:
-    last_error: httpx.HTTPError | None = None
+    last_error: Exception | None = None
     for attempt in range(10):
         try:
             return read_snapshot()
-        except httpx.HTTPError as read_error:
+        except (httpx.HTTPError, OpenyakApiError) as read_error:
             last_error = read_error
             if attempt == 9:
                 break
@@ -982,11 +1002,11 @@ async def _read_for_reconcile_async(
     read_snapshot: Callable[[], Any],
     error: OpenyakResyncRequiredError | OpenyakReconnectRequiredError,
 ) -> ThreadSnapshot:
-    last_error: httpx.HTTPError | None = None
+    last_error: Exception | None = None
     for attempt in range(10):
         try:
             return await read_snapshot()
-        except httpx.HTTPError as read_error:
+        except (httpx.HTTPError, OpenyakApiError) as read_error:
             last_error = read_error
             if attempt == 9:
                 break

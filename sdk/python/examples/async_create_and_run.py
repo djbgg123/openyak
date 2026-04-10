@@ -7,7 +7,10 @@ from openyak_sdk import AsyncOpenyakClient
 
 
 async def main() -> None:
-    async with AsyncOpenyakClient(base_url=os.environ["OPENYAK_BASE_URL"]) as client:
+    async with AsyncOpenyakClient(
+        base_url=os.environ["OPENYAK_BASE_URL"],
+        operator_token=os.environ.get("OPENYAK_OPERATOR_TOKEN"),
+    ) as client:
         thread = await client.create_thread(
             model="claude-sonnet-4-6",
             allowed_tools=["bash"],

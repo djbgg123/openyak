@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -30,6 +30,7 @@ export interface MockAnthropicHarness extends ManagedProcess {
 
 export interface OpenyakServerHarness extends ManagedProcess {
   baseUrl: string;
+  operatorToken: string;
   workspace: string;
 }
 
@@ -87,9 +88,11 @@ export async function startOpenyakServerIn(
   if (!baseUrl) {
     throw new Error("openyak server did not report a base URL");
   }
+  const operatorToken = await readOperatorToken(workspace);
   return {
     ...proc,
     baseUrl,
+    operatorToken,
     workspace,
     async close() {
       await proc.close();
@@ -98,6 +101,15 @@ export async function startOpenyakServerIn(
       }
     },
   };
+}
+
+async function readOperatorToken(workspace: string): Promise<string> {
+  const raw = await readFile(path.join(workspace, ".openyak", "thread-server.json"), "utf8");
+  const parsed = JSON.parse(raw) as { operatorToken?: unknown };
+  if (typeof parsed.operatorToken !== "string" || parsed.operatorToken.length === 0) {
+    throw new Error("thread-server discovery did not include operatorToken");
+  }
+  return parsed.operatorToken;
 }
 
 export async function withServerHarness<T>(

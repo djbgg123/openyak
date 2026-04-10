@@ -83,6 +83,7 @@ import { OpenyakClient } from "@openyak/typescript-sdk-alpha";
 
 const client = new OpenyakClient({
   baseUrl: process.env.OPENYAK_BASE_URL!,
+  operatorToken: process.env.OPENYAK_OPERATOR_TOKEN,
 });
 
 const thread = await client.createThread({
@@ -155,7 +156,7 @@ const snapshot = await thread.read();
 - `run()` may reconcile from `thread.read()` after a dropped stream and marks the result with `recoveredFromSnapshot: true`.
 - If the local server fails before runtime/provider bootstrap completes, the latest thread snapshot still preserves the submitted turn or user-input response instead of silently dropping it.
 - If the server restarts mid-run, the latest snapshot may come back as `status="interrupted"` with a `recovery_note`; the SDK exposes that persisted truth, but it does not invent daemon-side replay or recovery actions.
-- That interrupted snapshot truth is now also locked in live local-server integration coverage, so buffered attach-first runs can reconcile real restart disconnects back into `recovery_note` plus shared `failure_kind / recovery_kind / recommended_actions`.
+- Because local operator auth is per-daemon, an in-flight buffered client from before the restart may no longer be able to read the restarted server; that path now throws `OpenyakReconnectRequiredError` instead of pretending buffered replay still exists.
 - Fresh attach-first reattachment is now also locked live: after a local server restart, `resumeThread()`, `read()`, and `listThreads()` expose the latest persisted `awaiting_user_input` or `interrupted` snapshot truth without pretending `run()` replay exists.
 - The same snapshot contract also exposes `operator_plane`, `persistence`, and structured recovery fields (`failure_kind`, `recovery_kind`, `recommended_actions`) so attach-first clients can render operator guidance without implying broader daemon controls.
 - That reconciliation is intentionally best-effort for local attach-first, single-writer usage; if the latest snapshot shows a different active `run_id`, `run()` throws `OpenyakReconnectRequiredError` instead of pretending replay exists.

@@ -58,6 +58,10 @@ impl ChildGuard {
         self.workspace.join(".openyak").join("thread-server.json")
     }
 
+    fn operator_token(&self) -> String {
+        discovery_operator_token(&self.server_info_path())
+    }
+
     fn workspace(&self) -> &PathBuf {
         &self.workspace
     }
@@ -131,6 +135,8 @@ impl Drop for DetachedWorkspaceGuard {
 fn openyak_server_surfaces_thread_routes() {
     let mut child = ChildGuard::spawn();
     let address = child.advertised_address();
+    let operator_token = child.operator_token();
+    let auth = auth_header(&operator_token);
     let server_info = std::fs::read_to_string(child.server_info_path())
         .expect("thread server info file should exist");
     let server_info_json: Value =
@@ -147,11 +153,12 @@ fn openyak_server_surfaces_thread_routes() {
     );
     assert_eq!(server_info_json["persistence"], "workspace_sqlite_v1");
     assert_eq!(server_info_json["attachApi"], "/v1/threads");
+    assert!(server_info_json["operatorToken"].as_str().is_some());
 
     let create = http_request_with_retry(
         &address,
         &format!(
-            "POST /v1/threads HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+            "POST /v1/threads HTTP/1.1\r\nHost: {address}\r\n{auth}Connection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
         ),
     );
     assert!(
@@ -179,7 +186,7 @@ fn openyak_server_surfaces_thread_routes() {
 
     let list = http_request_with_retry(
         &address,
-        &format!("GET /v1/threads HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"),
+        &format!("GET /v1/threads HTTP/1.1\r\nHost: {address}\r\n{auth}Connection: close\r\n\r\n"),
     );
     assert!(
         list.starts_with("HTTP/1.1 200"),
@@ -221,11 +228,13 @@ fn openyak_server_persists_threads_across_restart_and_keeps_legacy_session_route
 
     let mut child = ChildGuard::spawn_in(workspace.clone(), false);
     let address = child.advertised_address();
+    let operator_token = child.operator_token();
+    let auth = auth_header(&operator_token);
 
     let create = http_request_with_retry(
         &address,
         &format!(
-            "POST /v1/threads HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+            "POST /v1/threads HTTP/1.1\r\nHost: {address}\r\n{auth}Connection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
         ),
     );
     assert!(
@@ -242,7 +251,7 @@ fn openyak_server_persists_threads_across_restart_and_keeps_legacy_session_route
     let legacy_before_restart = http_request_with_retry(
         &address,
         &format!(
-            "GET /sessions/{thread_id} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            "GET /sessions/{thread_id} HTTP/1.1\r\nHost: {address}\r\n{auth}Connection: close\r\n\r\n"
         ),
     );
     assert!(
@@ -257,6 +266,8 @@ fn openyak_server_persists_threads_across_restart_and_keeps_legacy_session_route
 
     let mut restarted = ChildGuard::spawn_in(workspace.clone(), false);
     let restarted_address = restarted.advertised_address();
+    let restarted_operator_token = restarted.operator_token();
+    let restarted_auth = auth_header(&restarted_operator_token);
     assert_eq!(
         workspace,
         *restarted.workspace(),
@@ -266,7 +277,7 @@ fn openyak_server_persists_threads_across_restart_and_keeps_legacy_session_route
     let list = http_request_with_retry(
         &restarted_address,
         &format!(
-            "GET /v1/threads HTTP/1.1\r\nHost: {restarted_address}\r\nConnection: close\r\n\r\n"
+            "GET /v1/threads HTTP/1.1\r\nHost: {restarted_address}\r\n{restarted_auth}Connection: close\r\n\r\n"
         ),
     );
     assert!(
@@ -287,7 +298,7 @@ fn openyak_server_persists_threads_across_restart_and_keeps_legacy_session_route
     let thread_snapshot = http_request_with_retry(
         &restarted_address,
         &format!(
-            "GET /v1/threads/{thread_id} HTTP/1.1\r\nHost: {restarted_address}\r\nConnection: close\r\n\r\n"
+            "GET /v1/threads/{thread_id} HTTP/1.1\r\nHost: {restarted_address}\r\n{restarted_auth}Connection: close\r\n\r\n"
         ),
     );
     assert!(
@@ -302,7 +313,7 @@ fn openyak_server_persists_threads_across_restart_and_keeps_legacy_session_route
     let legacy_after_restart = http_request_with_retry(
         &restarted_address,
         &format!(
-            "GET /sessions/{thread_id} HTTP/1.1\r\nHost: {restarted_address}\r\nConnection: close\r\n\r\n"
+            "GET /sessions/{thread_id} HTTP/1.1\r\nHost: {restarted_address}\r\n{restarted_auth}Connection: close\r\n\r\n"
         ),
     );
     assert!(
@@ -469,11 +480,18 @@ fn openyak_server_start_detached_launches_local_server() {
     let address = base_url
         .strip_prefix("http://")
         .expect("base_url should be http");
+    let operator_token = discovery_operator_token(
+        &workspace
+            .workspace()
+            .join(".openyak")
+            .join("thread-server.json"),
+    );
+    let auth = auth_header(&operator_token);
 
     let identity = http_request_with_retry(
         address,
         &format!(
-            "GET /v1/operator/identity HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            "GET /v1/operator/identity HTTP/1.1\r\nHost: {address}\r\n{auth}Connection: close\r\n\r\n"
         ),
     );
     assert!(
@@ -536,6 +554,51 @@ fn openyak_server_start_detached_is_idempotent_while_running() {
 }
 
 #[test]
+fn openyak_server_start_detached_fails_when_requested_bind_conflicts_with_running_server() {
+    let workspace = DetachedWorkspaceGuard::new("openyak-server-start-detached-bind-conflict");
+
+    let first_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "start", "--detach"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("first detached start should run");
+    assert!(
+        first_output.status.success(),
+        "first detached start should succeed"
+    );
+    let first_report: Value =
+        serde_json::from_slice(&first_output.stdout).expect("first start json should parse");
+
+    let conflicting_output = Command::new(common::openyak_binary())
+        .args([
+            "--output-format",
+            "json",
+            "server",
+            "start",
+            "--detach",
+            "--bind",
+            "127.0.0.1:4105",
+        ])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("conflicting detached start should run");
+    assert!(
+        !conflicting_output.status.success(),
+        "conflicting detached start should fail"
+    );
+    let conflicting_report: Value = serde_json::from_slice(&conflicting_output.stdout)
+        .expect("conflicting start json should parse");
+    assert_eq!(conflicting_report["status"], "bind_conflict");
+    assert_eq!(conflicting_report["base_url"], first_report["base_url"]);
+    assert!(
+        conflicting_report["problem"]
+            .as_str()
+            .is_some_and(|problem| problem.contains("does not match")),
+        "{conflicting_report}"
+    );
+}
+
+#[test]
 fn openyak_server_start_detached_replaces_stale_registration() {
     let workspace = DetachedWorkspaceGuard::new("openyak-server-start-detached-stale");
     let openyak_dir = workspace.workspace().join(".openyak");
@@ -548,7 +611,8 @@ fn openyak_server_start_detached_replaces_stale_registration() {
             "truthLayer": "daemon_local_v1",
             "operatorPlane": "local_loopback_operator_v1",
             "persistence": "workspace_sqlite_v1",
-            "attachApi": "/v1/threads"
+            "attachApi": "/v1/threads",
+            "operatorToken": "fixture-token"
         }))
         .expect("thread server info should serialize"),
     )
@@ -583,7 +647,8 @@ fn openyak_server_start_detached_rejects_unsafe_registration() {
             "truthLayer": "process_local_v1",
             "operatorPlane": "local_loopback_operator_v1",
             "persistence": "workspace_sqlite_v1",
-            "attachApi": "/v1/threads"
+            "attachApi": "/v1/threads",
+            "operatorToken": "fixture-token"
         }))
         .expect("thread server info should serialize"),
     )
@@ -641,18 +706,57 @@ fn openyak_server_recover_reports_nothing_to_recover_without_persisted_truth() {
 }
 
 #[test]
+fn openyak_server_recover_reports_nothing_to_recover_for_empty_state_db() {
+    let workspace = DetachedWorkspaceGuard::new("openyak-server-recover-empty-state-db");
+
+    let start_output = Command::new(common::openyak_binary())
+        .args(["server", "start", "--detach"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("server start --detach should run");
+    assert!(
+        start_output.status.success(),
+        "detached start should succeed"
+    );
+
+    let stop_output = Command::new(common::openyak_binary())
+        .args(["server", "stop"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("server stop should run");
+    assert!(stop_output.status.success(), "server stop should succeed");
+
+    let recover_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "recover"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("server recover should run");
+    assert!(
+        recover_output.status.success(),
+        "server recover should succeed"
+    );
+    let report: Value =
+        serde_json::from_slice(&recover_output.stdout).expect("json server recover should parse");
+    assert_eq!(report["status"], "nothing_to_recover");
+    assert_eq!(report["recovery_kind"], "no_persisted_truth");
+    assert_eq!(report["state_db_present"], true);
+}
+
+#[test]
 fn openyak_server_recover_reattaches_persisted_truth() {
     let workspace = unique_temp_dir("openyak-server-recover-persisted");
     std::fs::create_dir_all(&workspace).expect("workspace should create");
 
     let mut child = ChildGuard::spawn_in(workspace.clone(), false);
     let address = child.advertised_address();
+    let operator_token = child.operator_token();
+    let auth = auth_header(&operator_token);
     let discovery_path = child.server_info_path();
 
     let create = http_request_with_retry(
         &address,
         &format!(
-            "POST /v1/threads HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+            "POST /v1/threads HTTP/1.1\r\nHost: {address}\r\n{auth}Connection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
         ),
     );
     assert!(
@@ -690,11 +794,13 @@ fn openyak_server_recover_reattaches_persisted_truth() {
     let recovered_address = base_url
         .strip_prefix("http://")
         .expect("base_url should be http");
+    let recovered_operator_token = discovery_operator_token(&discovery_path);
+    let recovered_auth = auth_header(&recovered_operator_token);
 
     let list = http_request_with_retry(
         recovered_address,
         &format!(
-            "GET /v1/threads HTTP/1.1\r\nHost: {recovered_address}\r\nConnection: close\r\n\r\n"
+            "GET /v1/threads HTTP/1.1\r\nHost: {recovered_address}\r\n{recovered_auth}Connection: close\r\n\r\n"
         ),
     );
     assert!(
@@ -735,7 +841,8 @@ fn openyak_server_recover_clears_stale_registration_and_restores_server() {
             "truthLayer": "daemon_local_v1",
             "operatorPlane": "local_loopback_operator_v1",
             "persistence": "workspace_sqlite_v1",
-            "attachApi": "/v1/threads"
+            "attachApi": "/v1/threads",
+            "operatorToken": "fixture-token"
         }))
         .expect("thread server info should serialize"),
     )
@@ -790,7 +897,8 @@ fn openyak_server_recover_rejects_unsafe_registration() {
             "truthLayer": "process_local_v1",
             "operatorPlane": "local_loopback_operator_v1",
             "persistence": "workspace_sqlite_v1",
-            "attachApi": "/v1/threads"
+            "attachApi": "/v1/threads",
+            "operatorToken": "fixture-token"
         }))
         .expect("thread server info should serialize"),
     )
@@ -894,7 +1002,8 @@ fn openyak_server_stop_clears_stale_registration() {
             "truthLayer": "daemon_local_v1",
             "operatorPlane": "local_loopback_operator_v1",
             "persistence": "workspace_sqlite_v1",
-            "attachApi": "/v1/threads"
+            "attachApi": "/v1/threads",
+            "operatorToken": "fixture-token"
         }))
         .expect("thread server info should serialize"),
     )
@@ -933,7 +1042,8 @@ fn openyak_server_stop_rejects_unsafe_registration() {
             "truthLayer": "process_local_v1",
             "operatorPlane": "local_loopback_operator_v1",
             "persistence": "workspace_sqlite_v1",
-            "attachApi": "/v1/threads"
+            "attachApi": "/v1/threads",
+            "operatorToken": "fixture-token"
         }))
         .expect("thread server info should serialize"),
     )
@@ -984,7 +1094,8 @@ fn openyak_server_stop_rejects_reachable_listener_with_mismatched_pid() {
             "truthLayer": "daemon_local_v1",
             "operatorPlane": "local_loopback_operator_v1",
             "persistence": "workspace_sqlite_v1",
-            "attachApi": "/v1/threads"
+            "attachApi": "/v1/threads",
+            "operatorToken": target.operator_token()
         }))
         .expect("thread server info should serialize"),
     )
@@ -1042,6 +1153,21 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
         .as_nanos();
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("{prefix}-{nanos}-{counter}"))
+}
+
+fn discovery_operator_token(path: &std::path::Path) -> String {
+    let record: Value = serde_json::from_str(
+        &std::fs::read_to_string(path).expect("thread server info should be readable"),
+    )
+    .expect("thread server info should parse");
+    record["operatorToken"]
+        .as_str()
+        .expect("thread server info should include operatorToken")
+        .to_string()
+}
+
+fn auth_header(token: &str) -> String {
+    format!("Authorization: Bearer {token}\r\n")
 }
 
 fn http_request_with_retry(address: &str, request: &str) -> String {

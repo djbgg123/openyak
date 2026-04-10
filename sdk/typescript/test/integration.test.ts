@@ -10,6 +10,7 @@ import {
   OpenyakResyncRequiredError,
 } from "../src/index.js";
 import {
+  type OpenyakServerHarness,
   startMockAnthropicService,
   startOpenyakServer,
   startOpenyakServerIn,
@@ -66,12 +67,17 @@ async function waitForThreadStatus(
   throw new Error(`thread did not reach ${expected}; last status was ${lastStatus}`);
 }
 
+function createClient(server: OpenyakServerHarness): OpenyakClient {
+  return new OpenyakClient({
+    baseUrl: server.baseUrl,
+    operatorToken: server.operatorToken,
+    timeoutMs: 30_000,
+  });
+}
+
 test("attach-first client can create/list/get threads and stream a bash run", async () => {
   await withServerHarness(async ({ server }) => {
-    const client = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const client = createClient(server);
 
     const thread = await client.createThread({
       model: "claude-sonnet-4-6",
@@ -127,10 +133,7 @@ test("attach-first client can create/list/get threads and stream a bash run", as
 
 test("buffered run returns awaiting_user_input and resumeUserInput continues the same run", async () => {
   await withServerHarness(async ({ server }) => {
-    const client = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const client = createClient(server);
 
     const thread = await client.createThread({
       model: "claude-sonnet-4-6",
@@ -163,10 +166,7 @@ test("buffered run returns awaiting_user_input and resumeUserInput continues the
 
 test("buffered run preserves runtime failure recovery metadata against a real local server", async () => {
   await withRuntimeFailureHarness(async ({ server }) => {
-    const client = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const client = createClient(server);
 
     const thread = await client.createThread({
       model: "opus",
@@ -195,10 +195,7 @@ test("buffered run preserves runtime failure recovery metadata against a real lo
 
 test("runStreamed surfaces runtime failure recovery metadata against a real local server", async () => {
   await withRuntimeFailureHarness(async ({ server }) => {
-    const client = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const client = createClient(server);
 
     const thread = await client.createThread({
       model: "opus",
@@ -229,7 +226,7 @@ test("runStreamed surfaces runtime failure recovery metadata against a real loca
   });
 });
 
-test("buffered run recovers interrupted snapshot truth after local server restart", async () => {
+test("buffered run surfaces reconnect-required after local server restart", async () => {
   const mock = await startMockAnthropicService();
   const workspace = await mkdtemp(path.join(os.tmpdir(), "openyak-sdk-restart-"));
   const env = {
@@ -241,10 +238,7 @@ test("buffered run recovers interrupted snapshot truth after local server restar
   const bind = new URL(server.baseUrl).host;
 
   try {
-    const client = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const client = createClient(server);
 
     const thread = await client.createThread({
       model: "claude-sonnet-4-6",
@@ -261,17 +255,12 @@ test("buffered run recovers interrupted snapshot truth after local server restar
       cleanupWorkspace: false,
     });
 
-    const interrupted = await runPromise;
-    assert.equal(interrupted.status, "interrupted");
-    assert.equal(interrupted.recoveredFromSnapshot, true);
-    assert.match(interrupted.recoveryNote ?? "", /restart or shutdown/);
-    assert.equal(
-      interrupted.snapshot?.state.lifecycle?.failure_kind,
-      "daemon_restart_interrupted_run",
-    );
-    assert.equal(
-      interrupted.snapshot?.state.recovery?.recovery_kind,
-      "reattach_or_retry",
+    await assert.rejects(
+      runPromise,
+      (error: unknown) =>
+        error instanceof OpenyakReconnectRequiredError &&
+        error.threadId === thread.threadId &&
+        error.runId === "run-1",
     );
   } finally {
     await server.close();
@@ -292,10 +281,7 @@ test("runStreamed surfaces reconnect-required truth after local server restart",
   const bind = new URL(server.baseUrl).host;
 
   try {
-    const client = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const client = createClient(server);
 
     const thread = await client.createThread({
       model: "claude-sonnet-4-6",
@@ -346,10 +332,7 @@ test("runStreamed surfaces live thread.resync_required after a lagged local stre
     OPENYAK_TEST_BROADCAST_CAPACITY: "8",
   });
   try {
-    const client = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const client = createClient(server);
 
     const thread = await client.createThread({
       model: "claude-sonnet-4-6",
@@ -407,10 +390,7 @@ test("attach-first streamEvents restart yields awaiting_user_input snapshot firs
   const bind = new URL(server.baseUrl).host;
 
   try {
-    const client = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const client = createClient(server);
 
     const thread = await client.createThread({
       model: "claude-sonnet-4-6",
@@ -432,10 +412,7 @@ test("attach-first streamEvents restart yields awaiting_user_input snapshot firs
       cleanupWorkspace: false,
     });
 
-    const restartedClient = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const restartedClient = createClient(server);
     const reattached = restartedClient.resumeThread(threadId);
     const events = reattached.streamEvents();
     const iterator = events[Symbol.asyncIterator]();
@@ -471,10 +448,7 @@ test("attach-first streamEvents restart yields interrupted recovery snapshot fir
   const bind = new URL(server.baseUrl).host;
 
   try {
-    const client = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const client = createClient(server);
 
     const thread = await client.createThread({
       model: "claude-sonnet-4-6",
@@ -490,10 +464,7 @@ test("attach-first streamEvents restart yields interrupted recovery snapshot fir
       cleanupWorkspace: false,
     });
 
-    const restartedClient = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const restartedClient = createClient(server);
     const reattached = restartedClient.resumeThread(threadId);
     const events = reattached.streamEvents();
     const iterator = events[Symbol.asyncIterator]();
@@ -534,10 +505,7 @@ test("attach-first resumeThread/read/listThreads preserve awaiting_user_input tr
   const bind = new URL(server.baseUrl).host;
 
   try {
-    const client = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const client = createClient(server);
 
     const thread = await client.createThread({
       model: "claude-sonnet-4-6",
@@ -559,10 +527,7 @@ test("attach-first resumeThread/read/listThreads preserve awaiting_user_input tr
       cleanupWorkspace: false,
     });
 
-    const restartedClient = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const restartedClient = createClient(server);
     const reattached = restartedClient.resumeThread(threadId);
     const recovered = await reattached.read();
     assert.equal(recovered.state.status, "awaiting_user_input");
@@ -603,10 +568,7 @@ test("attach-first resumeThread/read/listThreads preserve interrupted recovery t
   const bind = new URL(server.baseUrl).host;
 
   try {
-    const client = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const client = createClient(server);
 
     const thread = await client.createThread({
       model: "claude-sonnet-4-6",
@@ -622,10 +584,7 @@ test("attach-first resumeThread/read/listThreads preserve interrupted recovery t
       cleanupWorkspace: false,
     });
 
-    const restartedClient = new OpenyakClient({
-      baseUrl: server.baseUrl,
-      timeoutMs: 30_000,
-    });
+    const restartedClient = createClient(server);
     const reattached = restartedClient.resumeThread(threadId);
     await waitForThreadStatus(reattached, "interrupted");
     const recovered = await reattached.read();

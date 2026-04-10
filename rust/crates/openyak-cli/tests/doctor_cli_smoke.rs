@@ -203,7 +203,8 @@ fn openyak_doctor_fails_on_invalid_local_daemon_registration() {
             "truthLayer": "process_local_v1",
             "operatorPlane": "local_loopback_operator_v1",
             "persistence": "workspace_sqlite_v1",
-            "attachApi": "/v1/threads"
+            "attachApi": "/v1/threads",
+            "operatorToken": "fixture-token"
         }))
         .expect("thread server info should serialize"),
     )

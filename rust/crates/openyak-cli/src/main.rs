@@ -175,7 +175,7 @@ fn run_server(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(bind).await?;
         let local_addr = listener.local_addr()?;
         let state = server::AppState::load_for_current_dir()?;
-        let _info_guard = write_thread_server_info(local_addr)?;
+        let _info_guard = write_thread_server_info(local_addr, state.operator_token())?;
         let mut stdout = io::stdout();
         writeln!(
             stdout,
@@ -274,6 +274,7 @@ impl Drop for ThreadServerInfoGuard {
 
 fn write_thread_server_info(
     local_addr: std::net::SocketAddr,
+    operator_token: &str,
 ) -> Result<ThreadServerInfoGuard, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let openyak_dir = server::resolve_workspace_state_root(&cwd)?;
@@ -288,6 +289,7 @@ fn write_thread_server_info(
             "operatorPlane": server::THREAD_OPERATOR_PLANE,
             "persistence": server::THREAD_PERSISTENCE_LAYER,
             "attachApi": server::THREAD_ATTACH_API,
+            "operatorToken": operator_token,
         }))?,
     )?;
     Ok(ThreadServerInfoGuard { path, pid })
@@ -311,6 +313,7 @@ struct ThreadServerInfoRecord {
     operator_plane: String,
     persistence: String,
     attach_api: String,
+    operator_token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -383,6 +386,7 @@ fn read_thread_server_info(path: &Path) -> Result<ThreadServerInfoRecord, String
         operator_plane: require_string("operatorPlane")?,
         persistence: require_string("persistence")?,
         attach_api: require_string("attachApi")?,
+        operator_token: require_string("operatorToken")?,
     })
 }
 
@@ -463,11 +467,13 @@ fn http_response_body(response: &[u8]) -> Result<&[u8], String> {
 
 fn read_thread_server_operator_identity(
     base_url: &str,
+    operator_token: &str,
 ) -> Result<server::ThreadServerOperatorIdentity, String> {
     let (authority, addresses) = resolve_loopback_thread_server_addresses(base_url)?;
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-        server::THREAD_OPERATOR_IDENTITY_API
+        "GET {} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        server::THREAD_OPERATOR_IDENTITY_API,
+        operator_token
     );
     let mut last_error = None;
     for address in addresses {
@@ -529,7 +535,7 @@ fn validate_reachable_thread_server_identity(
     workspace_root: &Path,
     info: &ThreadServerInfoRecord,
 ) -> Result<(), String> {
-    let identity = read_thread_server_operator_identity(&info.base_url)?;
+    let identity = read_thread_server_operator_identity(&info.base_url, &info.operator_token)?;
     if identity.pid != info.pid {
         return Err(format!(
             "reachable listener `{}` reported pid {} but discovery recorded pid {}",
@@ -573,6 +579,23 @@ fn validate_reachable_thread_server_identity(
         }
     }
     Ok(())
+}
+
+fn bind_matches_running_server(requested_bind: &str, base_url: &str) -> Result<bool, String> {
+    let requested_addresses = requested_bind
+        .to_socket_addrs()
+        .map_err(|error| {
+            format!("requested bind `{requested_bind}` could not be resolved: {error}")
+        })?
+        .collect::<Vec<_>>();
+    let (_, running_addresses) = resolve_loopback_thread_server_addresses(base_url)?;
+    Ok(requested_addresses
+        .iter()
+        .any(|requested| running_addresses.contains(requested)))
+}
+
+fn persisted_thread_truth_available(cwd: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    server::has_persisted_threads(cwd).map_err(Into::into)
 }
 
 fn invalid_thread_server_status_report(
@@ -1119,6 +1142,85 @@ enum ThreadServerStartDecision {
     Report(Box<ThreadServerStartReport>),
 }
 
+fn detached_bind_change_action() -> String {
+    "stop the current workspace server before starting again with a different `--bind` target"
+        .to_string()
+}
+
+fn invalid_registration_start_actions(status_report: &ThreadServerStatusReport) -> Vec<String> {
+    if status_report.recommended_actions.is_empty() {
+        vec![
+            "inspect `openyak server status` output and repair the workspace discovery record before retrying detached start"
+                .to_string(),
+        ]
+    } else {
+        status_report.recommended_actions.clone()
+    }
+}
+
+fn requested_bind_matches_status(
+    requested_bind: &str,
+    status_report: &ThreadServerStatusReport,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if requested_bind == DEFAULT_DETACHED_SERVER_BIND {
+        return Ok(true);
+    }
+    Ok(status_report
+        .base_url
+        .as_deref()
+        .map(|base_url| bind_matches_running_server(requested_bind, base_url))
+        .transpose()?
+        .unwrap_or(false))
+}
+
+fn running_thread_server_start_report(
+    status_report: ThreadServerStatusReport,
+    requested_bind: &str,
+    recommended_actions: Vec<String>,
+) -> Result<ThreadServerStartReport, Box<dyn std::error::Error>> {
+    if !requested_bind_matches_status(requested_bind, &status_report)? {
+        let base_url = status_report
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "<unknown>".to_string());
+        return Ok(start_report_from_status(
+            status_report,
+            requested_bind,
+            "bind_conflict",
+            false,
+            Some(format!(
+                "requested detached bind `{requested_bind}` does not match the already running workspace server at `{base_url}`"
+            )),
+            vec![detached_bind_change_action()],
+        ));
+    }
+
+    Ok(start_report_from_status(
+        status_report,
+        requested_bind,
+        "already_running",
+        false,
+        None,
+        recommended_actions,
+    ))
+}
+
+fn invalid_registration_start_report(
+    status_report: ThreadServerStatusReport,
+    requested_bind: &str,
+) -> ThreadServerStartReport {
+    let problem = status_report.problem.clone();
+    let recommended_actions = invalid_registration_start_actions(&status_report);
+    start_report_from_status(
+        status_report,
+        requested_bind,
+        "invalid_registration",
+        false,
+        problem,
+        recommended_actions,
+    )
+}
+
 fn prepare_thread_server_start(
     cwd: &Path,
     requested_bind: &str,
@@ -1128,38 +1230,18 @@ fn prepare_thread_server_start(
         "running" => {
             let mut recommended_actions = Vec::new();
             if requested_bind != DEFAULT_DETACHED_SERVER_BIND {
-                recommended_actions.push(
-                    "stop the current workspace server before starting again with a different `--bind` target"
-                        .to_string(),
-                );
+                recommended_actions.push(detached_bind_change_action());
             }
             Ok(ThreadServerStartDecision::Report(Box::new(
-                start_report_from_status(
+                running_thread_server_start_report(
                     status_report,
                     requested_bind,
-                    "already_running",
-                    false,
-                    None,
                     recommended_actions,
-                ),
+                )?,
             )))
         }
         "invalid_registration" => Ok(ThreadServerStartDecision::Report(Box::new(
-            start_report_from_status(
-                status_report.clone(),
-                requested_bind,
-                "invalid_registration",
-                false,
-                status_report.problem.clone(),
-                if status_report.recommended_actions.is_empty() {
-                    vec![
-                            "inspect `openyak server status` output and repair the workspace discovery record before retrying detached start"
-                                .to_string(),
-                        ]
-                } else {
-                    status_report.recommended_actions.clone()
-                },
-            ),
+            invalid_registration_start_report(status_report, requested_bind),
         ))),
         "stale_registration" => {
             let stale_registration_cleared = if let (Some(path), Some(pid)) =
@@ -1177,35 +1259,18 @@ fn prepare_thread_server_start(
             let refreshed_status = inspect_thread_server_status_for(cwd)?;
             match refreshed_status.status {
                 "running" => Ok(ThreadServerStartDecision::Report(Box::new(
-                    start_report_from_status(
+                    running_thread_server_start_report(
                         refreshed_status,
                         requested_bind,
-                        "already_running",
-                        false,
-                        None,
                         vec![
                             "stop the current workspace server first if you intended to replace it with a fresh detached launch"
                                 .to_string(),
                         ],
-                    ),
+                    )?,
                 ))),
-                "invalid_registration" => Ok(ThreadServerStartDecision::Report(
-                    Box::new(start_report_from_status(
-                        refreshed_status.clone(),
-                        requested_bind,
-                        "invalid_registration",
-                        false,
-                        refreshed_status.problem.clone(),
-                        if refreshed_status.recommended_actions.is_empty() {
-                            vec![
-                                "inspect `openyak server status` output and repair the workspace discovery record before retrying detached start"
-                                    .to_string(),
-                            ]
-                        } else {
-                            refreshed_status.recommended_actions.clone()
-                        },
-                    )),
-                )),
+                "invalid_registration" => Ok(ThreadServerStartDecision::Report(Box::new(
+                    invalid_registration_start_report(refreshed_status, requested_bind),
+                ))),
                 "stale_registration" | "not_running" => Ok(ThreadServerStartDecision::Start {
                     stale_registration_cleared: false,
                 }),
@@ -1373,6 +1438,12 @@ fn run_server_start_detached(
         return Err(io::Error::other(format!(
             "openyak server start --detach could not complete safely ({})",
             report.status
+        ))
+        .into());
+    }
+    if report.status == "bind_conflict" {
+        return Err(io::Error::other(format!(
+            "openyak server start --detach did not satisfy requested bind `{bind}`"
         ))
         .into());
     }
@@ -1616,6 +1687,9 @@ fn recover_thread_server_for(
         "running" => Ok(already_running_recover_report(status_report)),
         "not_running" if !status_report.state_db_present => Ok(nothing_to_recover_report(status_report)),
         "not_running" => {
+            if !persisted_thread_truth_available(cwd)? {
+                return Ok(nothing_to_recover_report(status_report));
+            }
             let start_report = start_thread_server_detached_for(cwd, DEFAULT_DETACHED_SERVER_BIND)?;
             match start_report.status {
                 "started" => Ok(recover_report_from_start(
@@ -1645,7 +1719,8 @@ fn recover_thread_server_for(
             }
         }
         "stale_registration" => {
-            let had_persisted_truth = status_report.state_db_present;
+            let had_persisted_truth =
+                status_report.state_db_present && persisted_thread_truth_available(cwd)?;
             let start_report = start_thread_server_detached_for(cwd, DEFAULT_DETACHED_SERVER_BIND)?;
             match start_report.status {
                 "started" => {
@@ -10117,6 +10192,7 @@ mod tests {
                 "operatorPlane": "local_loopback_operator_v1",
                 "persistence": "workspace_sqlite_v1",
                 "attachApi": "/v1/threads",
+                "operatorToken": "fixture-token",
             }))
             .expect("thread server info should serialize"),
         )
@@ -10156,6 +10232,7 @@ mod tests {
                 "operatorPlane": "local_loopback_operator_v1",
                 "persistence": "workspace_sqlite_v1",
                 "attachApi": "/v1/threads",
+                "operatorToken": "fixture-token",
             }))
             .expect("thread server info should serialize"),
         )
@@ -10199,6 +10276,7 @@ mod tests {
                 "operatorPlane": "local_loopback_operator_v1",
                 "persistence": "workspace_sqlite_v1",
                 "attachApi": "/v1/threads",
+                "operatorToken": "fixture-token",
             }))
             .expect("thread server info should serialize"),
         )
@@ -11329,6 +11407,7 @@ mod tests {
                 "operatorPlane": "local_loopback_operator_v1",
                 "persistence": "workspace_sqlite_v1",
                 "attachApi": "/v1/threads",
+                "operatorToken": "fixture-token",
             }))
             .expect("thread server info should serialize"),
         )
@@ -11389,6 +11468,7 @@ mod tests {
                 "operatorPlane": "local_loopback_operator_v1",
                 "persistence": "workspace_sqlite_v1",
                 "attachApi": "/v1/threads",
+                "operatorToken": "fixture-token",
             }))
             .expect("thread server info should serialize"),
         )

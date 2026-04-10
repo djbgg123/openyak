@@ -83,7 +83,10 @@ import os
 
 from openyak_sdk import OpenyakClient
 
-with OpenyakClient(base_url=os.environ["OPENYAK_BASE_URL"]) as client:
+with OpenyakClient(
+    base_url=os.environ["OPENYAK_BASE_URL"],
+    operator_token=os.environ.get("OPENYAK_OPERATOR_TOKEN"),
+) as client:
     thread = client.create_thread(
         model="claude-sonnet-4-6",
         allowed_tools=["bash"],
@@ -103,7 +106,10 @@ from openyak_sdk import AsyncOpenyakClient
 
 
 async def main() -> None:
-    async with AsyncOpenyakClient(base_url=os.environ["OPENYAK_BASE_URL"]) as client:
+    async with AsyncOpenyakClient(
+        base_url=os.environ["OPENYAK_BASE_URL"],
+        operator_token=os.environ.get("OPENYAK_OPERATOR_TOKEN"),
+    ) as client:
         thread = await client.create_thread(
             model="claude-sonnet-4-6",
             allowed_tools=["bash"],
@@ -176,7 +182,7 @@ snapshot = thread.read()
 - `run()` may reconcile from `thread.read()` after a dropped stream and marks the result with `recovered_from_snapshot=True`.
 - If the local server fails before runtime/provider bootstrap completes, the latest thread snapshot still preserves the submitted turn or user-input response instead of silently dropping it.
 - If the server restarts mid-run, the latest snapshot may come back as `status="interrupted"` with a `recovery_note`; the SDK surfaces that snapshot truth, but it does not invent daemon-side replay or recovery actions.
-- That interrupted snapshot truth is now also locked in live local-server integration coverage, so buffered attach-first runs can reconcile real restart disconnects back into `recovery_note` plus shared `failure_kind / recovery_kind / recommended_actions`.
+- Because local operator auth is per-daemon, an in-flight buffered client from before the restart may no longer be able to read the restarted server; that path now surfaces `OpenyakReconnectRequiredError` instead of pretending buffered replay still exists.
 - Fresh attach-first reattachment is now also locked live: after a local server restart, `resume_thread()`, `read()`, and `list_threads()` expose the latest persisted `awaiting_user_input` or `interrupted` snapshot truth without pretending `run()` replay exists.
 - The same snapshot contract also exposes `operator_plane`, `persistence`, and structured recovery fields (`failure_kind`, `recovery_kind`, `recommended_actions`) so attach-first clients can render operator guidance without implying broader daemon controls.
 - That reconciliation is intentionally best-effort for local attach-first, single-writer usage; if the latest snapshot shows a different active `run_id`, `run()` raises `OpenyakReconnectRequiredError` instead of pretending replay exists.

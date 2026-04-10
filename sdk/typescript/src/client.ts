@@ -59,6 +59,7 @@ type InterruptedRunResult = Extract<RunResult, { status: "interrupted" }>;
 
 export interface OpenyakClientOptions {
   baseUrl: string;
+  operatorToken?: string;
   timeoutMs?: number;
   retry?: number | Partial<RetryPolicy>;
   fetch?: FetchLike;
@@ -66,18 +67,24 @@ export interface OpenyakClientOptions {
 
 export class OpenyakClient {
   readonly #baseUrl: string;
+  readonly #operatorToken: string | undefined;
   readonly #timeoutMs: number;
   readonly #retry: RetryPolicy;
   readonly #fetch: FetchLike;
 
   constructor(options: OpenyakClientOptions) {
     this.#baseUrl = options.baseUrl.replace(/\/+$/, "");
+    const operatorToken = options.operatorToken?.trim();
     this.#timeoutMs = options.timeoutMs ?? 10_000;
     this.#retry = normalizeRetryPolicy(options.retry);
     this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
     if (!this.#baseUrl) {
       throw new OpenyakProtocolError("baseUrl is required");
     }
+    if (options.operatorToken !== undefined && !operatorToken) {
+      throw new OpenyakProtocolError("operatorToken must not be blank");
+    }
+    this.#operatorToken = operatorToken;
   }
 
   async createThreadSnapshot(
@@ -174,6 +181,9 @@ export class OpenyakClient {
         method,
         headers: {
           Accept: "application/json, text/event-stream",
+          ...(this.#operatorToken === undefined
+            ? {}
+            : { Authorization: `Bearer ${this.#operatorToken}` }),
           ...(body === undefined ? {} : { "Content-Type": "application/json" }),
         },
         signal: effectiveSignal,

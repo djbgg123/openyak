@@ -76,6 +76,22 @@ pub fn resolve_workspace_state_root(workspace_root: &Path) -> Result<PathBuf, St
     Ok(canonical_state_root)
 }
 
+pub fn has_persisted_threads(workspace_root: &Path) -> Result<bool, StateStoreError> {
+    let canonical_workspace = workspace_root.canonicalize().map_err(|error| {
+        StateStoreError::new(format!(
+            "failed to resolve server workspace `{}`: {error}",
+            workspace_root.display()
+        ))
+    })?;
+    let state_db_path = canonical_workspace.join(".openyak").join(STATE_DB_FILENAME);
+    if !state_db_path.is_file() {
+        return Ok(false);
+    }
+    Ok(!SqliteThreadStore::open(&canonical_workspace)?
+        .load_threads()?
+        .is_empty())
+}
+
 #[derive(Debug, Clone)]
 pub struct PersistedThreadRecord {
     pub thread_id: String,

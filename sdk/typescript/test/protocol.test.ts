@@ -238,6 +238,25 @@ test("streamEvents preserves run.failed recovery metadata on additive failure pa
   );
 });
 
+test("listThreads sends a bearer token when operatorToken is configured", async () => {
+  let seenHeaders: Headers | undefined;
+  const client = new OpenyakClient({
+    baseUrl: "http://local.test",
+    operatorToken: "token-123",
+    fetch: async (_input, init) => {
+      seenHeaders = new Headers(init?.headers);
+      return jsonResponse({
+        protocol_version: "v1",
+        threads: [],
+      });
+    },
+  });
+
+  await client.listThreads();
+
+  assert.equal(seenHeaders?.get("authorization"), "Bearer token-123");
+});
+
 test("runStreamed surfaces thread.resync_required as a dedicated error", async () => {
   const client = new OpenyakClient({
     baseUrl: "http://local.test",

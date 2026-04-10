@@ -8,23 +8,24 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_stream::stream;
-use axum::extract::{Path as AxumPath, State};
-use axum::http::StatusCode;
+use axum::extract::{Path as AxumPath, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{from_fn_with_state, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use runtime::{
-    ApiClient, ApiRequest, AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage,
-    ConversationRuntime, LifecycleStateSnapshot, MessageRole, PendingUserInputRequest,
-    PermissionEnforcer, PermissionMode, PermissionPolicy, RecoveryGuidanceSnapshot,
-    ResolvedPermissionMode, RuntimeError, Session as RuntimeSession, ThreadContractSnapshot,
-    ToolError, ToolExecutor, TurnSummary, UserInputOutcome, UserInputPrompter, UserInputRequest,
-    UserInputResponse,
+    generate_state, ApiClient, ApiRequest, AssistantEvent, ConfigLoader, ContentBlock,
+    ConversationMessage, ConversationRuntime, LifecycleStateSnapshot, MessageRole,
+    PendingUserInputRequest, PermissionEnforcer, PermissionMode, PermissionPolicy,
+    RecoveryGuidanceSnapshot, ResolvedPermissionMode, RuntimeError, Session as RuntimeSession,
+    ThreadContractSnapshot, ToolError, ToolExecutor, TurnSummary, UserInputOutcome,
+    UserInputPrompter, UserInputRequest, UserInputResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-pub use state_store::{resolve_workspace_state_root, StateStoreError};
+pub use state_store::{has_persisted_threads, resolve_workspace_state_root, StateStoreError};
 use state_store::{PersistedThreadRecord, SqliteThreadStore};
 use tokio::sync::broadcast;
 use tools::{GlobalToolRegistry, ProviderRuntimeClient};
@@ -53,6 +54,7 @@ pub struct AppState {
     threads: ThreadStore,
     next_thread_id: Arc<AtomicU64>,
     next_run_id: Arc<AtomicU64>,
+    operator_token: Arc<str>,
 }
 
 impl AppState {
@@ -64,6 +66,16 @@ impl AppState {
     }
 
     pub fn load_for_cwd(cwd: impl AsRef<Path>) -> Result<Self, StateStoreError> {
+        let operator_token = generate_state().map_err(|error| {
+            StateStoreError::new(format!("failed to generate operator token: {error}"))
+        })?;
+        Self::load_for_cwd_with_operator_token(cwd, operator_token)
+    }
+
+    pub fn load_for_cwd_with_operator_token(
+        cwd: impl AsRef<Path>,
+        operator_token: impl Into<String>,
+    ) -> Result<Self, StateStoreError> {
         let cwd = cwd.as_ref().canonicalize().map_err(|error| {
             StateStoreError::new(format!(
                 "failed to resolve server workspace `{}`: {error}",
@@ -99,7 +111,13 @@ impl AppState {
             threads: Arc::new(RwLock::new(threads)),
             next_thread_id: Arc::new(AtomicU64::new(max_thread_id.saturating_add(1))),
             next_run_id: Arc::new(AtomicU64::new(max_run_id.saturating_add(1))),
+            operator_token: Arc::from(operator_token.into().into_boxed_str()),
         })
+    }
+
+    #[must_use]
+    pub fn operator_token(&self) -> &str {
+        self.operator_token.as_ref()
     }
 
     fn allocate_thread_id(&self) -> ThreadId {
@@ -137,40 +155,44 @@ impl AppState {
 
     fn resolve_thread_config(
         &self,
-        payload: CreateThreadRequest,
+        payload: &CreateThreadRequest,
     ) -> ApiResult<ThreadExecutionConfig> {
         let cwd = resolve_thread_cwd(&self.cwd, payload.cwd.as_deref())?;
         let runtime_config = ConfigLoader::default_for(&cwd)
             .load()
             .map_err(|error| internal_error(error.to_string()))?;
         let tool_registry = GlobalToolRegistry::builtin();
-        let allowed_tools = tool_registry
-            .normalize_allowed_tools(&payload.allowed_tools)
-            .map_err(|error| bad_request(error, None))?
-            .unwrap_or_else(|| {
-                tool_registry
-                    .definitions(None)
-                    .into_iter()
-                    .map(|definition| definition.name)
-                    .collect()
-            });
-
         let model = payload
             .model
+            .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| {
-                runtime_config
-                    .model()
-                    .unwrap_or(DEFAULT_MODEL_ALIAS)
-                    .to_string()
-            });
-        let permission_mode = match payload.permission_mode {
-            Some(mode) => parse_server_permission_mode(&mode)?,
-            None => runtime_config.permission_mode().map_or(
-                PermissionMode::DangerFullAccess,
-                permission_mode_from_resolved,
-            ),
-        };
+            .map_or_else(
+                || {
+                    runtime_config
+                        .model()
+                        .unwrap_or(DEFAULT_MODEL_ALIAS)
+                        .to_string()
+                },
+                ToOwned::to_owned,
+            );
+        let permission_ceiling = runtime_config.permission_mode().map_or(
+            PermissionMode::DangerFullAccess,
+            permission_mode_from_resolved,
+        );
+        let requested_permission_mode = payload
+            .permission_mode
+            .as_deref()
+            .map(parse_server_permission_mode)
+            .transpose()?;
+        let permission_mode = requested_permission_mode.map_or(permission_ceiling, |requested| {
+            clamp_permission_mode_to_ceiling(requested, permission_ceiling)
+        });
+        let requested_allowed_tools = resolve_requested_allowed_tools(&tool_registry, payload)?;
+        let allowed_tools = clamp_allowed_tools_to_permission_mode(
+            &tool_registry,
+            &requested_allowed_tools,
+            permission_mode,
+        );
 
         Ok(ThreadExecutionConfig {
             cwd,
@@ -936,7 +958,7 @@ pub struct CreateThreadRequest {
     #[serde(default, alias = "permissionMode")]
     pub permission_mode: Option<String>,
     #[serde(default, alias = "allowedTools")]
-    pub allowed_tools: Vec<String>,
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -967,6 +989,7 @@ pub fn app(state: AppState) -> Router {
         .route("/sessions/{id}", get(get_session))
         .route("/sessions/{id}/events", get(stream_session_events))
         .route("/sessions/{id}/message", post(send_message))
+        .layer(from_fn_with_state(state.clone(), require_operator_auth))
         .with_state(state)
 }
 
@@ -980,12 +1003,31 @@ async fn get_operator_identity(
     Json(state.operator_identity())
 }
 
+async fn require_operator_auth(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let Some(value) = request.headers().get(header::AUTHORIZATION) else {
+        return Err(unauthorized("missing bearer token".to_string()));
+    };
+    let token = value
+        .to_str()
+        .ok()
+        .and_then(parse_bearer_token)
+        .ok_or_else(|| unauthorized("invalid bearer token".to_string()))?;
+    if token != state.operator_token() {
+        return Err(unauthorized("invalid bearer token".to_string()));
+    }
+    Ok(next.run(request).await)
+}
+
 async fn create_thread(
     State(state): State<AppState>,
     Json(payload): Json<CreateThreadRequest>,
 ) -> ApiResult<(StatusCode, Json<ThreadSnapshot>)> {
     let thread_id = state.allocate_thread_id();
-    let config = state.resolve_thread_config(payload)?;
+    let config = state.resolve_thread_config(&payload)?;
     let record = Arc::new(
         ThreadRecord::new(thread_id, config, Arc::clone(&state.store))
             .map_err(|error| internal_error(error.to_string()))?,
@@ -1154,7 +1196,7 @@ async fn create_session(
     State(state): State<AppState>,
 ) -> ApiResult<(StatusCode, Json<CreateSessionResponse>)> {
     let thread_id = state.allocate_thread_id();
-    let config = state.resolve_thread_config(CreateThreadRequest::default())?;
+    let config = state.resolve_thread_config(&CreateThreadRequest::default())?;
     let record = Arc::new(
         ThreadRecord::new(thread_id.clone(), config, Arc::clone(&state.store))
             .map_err(|error| internal_error(error.to_string()))?,
@@ -1877,6 +1919,54 @@ fn parse_server_permission_mode(value: &str) -> ApiResult<PermissionMode> {
     }
 }
 
+fn clamp_permission_mode_to_ceiling(
+    requested: PermissionMode,
+    ceiling: PermissionMode,
+) -> PermissionMode {
+    if ceiling.encompasses(requested) {
+        requested
+    } else {
+        ceiling
+    }
+}
+
+fn resolve_requested_allowed_tools(
+    tool_registry: &GlobalToolRegistry,
+    payload: &CreateThreadRequest,
+) -> ApiResult<BTreeSet<String>> {
+    match payload.allowed_tools.as_ref() {
+        Some(values) if values.is_empty() => Ok(BTreeSet::new()),
+        Some(values) => tool_registry
+            .normalize_allowed_tools(values)
+            .map_err(|error| bad_request(error, None))?
+            .ok_or_else(|| {
+                bad_request(
+                    "explicit allowed_tools unexpectedly resolved to none".to_string(),
+                    None,
+                )
+            }),
+        None => Ok(tool_registry
+            .definitions(None)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect()),
+    }
+}
+
+fn clamp_allowed_tools_to_permission_mode(
+    tool_registry: &GlobalToolRegistry,
+    allowed_tools: &BTreeSet<String>,
+    permission_mode: PermissionMode,
+) -> BTreeSet<String> {
+    tool_registry
+        .permission_specs(Some(allowed_tools))
+        .into_iter()
+        .filter_map(|(name, required_mode)| {
+            permission_mode.encompasses(required_mode).then_some(name)
+        })
+        .collect()
+}
+
 fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode {
     match mode {
         ResolvedPermissionMode::ReadOnly => PermissionMode::ReadOnly,
@@ -1960,6 +2050,15 @@ fn bad_request(message: String, details: Option<Value>) -> ApiError {
     }
 }
 
+fn unauthorized(message: String) -> ApiError {
+    ApiError {
+        status: StatusCode::UNAUTHORIZED,
+        code: "unauthorized".to_string(),
+        message,
+        details: None,
+    }
+}
+
 fn conflict(message: String, details: Option<Value>) -> ApiError {
     ApiError {
         status: StatusCode::CONFLICT,
@@ -1985,6 +2084,13 @@ fn internal_error(message: String) -> ApiError {
         message,
         details: None,
     }
+}
+
+fn parse_bearer_token(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .filter(|token| !token.is_empty())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -2015,7 +2121,7 @@ mod tests {
         ThreadSnapshot, TurnAcceptedResponse, UserInputAcceptedResponse,
     };
     use mock_anthropic_service::MockAnthropicService;
-    use reqwest::Client;
+    use reqwest::{header, Client};
     use runtime::{
         ContentBlock, ConversationMessage, MessageRole, Session as RuntimeSession, TokenUsage,
         TurnSummary,
@@ -2025,7 +2131,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::net::SocketAddr;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::sync::OnceLock;
@@ -2049,6 +2155,7 @@ mod tests {
         address: SocketAddr,
         handle: Option<JoinHandle<()>>,
         workspace: PathBuf,
+        operator_token: String,
     }
 
     impl TestServer {
@@ -2067,6 +2174,7 @@ mod tests {
                 .local_addr()
                 .expect("listener should report local address");
             let state = AppState::load_for_cwd(&workspace).expect("state should load");
+            let operator_token = state.operator_token().to_string();
             let handle = tokio::spawn(async move {
                 axum::serve(listener, app(state))
                     .await
@@ -2077,11 +2185,25 @@ mod tests {
                 address,
                 handle: Some(handle),
                 workspace,
+                operator_token,
             }
         }
 
         fn url(&self, path: &str) -> String {
             format!("http://{}{}", self.address, path)
+        }
+
+        fn client(&self) -> Client {
+            let mut headers = header::HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                header::HeaderValue::from_str(&format!("Bearer {}", self.operator_token))
+                    .expect("operator token header should be valid"),
+            );
+            Client::builder()
+                .default_headers(headers)
+                .build()
+                .expect("authorized client should build")
         }
 
         fn state_db_path(&self) -> PathBuf {
@@ -2177,6 +2299,12 @@ mod tests {
             .as_nanos();
         let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("{prefix}-{nanos}-{counter}"))
+    }
+
+    fn write_local_settings(root: &Path, contents: &str) {
+        std::fs::create_dir_all(root.join(".openyak")).expect("config dir should exist");
+        std::fs::write(root.join(".openyak").join("settings.local.json"), contents)
+            .expect("local settings should write");
     }
 
     async fn create_thread(client: &Client, server: &TestServer, payload: Value) -> ThreadSnapshot {
@@ -2337,7 +2465,7 @@ mod tests {
     #[tokio::test]
     async fn creates_lists_and_gets_threads() {
         let server = TestServer::spawn().await;
-        let client = Client::new();
+        let client = server.client();
 
         let created = create_thread(&client, &server, serde_json::json!({})).await;
 
@@ -2386,9 +2514,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_identity_endpoint_reports_workspace_and_contract() {
+    async fn thread_routes_require_a_bearer_token() {
         let server = TestServer::spawn().await;
         let client = Client::new();
+
+        let response = client
+            .get(server.url(super::THREAD_OPERATOR_IDENTITY_API))
+            .send()
+            .await
+            .expect("unauthorized request should return a response");
+
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let error = response
+            .json::<Value>()
+            .await
+            .expect("unauthorized body should parse");
+        assert_eq!(error["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn operator_identity_endpoint_reports_workspace_and_contract() {
+        let server = TestServer::spawn().await;
+        let client = server.client();
 
         let identity = client
             .get(server.url(super::THREAD_OPERATOR_IDENTITY_API))
@@ -2418,6 +2565,36 @@ mod tests {
         assert_eq!(identity.attach_api, super::THREAD_ATTACH_API);
     }
 
+    #[tokio::test]
+    async fn create_thread_clamps_requested_permissions_and_filters_tools_to_runtime_ceiling() {
+        let workspace = unique_temp_dir("server-permission-ceiling");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        write_local_settings(
+            &workspace,
+            r#"{
+  "permissionMode": "read-only"
+}"#,
+        );
+        let server = TestServer::spawn_in(workspace.clone()).await;
+        let client = server.client();
+
+        let created = create_thread(
+            &client,
+            &server,
+            serde_json::json!({
+                "permission_mode": "danger-full-access",
+                "allowed_tools": ["bash", "read_file"],
+            }),
+        )
+        .await;
+
+        assert_eq!(created.config.permission_mode, "read-only");
+        assert_eq!(created.config.allowed_tools, vec!["read_file"]);
+
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn threads_protocol_fixture_matches_current_v1_contract() {
@@ -2427,7 +2604,7 @@ mod tests {
             .expect("mock service should start");
         let env_guard = EnvGuard::set(&mock_service.base_url());
         let server = TestServer::spawn().await;
-        let client = Client::new();
+        let client = server.client();
 
         let create_thread_request = json!({
             "model": "claude-sonnet-4-6",
@@ -2863,14 +3040,15 @@ mod tests {
     async fn startup_creates_state_db_and_recovers_idle_threads_after_restart() {
         let workspace = unique_temp_dir("server-restart-idle");
         let server = TestServer::spawn_in(workspace.clone()).await;
-        let client = Client::new();
+        let client = server.client();
         assert!(server.state_db_path().exists());
 
         let created = create_thread(&client, &server, serde_json::json!({})).await;
         server.shutdown().await;
 
         let restarted = TestServer::spawn_in(workspace.clone()).await;
-        let listed = client
+        let restarted_client = restarted.client();
+        let listed = restarted_client
             .get(restarted.url("/v1/threads"))
             .send()
             .await
@@ -2880,7 +3058,7 @@ mod tests {
             .json::<ListThreadsResponse>()
             .await
             .expect("restarted list response should parse");
-        let recovered = client
+        let recovered = restarted_client
             .get(restarted.url(&format!("/v1/threads/{}", created.thread_id)))
             .send()
             .await
@@ -2890,7 +3068,7 @@ mod tests {
             .json::<ThreadSnapshot>()
             .await
             .expect("restarted snapshot should parse");
-        let legacy = client
+        let legacy = restarted_client
             .get(restarted.url(&format!("/sessions/{}", created.thread_id)))
             .send()
             .await
@@ -2923,7 +3101,7 @@ mod tests {
         let _env = EnvGuard::set(&mock_service.base_url());
         let workspace = unique_temp_dir("server-restart-pending");
         let server = TestServer::spawn_in(workspace.clone()).await;
-        let client = Client::new();
+        let client = server.client();
 
         let created = create_thread(&client, &server, serde_json::json!({})).await;
         let accepted = client
@@ -2950,8 +3128,9 @@ mod tests {
 
         server.shutdown().await;
         let restarted = TestServer::spawn_in(workspace.clone()).await;
+        let restarted_client = restarted.client();
         let recovered = wait_for_thread_status(
-            &client,
+            &restarted_client,
             &restarted,
             &created.thread_id,
             "awaiting_user_input",
@@ -2967,7 +3146,7 @@ mod tests {
             Some(accepted.run_id.as_str())
         );
 
-        let resumed = client
+        let resumed = restarted_client
             .post(restarted.url(&format!("/v1/threads/{}/user-input", created.thread_id)))
             .json(&SubmitUserInputRequest {
                 request_id: pending.request_id,
@@ -2984,7 +3163,7 @@ mod tests {
             .expect("recovered user-input response should parse");
         assert_eq!(resumed.run_id, accepted.run_id);
         let completed =
-            wait_for_thread_status(&client, &restarted, &created.thread_id, "idle").await;
+            wait_for_thread_status(&restarted_client, &restarted, &created.thread_id, "idle").await;
         let transcript =
             serde_json::to_string(&completed.session).expect("session should serialize");
         assert!(transcript.contains("\"feature\""));
@@ -3176,7 +3355,7 @@ mod tests {
             .expect("mock service should start");
         let _env = EnvGuard::set(&mock_service.base_url());
         let server = TestServer::spawn().await;
-        let client = Client::new();
+        let client = server.client();
 
         let created = create_thread(
             &client,
@@ -3269,7 +3448,7 @@ mod tests {
             .expect("mock service should start");
         let _env = EnvGuard::set(&mock_service.base_url());
         let server = TestServer::spawn().await;
-        let client = Client::new();
+        let client = server.client();
 
         let created = create_thread(&client, &server, serde_json::json!({})).await;
         let accepted = client
@@ -3353,7 +3532,7 @@ mod tests {
             .expect("mock service should start");
         let _env = EnvGuard::set(&mock_service.base_url());
         let server = TestServer::spawn().await;
-        let client = Client::new();
+        let client = server.client();
 
         let created = create_thread(&client, &server, serde_json::json!({})).await;
         client
@@ -3437,7 +3616,7 @@ mod tests {
         let _env_guard = env_lock().lock().await;
         let _removed = RemovedEnvGuard::remove(PROVIDER_ENV_KEYS);
         let server = TestServer::spawn().await;
-        let client = Client::new();
+        let client = server.client();
 
         let created = create_thread(
             &client,
@@ -3617,7 +3796,7 @@ mod tests {
             .expect("mock service should start");
         let _env = EnvGuard::set(&mock_service.base_url());
         let server = TestServer::spawn().await;
-        let client = Client::new();
+        let client = server.client();
 
         let created = create_thread(
             &client,
@@ -3667,7 +3846,7 @@ mod tests {
     #[tokio::test]
     async fn creates_and_lists_sessions() {
         let server = TestServer::spawn().await;
-        let client = Client::new();
+        let client = server.client();
 
         let created = create_session(&client, &server).await;
 
@@ -3703,7 +3882,7 @@ mod tests {
     #[tokio::test]
     async fn streams_message_events_and_persists_message_flow() {
         let server = TestServer::spawn().await;
-        let client = Client::new();
+        let client = server.client();
 
         let created = create_session(&client, &server).await;
         let mut response = client
