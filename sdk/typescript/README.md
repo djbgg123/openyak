@@ -7,7 +7,8 @@ Current package metadata:
 - version: `0.0.0-alpha.1`
 - requires Node.js `>=18`
 - package manager in-repo: `pnpm`
-- verified against local `openyak` CLI `v0.1.0` on `2026-04-09`
+- CLI/operator boundary rechecked against local `openyak` CLI `v0.1.0` on `2026-04-10`
+- full SDK verification commands below remain last repo-wide rerun on `2026-04-09`
 
 ## Scope
 
@@ -54,7 +55,7 @@ For local verification inside this repo, keep using the workspace package root i
 
 ## Start a local server first
 
-In another terminal:
+In another terminal, you can start a foreground local server:
 
 ```bash
 cd rust
@@ -68,6 +69,16 @@ Local thread server listening on http://127.0.0.1:PORT
 ```
 
 Use that URL as `OPENYAK_BASE_URL`.
+
+For a longer-lived workspace-local daemon, the current CLI also ships a bounded local operator surface:
+
+```bash
+cd rust
+cargo run --bin openyak -- server start --detach --bind 127.0.0.1:0
+cargo run --bin openyak -- server status
+```
+
+If you use detached mode, read the reported `base_url` / operator token from `openyak server status` or the workspace `.openyak/thread-server.json` discovery file. Use `openyak server stop` to shut it down and `openyak server recover` only when you want to reattach persisted local thread truth in that same workspace.
 
 The backing CLI help currently defines `openyak server` as a local HTTP/SSE thread server that:
 
@@ -163,7 +174,7 @@ const snapshot = await thread.read();
 - `runStreamed()` does **not** pretend replay exists; if live streaming fidelity is lost, it throws.
 - 真实本地 server 重启导致的 streamed 断流现在也有 live integration 锁定，并会按当前 attach-first 合约抛出 reconnect-required 语义，而不是假装 replay。
 
-So the current TypeScript SDK is compatible with the daemon/control-plane roadmap only at the `/v1/threads` attach-first boundary: it can observe persisted interruption state plus the `daemon_local_v1` thread truth label, but it is not yet a client for daemon start/stop/status/recover operator APIs.
+So the current TypeScript SDK is compatible with the daemon/control-plane roadmap only at the `/v1/threads` attach-first boundary: it can observe persisted interruption state plus the `daemon_local_v1` thread truth label, but it is not itself a client for the CLI's local-only `server start --detach` / `status` / `stop` / `recover` operator actions.
 
 ## Scripts
 
@@ -174,4 +185,4 @@ pnpm lint
 pnpm build
 ```
 
-These commands were rerun successfully on `2026-04-09` during the latest repo-wide documentation refresh and full command-by-command CLI verification.
+`pnpm build` in this list was rerun successfully on `2026-04-10` during the latest documentation refresh. The full SDK verification set above remains the repo-wide baseline last rerun on `2026-04-09`.

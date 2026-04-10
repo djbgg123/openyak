@@ -2,7 +2,7 @@
 
 `rust/` 是当前仓库的主产品实现面。这里包含可直接构建、运行和维护的 `openyak` CLI，以及其运行时、工具系统、插件框架和配套服务。
 
-最近一次全量文档与命令面对齐完成于 `2026-04-09`。本文内容已对照当前 `openyak` CLI help、最新一轮 59 项 release-binary 逐命令 rerun，以及工作区、根目录 Python、Python SDK、TypeScript SDK 本地验证结果更新。
+最近一次全量文档与命令面对齐完成于 `2026-04-10`。本文内容已对照当前 `openyak` CLI help、`2026-04-10` 的 47 步 release-binary 直接命令/子命令矩阵与 CLI smoke/regression rerun 更新；工作区、根目录 Python、Python SDK、TypeScript SDK 的仓库级全量验证基线仍以 `2026-04-09` 的结果为准。
 
 ## 当前定位
 
@@ -85,6 +85,8 @@ cargo run --bin openyak -- onboard
 cargo run --bin openyak -- doctor
 cargo run --bin openyak -- foundations
 cargo run --bin openyak -- server --help
+cargo run --bin openyak -- server start --detach --bind 127.0.0.1:0
+cargo run --bin openyak -- server status
 cargo build --release -p openyak-cli
 ```
 
@@ -453,18 +455,27 @@ pnpm build
 
 上述验证命令现已同步固化到 GitHub Actions [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)，用于检查公开仓库可复现的主验证基线。
 
-另外还做过一轮在 `2026-04-09` 完成的 fresh release binary 级命令面巡检，覆盖：
+本次文档刷新还额外补做了一轮在 `2026-04-10` 完成的 fresh release-binary 级直接命令矩阵与 CLI smoke/regression rerun，覆盖：
 
-- `openyak --help`、`openyak --version`
-- `openyak prompt`、`openyak dump-manifests`、`openyak bootstrap-plan`、`openyak agents`、`openyak skills`、`openyak foundations`、`openyak system-prompt`、`openyak login`、`openyak logout`、`openyak init`、`openyak onboard`、`openyak doctor`、`openyak package-release`、`openyak server` 的 help
-- `openyak dump-manifests`、`openyak bootstrap-plan`、`openyak agents`、`openyak skills`、`openyak foundations`、`openyak system-prompt`、`openyak logout`、`openyak init`、`openyak doctor`、`openyak package-release` 的直接执行路径
-- `openyak skills list/available/info/install/update/uninstall`
-- `openyak /agents`、`openyak /skills`、`openyak /foundations`、`openyak /skills help`，以及 `openyak --resume ...` 的 resume-safe slash command 链路
-- `openyak server --bind 127.0.0.1:0` 与 `openyak server start --detach --bind 127.0.0.1:0` 的真实启动探测
-- `openyak server --bind 0.0.0.0:0` 的非 loopback bind 拒绝路径
-- `openyak login`、`openyak onboard`、`openyak prompt` 与 self-target `openyak package-release` 的受控失败路径
+- `cargo build --manifest-path rust/Cargo.toml --workspace`
+- `cargo build --manifest-path rust/Cargo.toml --release -p openyak-cli`
+- `cargo test --manifest-path rust/Cargo.toml -p openyak-cli --test command_surface_cli_smoke --test doctor_cli_smoke --test server_cli_smoke --test onboard_cli_smoke --test package_release_cli_smoke`
+- `pnpm --dir sdk/typescript build`
+- `python -m build`（`sdk/python`）
+- 47 个直接 release-binary help/命令/子命令步骤
 
-其中 `openyak foundations lsp` 已做额外直接复核：当前 detail 输出使用高层 `Tools            LSP` 标签，不再展开成单条 `LspGetDiagnostics` 文案。
+其中这 47 个直接步骤再次覆盖了：
+
+- `openyak --help`
+- `openyak prompt --help`、`dump-manifests --help`、`bootstrap-plan --help`、`agents --help`、`skills --help`、`foundations --help`、`system-prompt --help`、`login --help`、`logout --help`、`init --help`、`onboard --help`、`doctor --help`、`package-release --help`、`server --help`
+- `openyak dump-manifests`、`bootstrap-plan`、`agents`、`skills`、`foundations`、`foundations task`、`foundations mcp`、`system-prompt`、`logout`、`init`、`doctor`、`package-release`
+- `openyak /agents`、`openyak /skills`、`openyak /foundations task`
+- `openyak server start --detach --bind 127.0.0.1:0`、`openyak server status`、`openyak server recover`、`openyak server stop`
+- `openyak server --bind 127.0.0.1:0` 的真实启动与停服路径
+- 打包后二进制 `openyak(.exe) --help`
+- `openyak login`、`openyak onboard` 的受控失败路径
+
+其中 `openyak foundations lsp` 仍以前一轮直接复核结论为准：当前 detail 输出使用高层 `Tools            LSP` 标签，不再展开成单条 `LspGetDiagnostics` 文案。
 
 依赖外部环境的链路仍然需要单独准备条件后再做全链路验收：
 
