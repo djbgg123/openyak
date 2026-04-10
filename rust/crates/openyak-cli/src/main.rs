@@ -308,6 +308,42 @@ fn read_thread_server_info(path: &Path) -> Result<ThreadServerInfoRecord, String
     })
 }
 
+fn validate_thread_server_info_contract(
+    path: &Path,
+    info: &ThreadServerInfoRecord,
+) -> Result<(), String> {
+    for (field, actual, expected) in [
+        (
+            "truthLayer",
+            info.truth_layer.as_str(),
+            server::THREAD_TRUTH_LAYER,
+        ),
+        (
+            "operatorPlane",
+            info.operator_plane.as_str(),
+            server::THREAD_OPERATOR_PLANE,
+        ),
+        (
+            "persistence",
+            info.persistence.as_str(),
+            server::THREAD_PERSISTENCE_LAYER,
+        ),
+        (
+            "attachApi",
+            info.attach_api.as_str(),
+            server::THREAD_ATTACH_API,
+        ),
+    ] {
+        if actual != expected {
+            return Err(format!(
+                "`{}` field `{field}` expected `{expected}` but found `{actual}`",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn probe_local_thread_server(base_url: &str) -> Result<bool, String> {
     let authority = base_url
         .strip_prefix("http://")
@@ -331,6 +367,90 @@ fn probe_local_thread_server(base_url: &str) -> Result<bool, String> {
         .any(|address| TcpStream::connect_timeout(address, Duration::from_millis(200)).is_ok()))
 }
 
+fn invalid_thread_server_status_report(
+    workspace_root: &Path,
+    workspace_state_root: &Path,
+    state_db_path: &Path,
+    state_db_present: bool,
+    path: PathBuf,
+    source: &'static str,
+    problem: String,
+) -> ThreadServerStatusReport {
+    ThreadServerStatusReport {
+        status: "invalid_registration",
+        workspace_root: workspace_root.to_path_buf(),
+        workspace_state_root: workspace_state_root.to_path_buf(),
+        state_db_path: state_db_path.to_path_buf(),
+        state_db_present,
+        discovery_path: Some(path),
+        discovery_source: Some(source),
+        reachable: false,
+        base_url: None,
+        pid: None,
+        truth_layer: None,
+        operator_plane: None,
+        persistence: None,
+        attach_api: None,
+        problem: Some(problem),
+        recommended_actions: vec![
+            "rewrite the discovery file by starting `openyak server --bind 127.0.0.1:0` in this workspace".to_string(),
+        ],
+    }
+}
+
+fn status_report_from_thread_server_info(
+    workspace_root: &Path,
+    workspace_state_root: &Path,
+    state_db_path: &Path,
+    state_db_present: bool,
+    path: PathBuf,
+    source: &'static str,
+    info: ThreadServerInfoRecord,
+) -> ThreadServerStatusReport {
+    let reachability = probe_local_thread_server(&info.base_url);
+    let (status, reachable, problem, recommended_actions) = match reachability {
+        Ok(true) => ("running", true, None, Vec::new()),
+        Ok(false) => (
+            "stale_registration",
+            false,
+            Some(format!(
+                "thread server discovery points to `{}` but the local loopback listener is not reachable",
+                info.base_url
+            )),
+            vec![
+                "restart `openyak server --bind 127.0.0.1:0` in this workspace to refresh the discovery record".to_string(),
+            ],
+        ),
+        Err(problem) => (
+            "invalid_registration",
+            false,
+            Some(problem),
+            vec![
+                "rewrite the discovery file by starting `openyak server --bind 127.0.0.1:0` in this workspace".to_string(),
+            ],
+        ),
+    };
+
+    ThreadServerStatusReport {
+        status,
+        workspace_root: workspace_root.to_path_buf(),
+        workspace_state_root: workspace_state_root.to_path_buf(),
+        state_db_path: state_db_path.to_path_buf(),
+        state_db_present,
+        discovery_path: Some(path),
+        discovery_source: Some(source),
+        reachable,
+        base_url: Some(info.base_url),
+        pid: Some(info.pid),
+        truth_layer: Some(info.truth_layer),
+        operator_plane: Some(info.operator_plane),
+        persistence: Some(info.persistence),
+        attach_api: Some(info.attach_api),
+        problem,
+        recommended_actions,
+    }
+}
+
 fn inspect_thread_server_status_for(
     cwd: &Path,
 ) -> Result<ThreadServerStatusReport, Box<dyn std::error::Error>> {
@@ -344,74 +464,33 @@ fn inspect_thread_server_status_for(
             continue;
         }
 
-        let info = match read_thread_server_info(&path) {
+        let info = match read_thread_server_info(&path).and_then(|info| {
+            validate_thread_server_info_contract(&path, &info)?;
+            Ok(info)
+        }) {
             Ok(info) => info,
             Err(problem) => {
-                return Ok(ThreadServerStatusReport {
-                    status: "invalid_registration",
-                    workspace_root,
-                    workspace_state_root,
-                    state_db_path,
+                return Ok(invalid_thread_server_status_report(
+                    &workspace_root,
+                    &workspace_state_root,
+                    &state_db_path,
                     state_db_present,
-                    discovery_path: Some(path),
-                    discovery_source: Some(source),
-                    reachable: false,
-                    base_url: None,
-                    pid: None,
-                    truth_layer: None,
-                    operator_plane: None,
-                    persistence: None,
-                    attach_api: None,
-                    problem: Some(problem),
-                    recommended_actions: vec![
-                        "rewrite the discovery file by starting `openyak server --bind 127.0.0.1:0` in this workspace".to_string(),
-                    ],
-                });
+                    path,
+                    source,
+                    problem,
+                ));
             }
         };
 
-        let reachability = probe_local_thread_server(&info.base_url);
-        let (status, reachable, problem, recommended_actions) = match reachability {
-            Ok(true) => ("running", true, None, Vec::new()),
-            Ok(false) => (
-                "stale_registration",
-                false,
-                Some(format!(
-                    "thread server discovery points to `{}` but the local loopback listener is not reachable",
-                    info.base_url
-                )),
-                vec![
-                    "restart `openyak server --bind 127.0.0.1:0` in this workspace to refresh the discovery record".to_string(),
-                ],
-            ),
-            Err(problem) => (
-                "invalid_registration",
-                false,
-                Some(problem),
-                vec![
-                    "rewrite the discovery file by starting `openyak server --bind 127.0.0.1:0` in this workspace".to_string(),
-                ],
-            ),
-        };
-
-        return Ok(ThreadServerStatusReport {
-            status,
-            workspace_root,
-            workspace_state_root,
-            state_db_path,
+        return Ok(status_report_from_thread_server_info(
+            &workspace_root,
+            &workspace_state_root,
+            &state_db_path,
             state_db_present,
-            discovery_path: Some(path),
-            discovery_source: Some(source),
-            reachable,
-            base_url: Some(info.base_url),
-            pid: Some(info.pid),
-            truth_layer: Some(info.truth_layer),
-            operator_plane: Some(info.operator_plane),
-            persistence: Some(info.persistence),
-            attach_api: Some(info.attach_api),
-            problem,
-            recommended_actions,
-        });
+            path,
+            source,
+            info,
+        ));
     }
 
     let recommended_action = if state_db_present {
@@ -542,6 +621,381 @@ fn run_server_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::
                 serde_json::to_string_pretty(&thread_server_status_json(&report))?
             );
         }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadServerStopReport {
+    status: &'static str,
+    workspace_root: PathBuf,
+    workspace_state_root: PathBuf,
+    state_db_path: PathBuf,
+    state_db_present: bool,
+    discovery_path: Option<PathBuf>,
+    discovery_source: Option<&'static str>,
+    discovery_cleared: bool,
+    reachable_before_stop: bool,
+    base_url: Option<String>,
+    pid: Option<u32>,
+    truth_layer: Option<String>,
+    operator_plane: Option<String>,
+    persistence: Option<String>,
+    attach_api: Option<String>,
+    problem: Option<String>,
+    recommended_actions: Vec<String>,
+}
+
+fn remove_thread_server_info_if_matches_pid(path: &Path, pid: u32) -> Result<bool, String> {
+    if !thread_server_info_matches_pid(path, pid) {
+        return Ok(false);
+    }
+    fs::remove_file(path).map_err(|error| {
+        format!(
+            "failed to remove discovery file `{}`: {error}",
+            path.display()
+        )
+    })?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> Result<bool, String> {
+    let output = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .map_err(|error| format!("failed to query pid {pid} with tasklist: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tasklist failed while checking pid {pid}: {}",
+            summarize_command_stderr(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_start()
+        .starts_with('"'))
+}
+
+#[cfg(not(windows))]
+fn process_is_alive(pid: u32) -> Result<bool, String> {
+    let output = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map_err(|error| format!("failed to query pid {pid} with kill -0: {error}"))?;
+    Ok(output.status.success())
+}
+
+#[cfg(windows)]
+fn terminate_process_by_pid(pid: u32) -> Result<(), String> {
+    let output = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output()
+        .map_err(|error| format!("failed to invoke taskkill for pid {pid}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "taskkill failed for pid {pid}: {}",
+        summarize_command_stderr(&output.stderr)
+    ))
+}
+
+#[cfg(not(windows))]
+fn terminate_process_by_pid(pid: u32) -> Result<(), String> {
+    let output = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output()
+        .map_err(|error| format!("failed to invoke kill for pid {pid}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "kill -TERM failed for pid {pid}: {}",
+        summarize_command_stderr(&output.stderr)
+    ))
+}
+
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<bool, String> {
+    let start = Instant::now();
+    loop {
+        if !process_is_alive(pid)? {
+            return Ok(true);
+        }
+        if start.elapsed() >= timeout {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn stop_report_from_status(
+    status_report: ThreadServerStatusReport,
+    status: &'static str,
+    discovery_cleared: bool,
+    problem: Option<String>,
+    recommended_actions: Vec<String>,
+) -> ThreadServerStopReport {
+    ThreadServerStopReport {
+        status,
+        workspace_root: status_report.workspace_root,
+        workspace_state_root: status_report.workspace_state_root,
+        state_db_path: status_report.state_db_path,
+        state_db_present: status_report.state_db_present,
+        discovery_path: status_report.discovery_path,
+        discovery_source: status_report.discovery_source,
+        discovery_cleared,
+        reachable_before_stop: status_report.reachable,
+        base_url: status_report.base_url,
+        pid: status_report.pid,
+        truth_layer: status_report.truth_layer,
+        operator_plane: status_report.operator_plane,
+        persistence: status_report.persistence,
+        attach_api: status_report.attach_api,
+        problem,
+        recommended_actions,
+    }
+}
+
+fn stop_report_for_stale_registration(
+    status_report: ThreadServerStatusReport,
+) -> Result<ThreadServerStopReport, Box<dyn std::error::Error>> {
+    let mut discovery_cleared = false;
+    if let (Some(path), Some(pid)) = (&status_report.discovery_path, status_report.pid) {
+        discovery_cleared = remove_thread_server_info_if_matches_pid(path, pid)?;
+    }
+    let mut recommended_actions = Vec::new();
+    if !status_report.state_db_present {
+        recommended_actions.push(
+            "start `openyak server --bind 127.0.0.1:0` in this workspace if you want a new local thread server"
+                .to_string(),
+        );
+    }
+    Ok(stop_report_from_status(
+        status_report,
+        if discovery_cleared {
+            "stale_registration_cleared"
+        } else {
+            "already_stopped"
+        },
+        discovery_cleared,
+        None,
+        recommended_actions,
+    ))
+}
+
+fn stop_report_for_invalid_registration(
+    status_report: ThreadServerStatusReport,
+) -> ThreadServerStopReport {
+    let problem = status_report.problem.clone().or_else(|| {
+        Some(
+            "the current workspace discovery record is malformed or unsafe, so stop refused to act"
+                .to_string(),
+        )
+    });
+    let recommended_actions = if status_report.recommended_actions.is_empty() {
+        vec![
+            "inspect `openyak server status` output and rewrite the discovery record by restarting the local server in this workspace"
+                .to_string(),
+        ]
+    } else {
+        status_report.recommended_actions.clone()
+    };
+    stop_report_from_status(
+        status_report,
+        "invalid_registration",
+        false,
+        problem,
+        recommended_actions,
+    )
+}
+
+fn stop_running_thread_server(
+    status_report: ThreadServerStatusReport,
+) -> Result<ThreadServerStopReport, Box<dyn std::error::Error>> {
+    let pid = status_report
+        .pid
+        .ok_or_else(|| io::Error::other("running server report is missing pid"))?;
+    if pid == std::process::id() {
+        return Ok(stop_report_from_status(
+            status_report,
+            "stop_failed",
+            false,
+            Some("refusing to stop the current CLI process".to_string()),
+            vec![
+                "run `openyak server stop` from a separate process than the target server"
+                    .to_string(),
+            ],
+        ));
+    }
+    terminate_process_by_pid(pid)?;
+    if !wait_for_process_exit(pid, Duration::from_secs(2))? {
+        return Ok(stop_report_from_status(
+            status_report,
+            "stop_failed",
+            false,
+            Some(format!(
+                "pid {pid} did not exit within the expected timeout"
+            )),
+            vec![
+                "rerun `openyak server status` to confirm the current workspace server state"
+                    .to_string(),
+            ],
+        ));
+    }
+    let discovery_cleared = if let Some(path) = &status_report.discovery_path {
+        remove_thread_server_info_if_matches_pid(path, pid)?
+    } else {
+        false
+    };
+    Ok(stop_report_from_status(
+        status_report,
+        "stopped",
+        discovery_cleared,
+        None,
+        Vec::new(),
+    ))
+}
+
+fn stop_thread_server_for(
+    cwd: &Path,
+) -> Result<ThreadServerStopReport, Box<dyn std::error::Error>> {
+    let status_report = inspect_thread_server_status_for(cwd)?;
+    match status_report.status {
+        "not_running" => Ok(stop_report_from_status(
+            status_report,
+            "already_stopped",
+            false,
+            None,
+            Vec::new(),
+        )),
+        "stale_registration" => stop_report_for_stale_registration(status_report),
+        "invalid_registration" => Ok(stop_report_for_invalid_registration(status_report)),
+        "running" => stop_running_thread_server(status_report),
+        other => {
+            Err(io::Error::other(format!("unsupported thread server status `{other}`")).into())
+        }
+    }
+}
+
+fn thread_server_stop_json(report: &ThreadServerStopReport) -> serde_json::Value {
+    json!({
+        "status": report.status,
+        "workspace_root": report.workspace_root.display().to_string(),
+        "workspace_state_root": report.workspace_state_root.display().to_string(),
+        "state_db_path": report.state_db_path.display().to_string(),
+        "state_db_present": report.state_db_present,
+        "discovery_path": report.discovery_path.as_ref().map(|path| path.display().to_string()),
+        "discovery_source": report.discovery_source,
+        "discovery_cleared": report.discovery_cleared,
+        "reachable_before_stop": report.reachable_before_stop,
+        "base_url": report.base_url.as_deref(),
+        "pid": report.pid,
+        "contract": {
+            "truth_layer": report.truth_layer.as_deref(),
+            "operator_plane": report.operator_plane.as_deref(),
+            "persistence": report.persistence.as_deref(),
+            "attach_api": report.attach_api.as_deref(),
+        },
+        "problem": report.problem.as_deref(),
+        "recommended_actions": &report.recommended_actions,
+    })
+}
+
+fn render_thread_server_stop(report: &ThreadServerStopReport) -> String {
+    let mut lines = vec![
+        "Local thread server stop".to_string(),
+        format!("  Status           {}", report.status),
+        format!("  Workspace        {}", report.workspace_root.display()),
+        format!(
+            "  State root       {}",
+            report.workspace_state_root.display()
+        ),
+        format!(
+            "  State DB         {} ({})",
+            report.state_db_path.display(),
+            if report.state_db_present {
+                "present"
+            } else {
+                "missing"
+            }
+        ),
+    ];
+    if let Some(source) = report.discovery_source {
+        lines.push(format!("  Discovery source {source}"));
+    }
+    if let Some(path) = &report.discovery_path {
+        lines.push(format!("  Discovery file   {}", path.display()));
+    }
+    if let Some(base_url) = &report.base_url {
+        lines.push(format!("  Base URL         {base_url}"));
+    }
+    lines.push(format!(
+        "  Reachable before stop {}",
+        if report.reachable_before_stop {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    lines.push(format!(
+        "  Discovery clear  {}",
+        if report.discovery_cleared {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    if let Some(pid) = report.pid {
+        lines.push(format!("  PID              {pid}"));
+    }
+    if let Some(truth_layer) = &report.truth_layer {
+        lines.push(format!("  Truth layer      {truth_layer}"));
+    }
+    if let Some(operator_plane) = &report.operator_plane {
+        lines.push(format!("  Operator plane   {operator_plane}"));
+    }
+    if let Some(persistence) = &report.persistence {
+        lines.push(format!("  Persistence      {persistence}"));
+    }
+    if let Some(attach_api) = &report.attach_api {
+        lines.push(format!("  Attach API       {attach_api}"));
+    }
+    if let Some(problem) = &report.problem {
+        lines.push(format!("  Problem          {problem}"));
+    }
+    for (index, action) in report.recommended_actions.iter().enumerate() {
+        let label = if index == 0 {
+            "  Try              "
+        } else {
+            "                   "
+        };
+        lines.push(format!("{label}{action}"));
+    }
+    lines.push(
+        "  Scope            local-only stop action; broader daemon lifecycle controls remain unshipped"
+            .to_string(),
+    );
+    format!("{}\n", lines.join("\n"))
+}
+
+fn run_server_stop(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let report = stop_thread_server_for(&cwd)?;
+    match output_format {
+        CliOutputFormat::Text => print!("{}", render_thread_server_stop(&report)),
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&thread_server_stop_json(&report))?
+            );
+        }
+    }
+    if matches!(report.status, "invalid_registration" | "stop_failed") {
+        return Err(io::Error::other(format!(
+            "openyak server stop could not complete safely ({})",
+            report.status
+        ))
+        .into());
     }
     Ok(())
 }
@@ -706,6 +1160,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         CliAction::Server { bind } => run_server(&bind)?,
         CliAction::ServerStatus { output_format } => run_server_status(output_format)?,
+        CliAction::ServerStop { output_format } => run_server_stop(output_format)?,
         CliAction::Repl {
             model,
             requested_policy,
@@ -766,6 +1221,9 @@ enum CliAction {
         bind: String,
     },
     ServerStatus {
+        output_format: CliOutputFormat,
+    },
+    ServerStop {
         output_format: CliOutputFormat,
     },
     Repl {
@@ -1110,6 +1568,15 @@ fn parse_server_args(args: &[String], output_format: CliOutputFormat) -> Result<
             return Ok(CliAction::Help(HelpTopic::Server));
         }
         return Err(format!("unknown server status argument: {}", args[1]));
+    }
+    if matches!(args.first().map(String::as_str), Some("stop")) {
+        if args.len() == 1 {
+            return Ok(CliAction::ServerStop { output_format });
+        }
+        if is_help_args(&args[1..]) {
+            return Ok(CliAction::Help(HelpTopic::Server));
+        }
+        return Err(format!("unknown server stop argument: {}", args[1]));
     }
 
     let mut bind = DEFAULT_SERVER_BIND.to_string();
@@ -7281,6 +7748,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  openyak server status                    Inspect local thread-server discovery + operator status"
     )?;
+    writeln!(
+        out,
+        "  openyak server stop                      Stop the current workspace local thread server"
+    )?;
     writeln!(out)?;
     writeln!(out, "Flags")?;
     writeln!(
@@ -7361,6 +7832,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  openyak package-release --output-dir dist")?;
     writeln!(out, "  openyak server --bind 127.0.0.1:0")?;
     writeln!(out, "  openyak server status")?;
+    writeln!(out, "  openyak server stop")?;
     Ok(())
 }
 
@@ -7405,7 +7877,7 @@ fn render_help_topic(topic: HelpTopic) -> &'static str {
             "Usage: openyak package-release [--output-dir PATH] [--binary PATH]\n\nStage a release artifact directory containing the packaged openyak binary plus generated install metadata.\nBy default the command packages the currently running openyak executable into ./dist."
         }
         HelpTopic::Server => {
-            "Usage: openyak server [--bind HOST:PORT]\n       openyak server status\n\nRun the local HTTP/SSE thread server backed by the `server` crate, or inspect the current workspace's local thread-server discovery/liveness metadata.\nThe server exposes the local `/v1/threads` protocol plus legacy `/sessions` compatibility routes, persists thread state in the workspace `.openyak/state.sqlite3` SQLite store, prints the actual bound address on startup, keeps serving until interrupted, and only supports loopback binds.\n`openyak server status` stays read-only and reports local loopback operator truth; it does not add daemon start/stop/recover controls yet."
+            "Usage: openyak server [--bind HOST:PORT]\n       openyak server status\n       openyak server stop\n\nRun the local HTTP/SSE thread server backed by the `server` crate, inspect the current workspace's local thread-server discovery/liveness metadata, or stop the current workspace server via its local discovery record.\nThe server exposes the local `/v1/threads` protocol plus legacy `/sessions` compatibility routes, persists thread state in the workspace `.openyak/state.sqlite3` SQLite store, prints the actual bound address on startup, keeps serving until interrupted, and only supports loopback binds.\n`openyak server status` stays read-only and reports local loopback operator truth.\n`openyak server stop` stays local-only, uses workspace discovery + pid safeguards, and does not add broader daemon start/recover control yet."
         }
         HelpTopic::Prompt => {
             "Usage: openyak prompt [--tool-profile NAME] <text>\n       openyak -p [--tool-profile NAME] <text>\n\nRun one non-interactive prompt and exit.\nUse --tool-profile to apply a named local tool-profile ceiling for this process only.\nHidden optional browser tools such as BrowserObserve and BrowserInteract still require browserControl.enabled=true plus explicit --allowedTools BrowserObserve or --allowedTools BrowserInteract.\nIf the model requests structured follow-up input, this mode fails explicitly instead of guessing a reply."
@@ -7431,17 +7903,17 @@ mod tests {
         print_help_to, push_output_block, render_config_report, render_diff_report,
         render_foundations_report, render_git_command_requires_repo, render_help_topic,
         render_last_tool_debug_report, render_memory_report, render_repl_help,
-        render_thread_server_status, render_unknown_repl_command, resolve_effective_model,
-        resolve_model_alias, response_to_events, resume_supported_slash_commands,
-        run_github_titled_body_create, run_resume_command, sessions_dir,
-        slash_command_completion_candidates, stage_release_artifact, status_context,
-        status_context_or_fallback_for_cwd, summarize_command_stderr, validate_server_bind_target,
-        write_temp_text_file, CliAction, CliOutputFormat, CliUserInputPrompter, ConfigLoader,
-        DefaultRuntimeClient, DoctorCheckStatus, HelpTopic, InternalPromptProgressEvent,
-        InternalPromptProgressState, SlashCommand, StatusUsage, ThreadServerInfoGuard,
-        BROWSER_INTERACT_TOOL_NAME, BROWSER_OBSERVE_TOOL_NAME, DEFAULT_MODEL,
-        DEFAULT_RELEASE_OUTPUT_DIR, DEFAULT_SERVER_BIND, REQUEST_USER_INPUT_TOOL_NAME,
-        THREAD_SERVER_INFO_FILENAME, VERSION,
+        render_thread_server_status, render_thread_server_stop, render_unknown_repl_command,
+        resolve_effective_model, resolve_model_alias, response_to_events,
+        resume_supported_slash_commands, run_github_titled_body_create, run_resume_command,
+        sessions_dir, slash_command_completion_candidates, stage_release_artifact, status_context,
+        status_context_or_fallback_for_cwd, stop_thread_server_for, summarize_command_stderr,
+        validate_server_bind_target, write_temp_text_file, CliAction, CliOutputFormat,
+        CliUserInputPrompter, ConfigLoader, DefaultRuntimeClient, DoctorCheckStatus, HelpTopic,
+        InternalPromptProgressEvent, InternalPromptProgressState, SlashCommand, StatusUsage,
+        ThreadServerInfoGuard, BROWSER_INTERACT_TOOL_NAME, BROWSER_OBSERVE_TOOL_NAME,
+        DEFAULT_MODEL, DEFAULT_RELEASE_OUTPUT_DIR, DEFAULT_SERVER_BIND,
+        REQUEST_USER_INPUT_TOOL_NAME, THREAD_SERVER_INFO_FILENAME, VERSION,
     };
     use api::{InputContentBlock, MessageResponse, OutputContentBlock, ProviderKind, Usage};
     use plugins::{PluginHooks, PluginTool, PluginToolDefinition, PluginToolPermission};
@@ -8129,6 +8601,7 @@ mod tests {
         );
         assert!(render_help_topic(HelpTopic::Server).contains("Usage: openyak server"));
         assert!(render_help_topic(HelpTopic::Server).contains("openyak server status"));
+        assert!(render_help_topic(HelpTopic::Server).contains("openyak server stop"));
         assert!(render_help_topic(HelpTopic::Server).contains("loopback binds"));
     }
 
@@ -8264,6 +8737,13 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&["server".to_string(), "stop".to_string()])
+                .expect("server stop should parse"),
+            CliAction::ServerStop {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
             parse_args(&["server".to_string(), "--bind=127.0.0.1:0".to_string()])
                 .expect("server with bind should parse"),
             CliAction::Server {
@@ -8279,6 +8759,18 @@ mod tests {
             ])
             .expect("json server status should parse"),
             CliAction::ServerStatus {
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "--output-format".to_string(),
+                "json".to_string(),
+                "server".to_string(),
+                "stop".to_string(),
+            ])
+            .expect("json server stop should parse"),
+            CliAction::ServerStop {
                 output_format: CliOutputFormat::Json,
             }
         );
@@ -8309,6 +8801,111 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("State DB"), "{rendered}");
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn thread_server_stop_reports_already_stopped_when_no_registration_exists() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-server-stop-missing");
+        fs::create_dir_all(&root).expect("workspace should exist");
+
+        let report = {
+            let _cwd = CurrentDirGuard::set(&root);
+            stop_thread_server_for(&root).expect("stop inspection should succeed")
+        };
+
+        assert_eq!(report.status, "already_stopped");
+        assert!(!report.discovery_cleared);
+        assert!(!report.reachable_before_stop);
+
+        let rendered = render_thread_server_stop(&report);
+        assert!(
+            rendered.contains("Status           already_stopped"),
+            "{rendered}"
+        );
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn thread_server_stop_clears_stale_registration() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-server-stop-stale");
+        let openyak_dir = root.join(".openyak");
+        fs::create_dir_all(&openyak_dir).expect("openyak dir should exist");
+        fs::write(
+            openyak_dir.join(THREAD_SERVER_INFO_FILENAME),
+            serde_json::to_string_pretty(&json!({
+                "baseUrl": "http://127.0.0.1:9",
+                "pid": 4242_u32,
+                "truthLayer": "daemon_local_v1",
+                "operatorPlane": "local_loopback_operator_v1",
+                "persistence": "workspace_sqlite_v1",
+                "attachApi": "/v1/threads",
+            }))
+            .expect("thread server info should serialize"),
+        )
+        .expect("thread server info should write");
+
+        let report = {
+            let _cwd = CurrentDirGuard::set(&root);
+            stop_thread_server_for(&root).expect("stop should succeed")
+        };
+
+        assert_eq!(report.status, "stale_registration_cleared");
+        assert!(report.discovery_cleared);
+        assert!(!openyak_dir.join(THREAD_SERVER_INFO_FILENAME).exists());
+
+        let rendered = render_thread_server_stop(&report);
+        assert!(
+            rendered.contains("Status           stale_registration_cleared"),
+            "{rendered}"
+        );
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn thread_server_stop_rejects_unexpected_contract_labels() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-server-stop-unsafe");
+        let openyak_dir = root.join(".openyak");
+        fs::create_dir_all(&openyak_dir).expect("openyak dir should exist");
+        let discovery_path = openyak_dir.join(THREAD_SERVER_INFO_FILENAME);
+        fs::write(
+            &discovery_path,
+            serde_json::to_string_pretty(&json!({
+                "baseUrl": "http://127.0.0.1:4100",
+                "pid": 4242_u32,
+                "truthLayer": "process_local_v1",
+                "operatorPlane": "local_loopback_operator_v1",
+                "persistence": "workspace_sqlite_v1",
+                "attachApi": "/v1/threads",
+            }))
+            .expect("thread server info should serialize"),
+        )
+        .expect("thread server info should write");
+
+        let report = {
+            let _cwd = CurrentDirGuard::set(&root);
+            stop_thread_server_for(&root).expect("stop inspection should succeed")
+        };
+
+        assert_eq!(report.status, "invalid_registration");
+        assert!(!report.discovery_cleared);
+        assert!(
+            discovery_path.exists(),
+            "unsafe discovery should remain for inspection"
+        );
+        assert!(
+            report
+                .problem
+                .as_deref()
+                .is_some_and(|problem| problem.contains("truthLayer")),
+            "{report:?}"
+        );
 
         crate::cleanup_temp_dir(&root);
     }

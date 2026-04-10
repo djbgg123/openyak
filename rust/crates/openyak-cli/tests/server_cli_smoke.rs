@@ -73,6 +73,16 @@ impl ChildGuard {
             .expect("startup line should include http address")
             .to_string()
     }
+
+    fn wait_for_exit(&mut self) {
+        for _ in 0..80 {
+            match self.child.try_wait().expect("try_wait should succeed") {
+                Some(_status) => return,
+                None => thread::sleep(Duration::from_millis(25)),
+            }
+        }
+        panic!("server process did not exit in time");
+    }
 }
 
 impl Drop for ChildGuard {
@@ -389,6 +399,151 @@ fn openyak_server_status_reports_not_running_workspace_guidance() {
     assert_eq!(report["status"], "not_running");
     assert_eq!(report["reachable"], false);
     assert_eq!(report["state_db_present"], false);
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn openyak_server_stop_stops_running_local_server() {
+    let workspace = unique_temp_dir("openyak-server-stop-running");
+    std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+    let mut child = ChildGuard::spawn_in(workspace.clone(), false);
+    let address = child.advertised_address();
+
+    let text_output = Command::new(common::openyak_binary())
+        .args(["server", "stop"])
+        .current_dir(child.workspace())
+        .output()
+        .expect("server stop should run");
+    assert!(text_output.status.success(), "server stop should succeed");
+    let stdout = String::from_utf8(text_output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("Status           stopped"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("Base URL         http://{address}")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Discovery clear  yes"), "{stdout}");
+
+    child.wait_for_exit();
+    assert!(
+        !child.server_info_path().exists(),
+        "stop should clear the discovery file"
+    );
+
+    let json_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "stop"])
+        .current_dir(&workspace)
+        .output()
+        .expect("json server stop should run");
+    assert!(
+        json_output.status.success(),
+        "json stop after exit should be idempotent"
+    );
+    let report: Value =
+        serde_json::from_slice(&json_output.stdout).expect("json server stop should parse");
+    assert_eq!(report["status"], "already_stopped");
+
+    drop(child);
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn openyak_server_stop_is_idempotent_without_running_server() {
+    let workspace = unique_temp_dir("openyak-server-stop-missing");
+    std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+    let output = Command::new(common::openyak_binary())
+        .args(["server", "stop"])
+        .current_dir(&workspace)
+        .output()
+        .expect("server stop should run");
+    assert!(output.status.success(), "server stop should succeed");
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        stdout.contains("Status           already_stopped"),
+        "{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn openyak_server_stop_clears_stale_registration() {
+    let workspace = unique_temp_dir("openyak-server-stop-stale");
+    let openyak_dir = workspace.join(".openyak");
+    std::fs::create_dir_all(&openyak_dir).expect("openyak dir should create");
+    std::fs::write(
+        openyak_dir.join("thread-server.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "baseUrl": "http://127.0.0.1:9",
+            "pid": 4242_u32,
+            "truthLayer": "daemon_local_v1",
+            "operatorPlane": "local_loopback_operator_v1",
+            "persistence": "workspace_sqlite_v1",
+            "attachApi": "/v1/threads"
+        }))
+        .expect("thread server info should serialize"),
+    )
+    .expect("thread server info should write");
+
+    let output = Command::new(common::openyak_binary())
+        .args(["server", "stop"])
+        .current_dir(&workspace)
+        .output()
+        .expect("server stop should run");
+    assert!(output.status.success(), "server stop should succeed");
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        stdout.contains("Status           stale_registration_cleared"),
+        "{stdout}"
+    );
+    assert!(
+        !openyak_dir.join("thread-server.json").exists(),
+        "stale stop should clear the discovery file"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn openyak_server_stop_rejects_unsafe_registration() {
+    let workspace = unique_temp_dir("openyak-server-stop-unsafe");
+    let openyak_dir = workspace.join(".openyak");
+    std::fs::create_dir_all(&openyak_dir).expect("openyak dir should create");
+    let discovery_path = openyak_dir.join("thread-server.json");
+    std::fs::write(
+        &discovery_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "baseUrl": "http://127.0.0.1:4100",
+            "pid": 4242_u32,
+            "truthLayer": "process_local_v1",
+            "operatorPlane": "local_loopback_operator_v1",
+            "persistence": "workspace_sqlite_v1",
+            "attachApi": "/v1/threads"
+        }))
+        .expect("thread server info should serialize"),
+    )
+    .expect("thread server info should write");
+
+    let output = Command::new(common::openyak_binary())
+        .args(["server", "stop"])
+        .current_dir(&workspace)
+        .output()
+        .expect("server stop should run");
+    assert!(
+        !output.status.success(),
+        "server stop should reject unsafe discovery"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        stdout.contains("Status           invalid_registration"),
+        "{stdout}"
+    );
+    assert!(
+        discovery_path.exists(),
+        "unsafe discovery should remain for manual inspection"
+    );
 
     let _ = std::fs::remove_dir_all(workspace);
 }
