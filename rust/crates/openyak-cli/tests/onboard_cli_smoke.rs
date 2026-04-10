@@ -27,6 +27,11 @@ fn openyak_onboard_help_is_available_and_root_help_lists_it() {
         String::from_utf8(onboard_help.stdout).expect("onboard help should be utf8");
     assert!(onboard_stdout.contains("Usage: openyak onboard"));
     assert!(onboard_stdout.contains("interactive"));
+    assert!(onboard_stdout.contains("local daemon"), "{onboard_stdout}");
+    assert!(
+        onboard_stdout.contains("openyak doctor"),
+        "{onboard_stdout}"
+    );
 }
 
 #[test]
@@ -51,6 +56,9 @@ fn openyak_onboard_fails_safely_without_a_tty() {
     assert!(stdout.contains("interactive-only") || stdout.contains("interactive terminal"));
     assert!(stdout.contains("openyak init"));
     assert!(stdout.contains("openyak doctor"));
+    assert!(stdout.contains("Local daemon"), "{stdout}");
+    assert!(stdout.contains("openyak server start --detach"), "{stdout}");
+    assert!(stdout.contains("openyak server status"), "{stdout}");
     assert!(
         !config_home.join("settings.json").exists(),
         "non-interactive onboarding must not create user settings"

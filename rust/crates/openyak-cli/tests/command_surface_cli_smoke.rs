@@ -127,6 +127,14 @@ fn openyak_root_and_subcommand_help_cover_verified_surface() {
         );
     }
 
+    let onboard_help = sandbox.run_success(&["onboard", "--help"]);
+    for marker in ["local daemon", "openyak doctor"] {
+        assert!(
+            onboard_help.contains(marker),
+            "onboard help should mention {marker}: {onboard_help}"
+        );
+    }
+
     let server_help = sandbox.run_success(&["server", "--help"]);
     for marker in [
         "local `/v1/threads` protocol plus legacy `/sessions` compatibility routes",

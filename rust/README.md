@@ -243,13 +243,13 @@ printf 'reply with the exact text: OPENYAK_REPL_OK\n/exit\n' | cargo run --bin o
 cargo run --bin openyak -- doctor
 ```
 
-如果想要一个显式、可重跑的本地 onboarding flow，把 repo init、默认模型、auth guidance 和 doctor handoff 串起来：
+如果想要一个显式、可重跑的本地 onboarding flow，把 repo init、默认模型、auth guidance、当前 workspace local daemon handoff 和 doctor handoff 串起来：
 
 ```bash
 cargo run --bin openyak -- onboard
 ```
 
-`openyak onboard` 只在交互式本地终端中运行；它不会改变 `openyak` 无参数默认进入 REPL 的语义，也不会把 provider secrets 写进配置文件。在非交互终端中调用时，它会直接拒绝执行并说明原因。
+`openyak onboard` 只在交互式本地终端中运行；它不会改变 `openyak` 无参数默认进入 REPL 的语义，也不会把 provider secrets 写进配置文件。在非交互终端中调用时，它会直接拒绝执行，并回显当前 workspace local daemon 的下一步建议。
 
 ## 用户目录、配置与 skills 规则
 

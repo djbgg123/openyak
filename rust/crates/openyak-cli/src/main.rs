@@ -8634,7 +8634,7 @@ fn render_help_topic(topic: HelpTopic) -> &'static str {
             "Usage: openyak init\n\nScaffold OPENYAK.md, .openyak.json, .openyak/, and recommended local gitignore entries."
         }
         HelpTopic::Onboard => {
-            "Usage: openyak onboard\n\nRun the explicit interactive onboarding wizard.\nThe flow is local-only, reuses `openyak init`, persisted user-model setup, provider-aware auth guidance, and `openyak doctor`, and exits safely without writes in non-interactive terminals."
+            "Usage: openyak onboard\n\nRun the explicit interactive onboarding wizard.\nThe flow is local-only, reuses `openyak init`, persisted user-model setup, provider-aware auth guidance, `openyak doctor`, and current-workspace local daemon handoff guidance, and exits safely without writes in non-interactive terminals."
         }
         HelpTopic::Doctor => {
             "Usage: openyak doctor\n       openyak --model MODEL doctor\n\nRun local read-only health checks for config loading, OAuth setup, active model auth bootstrap, current-workspace local daemon/thread-server discovery readiness, and GitHub CLI availability/auth readiness. Pass --model to verify the exact provider/auth path you plan to use for prompt, REPL, or GitHub workflows."

@@ -74,6 +74,44 @@ impl OnboardingAssessment {
             "likely clean"
         }
     }
+
+    fn local_daemon_check(&self) -> Option<&crate::DoctorCheck> {
+        local_daemon_check(&self.doctor_report)
+    }
+}
+
+fn local_daemon_check(report: &crate::DoctorReport) -> Option<&crate::DoctorCheck> {
+    report
+        .checks
+        .iter()
+        .find(|check| check.name == "local daemon")
+}
+
+fn render_local_daemon_status(
+    local_daemon_check: Option<&crate::DoctorCheck>,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    if let Some(local_daemon_check) = local_daemon_check {
+        writeln!(
+            out,
+            "  {:<18}{}: {}",
+            "Local daemon",
+            local_daemon_check.status.label(),
+            local_daemon_check.summary
+        )?;
+    }
+    Ok(())
+}
+
+fn render_local_daemon_handoff(
+    local_daemon_check: Option<&crate::DoctorCheck>,
+    label: &str,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    if let Some(hint) = local_daemon_check.and_then(|check| check.hint.as_deref()) {
+        writeln!(out, "  {label:<18}{hint}")?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -492,6 +530,7 @@ fn render_assessment(assessment: &OnboardingAssessment, out: &mut impl Write) ->
         "  Doctor            {}",
         assessment.doctor_status_label()
     )?;
+    render_local_daemon_status(assessment.local_daemon_check(), out)?;
     if let Some(error) = &assessment.config_error {
         writeln!(out, "  Config issue      {error}")?;
     }
@@ -540,6 +579,9 @@ fn render_noninteractive_guidance(
     writeln!(out, "  Result            interactive terminal required")?;
     writeln!(out, "  Manual repo init  openyak init")?;
     writeln!(out, "  Manual health     openyak doctor")?;
+    let local_daemon_check = assessment.local_daemon_check();
+    render_local_daemon_status(local_daemon_check, out)?;
+    render_local_daemon_handoff(local_daemon_check, "Manual daemon", out)?;
     writeln!(out, "  Effective model   {}", assessment.effective_model)?;
     for line in assessment.auth.guidance.iter().take(2) {
         writeln!(out, "  Manual auth       {line}")?;
@@ -582,6 +624,9 @@ fn render_completion_summary(
     {
         writeln!(out, "  OAuth handoff     openyak login")?;
     }
+    let local_daemon_check = local_daemon_check(report);
+    render_local_daemon_status(local_daemon_check, out)?;
+    render_local_daemon_handoff(local_daemon_check, "Daemon handoff", out)?;
     if errors > 0 || warnings > 0 {
         writeln!(out, "  Re-check          openyak doctor")?;
     }
@@ -801,9 +846,9 @@ fn persist_default_model(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_assessment, persist_default_model, render_noninteractive_guidance,
-        run_onboarding_session, ModelChoice, ModelPersistStatus, OnboardingActions,
-        OnboardingPrompter, OnboardingStatus, PromptChoice,
+        collect_assessment, persist_default_model, render_completion_summary,
+        render_noninteractive_guidance, run_onboarding_session, ModelChoice, ModelPersistStatus,
+        OnboardingActions, OnboardingPrompter, OnboardingStatus, PromptChoice,
     };
     use crate::init::{initialize_repo, InitReport};
     use std::ffi::OsString;
@@ -963,6 +1008,16 @@ mod tests {
             .summary
             .contains("No openyak/Anthropic auth"));
         assert_eq!(assessment.doctor_status_label(), "warnings expected");
+        let local_daemon_check = assessment
+            .local_daemon_check()
+            .expect("local daemon check should exist");
+        assert_eq!(local_daemon_check.status, crate::DoctorCheckStatus::Ok);
+        assert!(
+            local_daemon_check
+                .summary
+                .contains("No workspace local thread server is running"),
+            "{local_daemon_check:?}"
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -1030,6 +1085,10 @@ mod tests {
         assert!(actions.doctor_called);
         assert!(!actions.init_called);
         assert!(!workspace.join(".openyak.json").exists());
+        let output = String::from_utf8(output).expect("stdout should be utf8");
+        assert!(output.contains("Local daemon"), "{output}");
+        assert!(output.contains("Daemon handoff"), "{output}");
+        assert!(output.contains("openyak server start --detach"), "{output}");
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -1078,6 +1137,8 @@ mod tests {
         assert!(settings.contains("\"model\": \"claude-sonnet-4-6\""));
         let output = String::from_utf8(output).expect("stdout should be utf8");
         assert!(output.contains("openyak Doctor"));
+        assert!(output.contains("Local daemon"), "{output}");
+        assert!(output.contains("Daemon handoff"), "{output}");
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -1246,6 +1307,46 @@ mod tests {
         assert!(output.contains("interactive terminal required"));
         assert!(output.contains("openyak init"));
         assert!(output.contains("openyak doctor"));
+        assert!(output.contains("Local daemon"), "{output}");
+        assert!(output.contains("openyak server start --detach"), "{output}");
+        assert!(output.contains("openyak server status"), "{output}");
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn completion_summary_uses_final_doctor_local_daemon_check() {
+        let _lock = env_lock();
+        let root = temp_dir("openyak-onboard-final-doctor-daemon");
+        let workspace = root.join("workspace");
+        let config_home = root.join("openyak-home");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::create_dir_all(&config_home).expect("config home should exist");
+        let _openyak_home =
+            EnvVarGuard::set("OPENYAK_CONFIG_HOME", Some(&config_home.to_string_lossy()));
+        let assessment = collect_assessment(&workspace, None);
+        let mut report = assessment.doctor_report.clone();
+        let local_daemon_check = report
+            .checks
+            .iter_mut()
+            .find(|check| check.name == "local daemon")
+            .expect("local daemon check should exist");
+        local_daemon_check.summary = "Workspace local thread server is running.".to_string();
+        local_daemon_check.hint = Some("openyak server status".to_string());
+        let mut output = Vec::new();
+
+        render_completion_summary(&assessment, &report, &mut output)
+            .expect("completion summary should render");
+        let output = String::from_utf8(output).expect("summary should be utf8");
+        assert!(
+            output.contains("Workspace local thread server is running."),
+            "{output}"
+        );
+        assert!(output.contains("openyak server status"), "{output}");
+        assert!(
+            !output.contains("No workspace local thread server is running"),
+            "{output}"
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
