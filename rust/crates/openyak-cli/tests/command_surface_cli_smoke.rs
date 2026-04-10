@@ -37,6 +37,7 @@ fn openyak_root_and_subcommand_help_cover_verified_surface() {
         "openyak server start --detach",
         "openyak server status",
         "openyak server stop",
+        "openyak server recover",
         "--tool-profile NAME",
     ] {
         assert!(
@@ -140,6 +141,7 @@ fn openyak_root_and_subcommand_help_cover_verified_surface() {
         "local `/v1/threads` protocol plus legacy `/sessions` compatibility routes",
         "openyak server start --detach",
         "openyak server stop",
+        "openyak server recover",
         "workspace `.openyak/state.sqlite3` SQLite store",
         "only supports loopback binds",
     ] {

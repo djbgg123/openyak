@@ -636,7 +636,7 @@ fn status_report_from_thread_server_info(
                 info.base_url
             )),
             vec![
-                "restart `openyak server start --detach --bind 127.0.0.1:0` in this workspace to refresh the discovery record".to_string(),
+                "run `openyak server recover` in this workspace to clear stale discovery and restore the local thread server".to_string(),
             ],
         ),
         Err(problem) => (
@@ -712,7 +712,7 @@ fn inspect_thread_server_status_for(
     }
 
     let recommended_action = if state_db_present {
-        "start `openyak server start --detach --bind 127.0.0.1:0` in this workspace to reattach the persisted thread truth"
+        "run `openyak server recover` in this workspace to reattach the persisted thread truth"
             .to_string()
     } else {
         "start `openyak server start --detach --bind 127.0.0.1:0` in this workspace to create the local loopback thread server"
@@ -822,7 +822,7 @@ fn render_thread_server_status(report: &ThreadServerStatusReport) -> String {
         lines.push(format!("{label}{action}"));
     }
     lines.push(
-        "  Scope            read-only local operator status; no start/stop/recover control yet"
+        "  Scope            read-only local operator status; paired local start/stop/recover actions remain workspace-scoped"
             .to_string(),
     );
     format!("{}\n", lines.join("\n"))
@@ -886,6 +886,29 @@ struct ThreadServerStopReport {
     recommended_actions: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadServerRecoverReport {
+    status: &'static str,
+    recovery_kind: &'static str,
+    stale_registration_cleared: bool,
+    workspace_root: PathBuf,
+    workspace_state_root: PathBuf,
+    state_db_path: PathBuf,
+    state_db_present: bool,
+    discovery_path: Option<PathBuf>,
+    discovery_source: Option<&'static str>,
+    reachable: bool,
+    base_url: Option<String>,
+    pid: Option<u32>,
+    truth_layer: Option<String>,
+    operator_plane: Option<String>,
+    persistence: Option<String>,
+    attach_api: Option<String>,
+    problem: Option<String>,
+    performed_actions: Vec<String>,
+    recommended_actions: Vec<String>,
+}
+
 fn start_report_from_status(
     status_report: ThreadServerStatusReport,
     requested_bind: &str,
@@ -912,6 +935,69 @@ fn start_report_from_status(
         persistence: status_report.persistence,
         attach_api: status_report.attach_api,
         problem,
+        recommended_actions,
+    }
+}
+
+fn recover_report_from_status(
+    status_report: ThreadServerStatusReport,
+    status: &'static str,
+    recovery_kind: &'static str,
+    stale_registration_cleared: bool,
+    problem: Option<String>,
+    performed_actions: Vec<String>,
+    recommended_actions: Vec<String>,
+) -> ThreadServerRecoverReport {
+    ThreadServerRecoverReport {
+        status,
+        recovery_kind,
+        stale_registration_cleared,
+        workspace_root: status_report.workspace_root,
+        workspace_state_root: status_report.workspace_state_root,
+        state_db_path: status_report.state_db_path,
+        state_db_present: status_report.state_db_present,
+        discovery_path: status_report.discovery_path,
+        discovery_source: status_report.discovery_source,
+        reachable: status_report.reachable,
+        base_url: status_report.base_url,
+        pid: status_report.pid,
+        truth_layer: status_report.truth_layer,
+        operator_plane: status_report.operator_plane,
+        persistence: status_report.persistence,
+        attach_api: status_report.attach_api,
+        problem,
+        performed_actions,
+        recommended_actions,
+    }
+}
+
+fn recover_report_from_start(
+    start_report: ThreadServerStartReport,
+    status: &'static str,
+    recovery_kind: &'static str,
+    problem: Option<String>,
+    performed_actions: Vec<String>,
+    recommended_actions: Vec<String>,
+) -> ThreadServerRecoverReport {
+    ThreadServerRecoverReport {
+        status,
+        recovery_kind,
+        stale_registration_cleared: start_report.stale_registration_cleared,
+        workspace_root: start_report.workspace_root,
+        workspace_state_root: start_report.workspace_state_root,
+        state_db_path: start_report.state_db_path,
+        state_db_present: start_report.state_db_present,
+        discovery_path: start_report.discovery_path,
+        discovery_source: start_report.discovery_source,
+        reachable: start_report.reachable,
+        base_url: start_report.base_url,
+        pid: start_report.pid,
+        truth_layer: start_report.truth_layer,
+        operator_plane: start_report.operator_plane,
+        persistence: start_report.persistence,
+        attach_api: start_report.attach_api,
+        problem,
+        performed_actions,
         recommended_actions,
     }
 }
@@ -1232,19 +1318,18 @@ fn start_failure_report(
     ))
 }
 
-fn run_server_start_detached(
+fn start_thread_server_detached_for(
+    cwd: &Path,
     bind: &str,
-    output_format: CliOutputFormat,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<ThreadServerStartReport, Box<dyn std::error::Error>> {
     validate_server_bind_target(bind)?;
-    let cwd = env::current_dir()?;
-    let report = match prepare_thread_server_start(&cwd, bind)? {
+    let report = match prepare_thread_server_start(cwd, bind)? {
         ThreadServerStartDecision::Report(report) => *report,
         ThreadServerStartDecision::Start {
             stale_registration_cleared,
         } => {
-            let mut launch = launch_detached_thread_server(bind, &cwd)?;
-            match wait_for_detached_thread_server_ready(&cwd, &mut launch, Duration::from_secs(3)) {
+            let mut launch = launch_detached_thread_server(bind, cwd)?;
+            match wait_for_detached_thread_server_ready(cwd, &mut launch, Duration::from_secs(3)) {
                 Ok(status_report) => start_report_from_status(
                     status_report,
                     bind,
@@ -1256,7 +1341,7 @@ fn run_server_start_detached(
                 Err(problem) => {
                     stop_launched_child_if_still_running(&mut launch);
                     start_failure_report(
-                        &cwd,
+                        cwd,
                         bind,
                         stale_registration_cleared,
                         launch.pid,
@@ -1266,6 +1351,15 @@ fn run_server_start_detached(
             }
         }
     };
+    Ok(report)
+}
+
+fn run_server_start_detached(
+    bind: &str,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let report = start_thread_server_detached_for(&cwd, bind)?;
     match output_format {
         CliOutputFormat::Text => print!("{}", render_thread_server_start(&report)),
         CliOutputFormat::Json => {
@@ -1278,6 +1372,343 @@ fn run_server_start_detached(
     if matches!(report.status, "invalid_registration" | "start_failed") {
         return Err(io::Error::other(format!(
             "openyak server start --detach could not complete safely ({})",
+            report.status
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn thread_server_recover_json(report: &ThreadServerRecoverReport) -> serde_json::Value {
+    json!({
+        "status": report.status,
+        "recovery_kind": report.recovery_kind,
+        "stale_registration_cleared": report.stale_registration_cleared,
+        "workspace_root": report.workspace_root.display().to_string(),
+        "workspace_state_root": report.workspace_state_root.display().to_string(),
+        "state_db_path": report.state_db_path.display().to_string(),
+        "state_db_present": report.state_db_present,
+        "discovery_path": report.discovery_path.as_ref().map(|path| path.display().to_string()),
+        "discovery_source": report.discovery_source,
+        "reachable": report.reachable,
+        "base_url": report.base_url.as_deref(),
+        "pid": report.pid,
+        "contract": {
+            "truth_layer": report.truth_layer.as_deref(),
+            "operator_plane": report.operator_plane.as_deref(),
+            "persistence": report.persistence.as_deref(),
+            "attach_api": report.attach_api.as_deref(),
+        },
+        "problem": report.problem.as_deref(),
+        "performed_actions": &report.performed_actions,
+        "recommended_actions": &report.recommended_actions,
+    })
+}
+
+fn render_thread_server_recover(report: &ThreadServerRecoverReport) -> String {
+    let mut lines = vec![
+        "Local thread server recovery".to_string(),
+        format!("  Status           {}", report.status),
+        format!("  Recovery kind    {}", report.recovery_kind),
+        format!(
+            "  Cleared stale    {}",
+            if report.stale_registration_cleared {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+        format!("  Workspace        {}", report.workspace_root.display()),
+        format!(
+            "  State root       {}",
+            report.workspace_state_root.display()
+        ),
+        format!(
+            "  State DB         {} ({})",
+            report.state_db_path.display(),
+            if report.state_db_present {
+                "present"
+            } else {
+                "missing"
+            }
+        ),
+    ];
+    if let Some(source) = report.discovery_source {
+        lines.push(format!("  Discovery source {source}"));
+    }
+    if let Some(path) = &report.discovery_path {
+        lines.push(format!("  Discovery file   {}", path.display()));
+    }
+    lines.push(format!(
+        "  Reachable        {}",
+        if report.reachable { "yes" } else { "no" }
+    ));
+    if let Some(base_url) = &report.base_url {
+        lines.push(format!("  Base URL         {base_url}"));
+    }
+    if let Some(pid) = report.pid {
+        lines.push(format!("  PID              {pid}"));
+    }
+    if let Some(truth_layer) = &report.truth_layer {
+        lines.push(format!("  Truth layer      {truth_layer}"));
+    }
+    if let Some(operator_plane) = &report.operator_plane {
+        lines.push(format!("  Operator plane   {operator_plane}"));
+    }
+    if let Some(persistence) = &report.persistence {
+        lines.push(format!("  Persistence      {persistence}"));
+    }
+    if let Some(attach_api) = &report.attach_api {
+        lines.push(format!("  Attach API       {attach_api}"));
+    }
+    if let Some(problem) = &report.problem {
+        lines.push(format!("  Problem          {problem}"));
+    }
+    for (index, action) in report.performed_actions.iter().enumerate() {
+        let label = if index == 0 {
+            "  Did              "
+        } else {
+            "                   "
+        };
+        lines.push(format!("{label}{action}"));
+    }
+    for (index, action) in report.recommended_actions.iter().enumerate() {
+        let label = if index == 0 {
+            "  Try              "
+        } else {
+            "                   "
+        };
+        lines.push(format!("{label}{action}"));
+    }
+    lines.push(
+        "  Scope            local-only recovery action for current-workspace daemon_local_v1 thread truth"
+            .to_string(),
+    );
+    format!("{}\n", lines.join("\n"))
+}
+
+fn already_running_recover_report(
+    status_report: ThreadServerStatusReport,
+) -> ThreadServerRecoverReport {
+    recover_report_from_status(
+        status_report,
+        "already_running",
+        "no_op_running",
+        false,
+        None,
+        vec!["confirmed that the current workspace thread server is already reachable".to_string()],
+        Vec::new(),
+    )
+}
+
+fn nothing_to_recover_report(status_report: ThreadServerStatusReport) -> ThreadServerRecoverReport {
+    recover_report_from_status(
+        status_report,
+        "nothing_to_recover",
+        "no_persisted_truth",
+        false,
+        None,
+        Vec::new(),
+        vec![
+            "run `openyak server start --detach --bind 127.0.0.1:0` in this workspace if you want a new local thread server"
+                .to_string(),
+        ],
+    )
+}
+
+fn invalid_recover_report_from_status(
+    status_report: ThreadServerStatusReport,
+    problem_fallback: &str,
+) -> ThreadServerRecoverReport {
+    let problem = status_report
+        .problem
+        .clone()
+        .or_else(|| Some(problem_fallback.to_string()));
+    let recommended_actions = if status_report.recommended_actions.is_empty() {
+        vec![
+            "inspect `openyak server status` output and rewrite the discovery record before retrying recovery"
+                .to_string(),
+        ]
+    } else {
+        status_report.recommended_actions.clone()
+    };
+    recover_report_from_status(
+        status_report,
+        "invalid_registration",
+        "manual_repair_required",
+        false,
+        problem,
+        Vec::new(),
+        recommended_actions,
+    )
+}
+
+fn invalid_recover_report_from_start(
+    start_report: ThreadServerStartReport,
+    problem_fallback: &str,
+) -> ThreadServerRecoverReport {
+    let problem = start_report
+        .problem
+        .clone()
+        .or_else(|| Some(problem_fallback.to_string()));
+    let recommended_actions = if start_report.recommended_actions.is_empty() {
+        vec![
+            "inspect `openyak server status` output and repair the workspace discovery record before retrying recovery"
+                .to_string(),
+        ]
+    } else {
+        start_report.recommended_actions.clone()
+    };
+    recover_report_from_start(
+        start_report,
+        "invalid_registration",
+        "manual_repair_required",
+        problem,
+        Vec::new(),
+        recommended_actions,
+    )
+}
+
+fn failed_recover_report_from_start(
+    start_report: ThreadServerStartReport,
+) -> ThreadServerRecoverReport {
+    let problem = start_report
+        .problem
+        .clone()
+        .or_else(|| Some("detached recovery launch did not complete safely".to_string()));
+    let recommended_actions = if start_report.recommended_actions.is_empty() {
+        vec![
+            "run `openyak server status` in this workspace to inspect the recovery state"
+                .to_string(),
+        ]
+    } else {
+        start_report.recommended_actions.clone()
+    };
+    recover_report_from_start(
+        start_report,
+        "recover_failed",
+        "restart_failed",
+        problem,
+        vec!["attempted a detached recovery launch".to_string()],
+        recommended_actions,
+    )
+}
+
+fn already_running_recover_report_from_start(
+    start_report: ThreadServerStartReport,
+    detail: &str,
+) -> ThreadServerRecoverReport {
+    recover_report_from_start(
+        start_report,
+        "already_running",
+        "no_op_running",
+        None,
+        vec![detail.to_string()],
+        Vec::new(),
+    )
+}
+
+fn recover_thread_server_for(
+    cwd: &Path,
+) -> Result<ThreadServerRecoverReport, Box<dyn std::error::Error>> {
+    let status_report = inspect_thread_server_status_for(cwd)?;
+    match status_report.status {
+        "running" => Ok(already_running_recover_report(status_report)),
+        "not_running" if !status_report.state_db_present => Ok(nothing_to_recover_report(status_report)),
+        "not_running" => {
+            let start_report = start_thread_server_detached_for(cwd, DEFAULT_DETACHED_SERVER_BIND)?;
+            match start_report.status {
+                "started" => Ok(recover_report_from_start(
+                    start_report,
+                    "recovered",
+                    "reattach_persisted_truth",
+                    None,
+                    vec![
+                        "started a detached local thread server".to_string(),
+                        "reattached the persisted workspace thread truth".to_string(),
+                    ],
+                    Vec::new(),
+                )),
+                "already_running" => Ok(already_running_recover_report_from_start(
+                    start_report,
+                    "observed a healthy local thread server while attempting recovery",
+                )),
+                "invalid_registration" => Ok(invalid_recover_report_from_start(
+                    start_report,
+                    "workspace discovery became unsafe during recovery",
+                )),
+                "start_failed" => Ok(failed_recover_report_from_start(start_report)),
+                other => Err(io::Error::other(format!(
+                    "unsupported detached start status `{other}` during recovery"
+                ))
+                .into()),
+            }
+        }
+        "stale_registration" => {
+            let had_persisted_truth = status_report.state_db_present;
+            let start_report = start_thread_server_detached_for(cwd, DEFAULT_DETACHED_SERVER_BIND)?;
+            match start_report.status {
+                "started" => {
+                    let mut performed_actions = Vec::new();
+                    if start_report.stale_registration_cleared {
+                        performed_actions
+                            .push("cleared the stale workspace discovery record".to_string());
+                    }
+                    performed_actions.push("started a detached local thread server".to_string());
+                    if had_persisted_truth {
+                        performed_actions
+                            .push("reconciled the persisted workspace thread truth".to_string());
+                    }
+                    Ok(recover_report_from_start(
+                        start_report,
+                        "recovered",
+                        "clear_stale_and_restart",
+                        None,
+                        performed_actions,
+                        Vec::new(),
+                    ))
+                }
+                "already_running" => Ok(already_running_recover_report_from_start(
+                    start_report,
+                    "observed a healthy local thread server while reconciling stale discovery",
+                )),
+                "invalid_registration" => Ok(invalid_recover_report_from_start(
+                    start_report,
+                    "workspace discovery became unsafe during stale recovery",
+                )),
+                "start_failed" => Ok(failed_recover_report_from_start(start_report)),
+                other => Err(io::Error::other(format!(
+                    "unsupported detached start status `{other}` during stale recovery"
+                ))
+                .into()),
+            }
+        }
+        "invalid_registration" => Ok(invalid_recover_report_from_status(
+            status_report,
+            "the current workspace discovery record is malformed or unsafe, so recovery refused to act",
+        )),
+        other => Err(io::Error::other(format!(
+            "unsupported thread server status `{other}` during recovery"
+        ))
+        .into()),
+    }
+}
+
+fn run_server_recover(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let report = recover_thread_server_for(&cwd)?;
+    match output_format {
+        CliOutputFormat::Text => print!("{}", render_thread_server_recover(&report)),
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&thread_server_recover_json(&report))?
+            );
+        }
+    }
+    if matches!(report.status, "invalid_registration" | "recover_failed") {
+        return Err(io::Error::other(format!(
+            "openyak server recover could not complete safely ({})",
             report.status
         ))
         .into());
@@ -1791,6 +2222,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => run_server_start_detached(&bind, output_format)?,
         CliAction::ServerStatus { output_format } => run_server_status(output_format)?,
         CliAction::ServerStop { output_format } => run_server_stop(output_format)?,
+        CliAction::ServerRecover { output_format } => run_server_recover(output_format)?,
         CliAction::Repl {
             model,
             requested_policy,
@@ -1858,6 +2290,9 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     ServerStop {
+        output_format: CliOutputFormat,
+    },
+    ServerRecover {
         output_format: CliOutputFormat,
     },
     Repl {
@@ -2253,6 +2688,15 @@ fn parse_server_args(args: &[String], output_format: CliOutputFormat) -> Result<
             return Ok(CliAction::Help(HelpTopic::Server));
         }
         return Err(format!("unknown server stop argument: {}", args[1]));
+    }
+    if matches!(args.first().map(String::as_str), Some("recover")) {
+        if args.len() == 1 {
+            return Ok(CliAction::ServerRecover { output_format });
+        }
+        if is_help_args(&args[1..]) {
+            return Ok(CliAction::Help(HelpTopic::Server));
+        }
+        return Err(format!("unknown server recover argument: {}", args[1]));
     }
 
     let mut bind = DEFAULT_SERVER_BIND.to_string();
@@ -8520,6 +8964,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  openyak server stop                      Stop the current workspace local thread server"
     )?;
+    writeln!(
+        out,
+        "  openyak server recover                   Recover current-workspace local thread-server state when safe"
+    )?;
     writeln!(out)?;
     writeln!(out, "Flags")?;
     writeln!(
@@ -8602,6 +9050,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  openyak server start --detach --bind 127.0.0.1:0")?;
     writeln!(out, "  openyak server status")?;
     writeln!(out, "  openyak server stop")?;
+    writeln!(out, "  openyak server recover")?;
     Ok(())
 }
 
@@ -8646,7 +9095,7 @@ fn render_help_topic(topic: HelpTopic) -> &'static str {
             "Usage: openyak package-release [--output-dir PATH] [--binary PATH]\n\nStage a release artifact directory containing the packaged openyak binary plus generated install metadata.\nBy default the command packages the currently running openyak executable into ./dist."
         }
         HelpTopic::Server => {
-            "Usage: openyak server [--bind HOST:PORT]\n       openyak server start --detach [--bind HOST:PORT]\n       openyak server status\n       openyak server stop\n\nRun the local HTTP/SSE thread server backed by the `server` crate, launch the current workspace server as a detached local-only background process, inspect the current workspace's local thread-server discovery/liveness metadata, or stop the current workspace server via its local discovery record.\nThe server exposes the local `/v1/threads` protocol plus legacy `/sessions` compatibility routes, persists thread state in the workspace `.openyak/state.sqlite3` SQLite store, prints the actual bound address on startup, keeps serving until interrupted, and only supports loopback binds.\n`openyak server start --detach` stays local-only, validates/clears workspace discovery preflight, waits for a running discovery record, and keeps foreground startup on `openyak server --bind ...`.\n`openyak server status` stays read-only and reports local loopback operator truth.\n`openyak server stop` stays local-only, validates the reachable operator identity against workspace discovery before signaling a pid, and does not add broader daemon start/recover control yet."
+            "Usage: openyak server [--bind HOST:PORT]\n       openyak server start --detach [--bind HOST:PORT]\n       openyak server status\n       openyak server stop\n       openyak server recover\n\nRun the local HTTP/SSE thread server backed by the `server` crate, launch the current workspace server as a detached local-only background process, inspect the current workspace's local thread-server discovery/liveness metadata, stop the current workspace server via its local discovery record, or attempt a narrow local recovery when persisted thread truth or stale discovery makes that safe.\nThe server exposes the local `/v1/threads` protocol plus legacy `/sessions` compatibility routes, persists thread state in the workspace `.openyak/state.sqlite3` SQLite store, prints the actual bound address on startup, keeps serving until interrupted, and only supports loopback binds.\n`openyak server start --detach` stays local-only, validates/clears workspace discovery preflight, waits for a running discovery record, and keeps foreground startup on `openyak server --bind ...`.\n`openyak server status` stays read-only and reports local loopback operator truth.\n`openyak server stop` stays local-only, validates the reachable operator identity against workspace discovery before signaling a pid.\n`openyak server recover` stays local-only, only acts on current-workspace `daemon_local_v1` thread truth, and still refuses malformed or unsafe discovery records instead of widening into broader daemon lifecycle management."
         }
         HelpTopic::Prompt => {
             "Usage: openyak prompt [--tool-profile NAME] <text>\n       openyak -p [--tool-profile NAME] <text>\n\nRun one non-interactive prompt and exit.\nUse --tool-profile to apply a named local tool-profile ceiling for this process only.\nHidden optional browser tools such as BrowserObserve and BrowserInteract still require browserControl.enabled=true plus explicit --allowedTools BrowserObserve or --allowedTools BrowserInteract.\nIf the model requests structured follow-up input, this mode fails explicitly instead of guessing a reply."
@@ -9372,6 +9821,7 @@ mod tests {
         assert!(render_help_topic(HelpTopic::Server).contains("openyak server start --detach"));
         assert!(render_help_topic(HelpTopic::Server).contains("openyak server status"));
         assert!(render_help_topic(HelpTopic::Server).contains("openyak server stop"));
+        assert!(render_help_topic(HelpTopic::Server).contains("openyak server recover"));
         assert!(render_help_topic(HelpTopic::Server).contains("loopback binds"));
     }
 
@@ -9492,6 +9942,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn parses_server_subcommands() {
         assert_eq!(
             parse_args(&["server".to_string()]).expect("server should parse"),
@@ -9510,6 +9961,13 @@ mod tests {
             parse_args(&["server".to_string(), "stop".to_string()])
                 .expect("server stop should parse"),
             CliAction::ServerStop {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["server".to_string(), "recover".to_string()])
+                .expect("server recover should parse"),
+            CliAction::ServerRecover {
                 output_format: CliOutputFormat::Text,
             }
         );
@@ -9573,6 +10031,18 @@ mod tests {
             ])
             .expect("json server stop should parse"),
             CliAction::ServerStop {
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "--output-format".to_string(),
+                "json".to_string(),
+                "server".to_string(),
+                "recover".to_string(),
+            ])
+            .expect("json server recover should parse"),
+            CliAction::ServerRecover {
                 output_format: CliOutputFormat::Json,
             }
         );
@@ -9744,7 +10214,7 @@ mod tests {
         assert_eq!(report.base_url.as_deref(), Some("http://127.0.0.1:9"));
         assert_eq!(report.truth_layer.as_deref(), Some("daemon_local_v1"));
         assert!(
-            report.recommended_actions[0].contains("refresh the discovery record"),
+            report.recommended_actions[0].contains("openyak server recover"),
             "{report:?}"
         );
 
@@ -10892,7 +11362,7 @@ mod tests {
             local_daemon_check
                 .hint
                 .as_deref()
-                .is_some_and(|hint| hint.contains("refresh the discovery record")),
+                .is_some_and(|hint| hint.contains("openyak server recover")),
             "{local_daemon_check:?}"
         );
 

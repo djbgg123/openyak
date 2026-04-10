@@ -315,6 +315,7 @@ skills 目录支持两种布局：
 - `openyak server start --detach [--bind HOST:PORT]`
 - `openyak server status`
 - `openyak server stop`
+- `openyak server recover`
 - `openyak dump-manifests`
 - `openyak bootstrap-plan`
 - `openyak system-prompt`
@@ -346,6 +347,7 @@ skills 目录支持两种布局：
 - `openyak server start --detach` 作为第一个 local-only operator start action：只会在 detached launch 前做 workspace discovery preflight，并在确认 running discovery record 可用后返回
 - `openyak server status` 作为首个最小 CLI-first daemon/operator inspection：只读回显当前工作区 thread server 的 discovery、reachability、`daemon_local_v1` contract labels 与本地状态库存在性
 - `openyak server stop` 作为第一个 local-only operator action：只会在验证 reachable operator identity 与当前工作区 discovery/pid 一致后停止本地 thread server，并在 stale registration 场景下清理旧发现记录
+- `openyak server recover` 作为第一个 local-only recovery operator action：只会在当前工作区存在 persisted thread truth 或 stale discovery 时尝试恢复本地 thread server，并在 malformed / unsafe discovery 场景下明确拒绝执行
 - 插件发现、安装、启用、禁用、卸载、更新
 - 插件工具聚合、插件 hook 聚合与生命周期
 - mock parity harness 基础设施，以及一批 registry-backed parity foundation tools（Task/Team/Cron + LSP/MCP registry surface）
@@ -385,7 +387,8 @@ skills 目录支持两种布局：
 - 已有：`openyak server start --detach` 作为 local-only 的最小 CLI-first detached start surface。
 - 已有：`openyak server status` 作为只读、local-only 的最小 CLI-first daemon operator inspection。
 - 已有：`openyak server stop` 作为第一个最小 local-only operator action，但仍然只覆盖当前工作区 thread server。
-- 未有：daemon-backed worker/task/team truth layer、跨 family 的 daemon lifecycle store、CLI-first daemon operator controls beyond local thread server start/status/stop。
+- 已有：`openyak server recover` 作为第一个最小 local-only recovery action，只在当前工作区 `daemon_local_v1` thread truth 可安全恢复时执行。
+- 未有：daemon-backed worker/task/team truth layer、跨 family 的 daemon lifecycle store、CLI-first daemon operator controls beyond local thread server start/status/stop/recover。
 
 当前 V1 contract 已冻结的核心口径：
 
@@ -479,7 +482,7 @@ Mock harness 的运行说明见：[`MOCK_PARITY_HARNESS.md`](./MOCK_PARITY_HARNE
 - `openyak doctor` 当前只做本地只读预检，不提供自动修复、迁移或远程探测；daemon-aware 部分目前只覆盖当前 workspace local thread server/discovery readiness。
 - Task / Team / Cron registry 当前仍是进程内临时状态，不提供 durability / restore / lease 语义。
 - `openyak server` 当前提供 bind 范围限制在 loopback 地址的本地 thread/session HTTP/SSE 路由，不是完整 app-server 或远程控制面。
-- daemon/control-plane 路线仍未发货独立的 service install/recover surface；当前只有 local-only `openyak server start --detach` / `openyak server status` / `openyak server stop`。现在的恢复语义仍只覆盖 thread attach-first compatibility，不等同于完整 daemon lifecycle management。
+- daemon/control-plane 路线仍未发货独立的 service install surface；当前只有 local-only `openyak server start --detach` / `openyak server status` / `openyak server stop` / `openyak server recover`。现在的恢复语义仍只覆盖 thread attach-first compatibility，不等同于完整 daemon lifecycle management。
 - 当前补齐的 LSP/MCP 仍以 registry-backed tool/operator surface 为主；完整独立 LSP main entry 继续作为分阶段 follow-up。
 - 在 `0.x` 阶段，命令面和交互细节仍可能继续演进。
 

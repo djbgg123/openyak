@@ -610,6 +610,213 @@ fn openyak_server_start_detached_rejects_unsafe_registration() {
 }
 
 #[test]
+fn openyak_server_recover_reports_nothing_to_recover_without_persisted_truth() {
+    let workspace = unique_temp_dir("openyak-server-recover-empty");
+    std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+    let output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "recover"])
+        .current_dir(&workspace)
+        .output()
+        .expect("server recover should run");
+    assert!(output.status.success(), "server recover should succeed");
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("json server recover should parse");
+    assert_eq!(report["status"], "nothing_to_recover");
+    assert_eq!(report["recovery_kind"], "no_persisted_truth");
+    assert_eq!(report["reachable"], false);
+    assert_eq!(report["state_db_present"], false);
+    assert!(
+        report["recommended_actions"]
+            .as_array()
+            .expect("recommended actions should be present")
+            .iter()
+            .any(|value| value
+                .as_str()
+                .is_some_and(|line| line.contains("openyak server start --detach"))),
+        "{report}"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn openyak_server_recover_reattaches_persisted_truth() {
+    let workspace = unique_temp_dir("openyak-server-recover-persisted");
+    std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+    let mut child = ChildGuard::spawn_in(workspace.clone(), false);
+    let address = child.advertised_address();
+    let discovery_path = child.server_info_path();
+
+    let create = http_request_with_retry(
+        &address,
+        &format!(
+            "POST /v1/threads HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+        ),
+    );
+    assert!(
+        create.starts_with("HTTP/1.1 201"),
+        "create response should be 201, got: {create}"
+    );
+    let created: Value =
+        serde_json::from_str(response_body(&create)).expect("create body should be json");
+    let thread_id = created["thread_id"]
+        .as_str()
+        .expect("thread_id should be present")
+        .to_string();
+
+    drop(child);
+    let _ = std::fs::remove_file(&discovery_path);
+
+    let output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "recover"])
+        .current_dir(&workspace)
+        .output()
+        .expect("server recover should run");
+    assert!(
+        output.status.success(),
+        "server recover should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("json server recover should parse");
+    assert_eq!(report["status"], "recovered");
+    assert_eq!(report["recovery_kind"], "reattach_persisted_truth");
+    assert_eq!(report["state_db_present"], true);
+    let base_url = report["base_url"]
+        .as_str()
+        .expect("recover report should include base_url");
+    let recovered_address = base_url
+        .strip_prefix("http://")
+        .expect("base_url should be http");
+
+    let list = http_request_with_retry(
+        recovered_address,
+        &format!(
+            "GET /v1/threads HTTP/1.1\r\nHost: {recovered_address}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(
+        list.starts_with("HTTP/1.1 200"),
+        "recovered list should be 200, got: {list}"
+    );
+    let listed: Value =
+        serde_json::from_str(response_body(&list)).expect("list body should be json");
+    assert!(
+        listed["threads"]
+            .as_array()
+            .expect("threads should be an array")
+            .iter()
+            .any(|entry| entry["thread_id"].as_str() == Some(thread_id.as_str())),
+        "recovered thread should still exist: {listed}"
+    );
+
+    let stop_output = Command::new(common::openyak_binary())
+        .args(["server", "stop"])
+        .current_dir(&workspace)
+        .output()
+        .expect("server stop should run");
+    assert!(stop_output.status.success(), "server stop should succeed");
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn openyak_server_recover_clears_stale_registration_and_restores_server() {
+    let workspace = DetachedWorkspaceGuard::new("openyak-server-recover-stale");
+    let openyak_dir = workspace.workspace().join(".openyak");
+    std::fs::create_dir_all(&openyak_dir).expect("openyak dir should create");
+    std::fs::write(
+        openyak_dir.join("thread-server.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "baseUrl": "http://127.0.0.1:9",
+            "pid": 4242_u32,
+            "truthLayer": "daemon_local_v1",
+            "operatorPlane": "local_loopback_operator_v1",
+            "persistence": "workspace_sqlite_v1",
+            "attachApi": "/v1/threads"
+        }))
+        .expect("thread server info should serialize"),
+    )
+    .expect("thread server info should write");
+
+    let output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "recover"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("server recover should run");
+    assert!(output.status.success(), "server recover should succeed");
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("json server recover should parse");
+    assert_eq!(report["status"], "recovered");
+    assert_eq!(report["recovery_kind"], "clear_stale_and_restart");
+    assert_eq!(report["stale_registration_cleared"], true);
+    assert_ne!(report["base_url"], "http://127.0.0.1:9");
+    let performed_actions = report["performed_actions"]
+        .as_array()
+        .expect("performed actions should be present");
+    assert!(
+        performed_actions.iter().any(|value| value
+            .as_str()
+            .is_some_and(|line| line.contains("cleared the stale workspace discovery record"))),
+        "{report}"
+    );
+    assert!(
+        performed_actions.iter().any(|value| value
+            .as_str()
+            .is_some_and(|line| line.contains("started a detached local thread server"))),
+        "{report}"
+    );
+    assert!(
+        !performed_actions.iter().any(|value| value
+            .as_str()
+            .is_some_and(|line| line.contains("reconciled the persisted workspace thread truth"))),
+        "{report}"
+    );
+}
+
+#[test]
+fn openyak_server_recover_rejects_unsafe_registration() {
+    let workspace = DetachedWorkspaceGuard::new("openyak-server-recover-unsafe");
+    let openyak_dir = workspace.workspace().join(".openyak");
+    std::fs::create_dir_all(&openyak_dir).expect("openyak dir should create");
+    let discovery_path = openyak_dir.join("thread-server.json");
+    std::fs::write(
+        &discovery_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "baseUrl": "http://127.0.0.1:4100",
+            "pid": 4242_u32,
+            "truthLayer": "process_local_v1",
+            "operatorPlane": "local_loopback_operator_v1",
+            "persistence": "workspace_sqlite_v1",
+            "attachApi": "/v1/threads"
+        }))
+        .expect("thread server info should serialize"),
+    )
+    .expect("thread server info should write");
+
+    let output = Command::new(common::openyak_binary())
+        .args(["server", "recover"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("server recover should run");
+    assert!(
+        !output.status.success(),
+        "server recover should reject unsafe discovery"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        stdout.contains("Status           invalid_registration"),
+        "{stdout}"
+    );
+    assert!(
+        discovery_path.exists(),
+        "unsafe discovery should remain for manual inspection"
+    );
+}
+
+#[test]
 fn openyak_server_stop_stops_running_local_server() {
     let workspace = unique_temp_dir("openyak-server-stop-running");
     std::fs::create_dir_all(&workspace).expect("workspace should create");
