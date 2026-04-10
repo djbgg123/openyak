@@ -1860,6 +1860,34 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<bool, String> {
     }
 }
 
+fn wait_for_thread_server_shutdown(
+    pid: u32,
+    base_url: Option<&str>,
+    timeout: Duration,
+) -> Result<bool, String> {
+    let start = Instant::now();
+    loop {
+        if !process_is_alive(pid)? {
+            return Ok(true);
+        }
+        if let Some(base_url) = base_url {
+            // On Unix the target server may briefly remain as a zombie until its
+            // parent reaps it, which keeps `kill -0` reporting the pid as alive
+            // even though the loopback operator is already gone. For the local
+            // stop contract, a closed operator listener is sufficient to treat
+            // the stop as successful.
+            match probe_local_thread_server(base_url) {
+                Ok(false) | Err(_) => return Ok(true),
+                Ok(true) => {}
+            }
+        }
+        if start.elapsed() >= timeout {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn stop_report_from_status(
     status_report: ThreadServerStatusReport,
     status: &'static str,
@@ -1960,7 +1988,11 @@ fn stop_running_thread_server(
         ));
     }
     terminate_process_by_pid(pid)?;
-    if !wait_for_process_exit(pid, Duration::from_secs(2))? {
+    if !wait_for_thread_server_shutdown(
+        pid,
+        status_report.base_url.as_deref(),
+        Duration::from_secs(2),
+    )? {
         return Ok(stop_report_from_status(
             status_report,
             "stop_failed",
