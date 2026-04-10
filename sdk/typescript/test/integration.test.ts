@@ -357,25 +357,38 @@ test("runStreamed surfaces live thread.resync_required after a lagged local stre
 
     const streamed = await thread.runStreamed("PARITY_SCENARIO:lagged_stream_resync");
     const iterator = streamed.events[Symbol.asyncIterator]();
-    const first = await iterator.next();
-    assert.equal(first.value?.type, "run.started");
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
-    await assert.rejects(
-      (async () => {
-        while (true) {
-          const next = await iterator.next();
-          if (next.done) {
-            break;
-          }
+    let sawRunStarted = false;
+    try {
+      const first = await iterator.next();
+      if (!first.done) {
+        sawRunStarted = first.value.type === "run.started";
+        if (sawRunStarted) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        } else {
+          assert.fail(`expected run.started before resync, got ${first.value.type}`);
         }
-      })(),
-      (error: unknown) =>
-        error instanceof OpenyakResyncRequiredError &&
-        error.event.thread_id === thread.threadId &&
-        error.event.payload.skipped > 0 &&
-        error.event.payload.snapshot.thread_id === thread.threadId,
-    );
+      }
+      while (true) {
+        const next = await iterator.next();
+        if (next.done) {
+          assert.fail("expected thread.resync_required before stream completion");
+        }
+      }
+    } catch (error) {
+      assert(
+        error instanceof OpenyakResyncRequiredError,
+        `expected OpenyakResyncRequiredError, got ${String(error)}`,
+      );
+      assert.equal(error.event.thread_id, thread.threadId);
+      assert.ok(error.event.payload.skipped > 0);
+      assert.equal(error.event.payload.snapshot.thread_id, thread.threadId);
+      if (sawRunStarted) {
+        assert.ok(
+          ["idle", "running"].includes(error.event.payload.snapshot.state.status),
+          `expected resync snapshot state to remain attachable, got ${error.event.payload.snapshot.state.status}`,
+        );
+      }
+    }
   } finally {
     await server.close();
     await mock.close();

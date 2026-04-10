@@ -59,8 +59,7 @@ pub use file_ops::{
 pub use hooks::{HookEvent, HookRunResult, HookRunner};
 pub use lifecycle::{
     LifecycleContractSnapshot, LifecycleStateSnapshot, RecoveryGuidanceSnapshot,
-    ThreadContractSnapshot,
-    DAEMON_LOCAL_TRUTH_LAYER, LOCAL_LOOPBACK_OPERATOR_PLANE,
+    ThreadContractSnapshot, DAEMON_LOCAL_TRUTH_LAYER, LOCAL_LOOPBACK_OPERATOR_PLANE,
     LOCAL_RUNTIME_FOUNDATION_OPERATOR_PLANE, PROCESS_LOCAL_TRUTH_LAYER,
     PROCESS_MEMORY_PERSISTENCE_LAYER, THREAD_ATTACH_API, WORKSPACE_SQLITE_PERSISTENCE_LAYER,
 };

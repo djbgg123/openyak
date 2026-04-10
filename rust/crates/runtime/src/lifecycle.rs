@@ -79,10 +79,7 @@ impl LifecycleStateSnapshot {
     }
 
     #[must_use]
-    pub fn with_recovery(
-        status: impl Into<String>,
-        recovery: RecoveryGuidanceSnapshot,
-    ) -> Self {
+    pub fn with_recovery(status: impl Into<String>, recovery: RecoveryGuidanceSnapshot) -> Self {
         Self {
             status: status.into(),
             failure_kind: Some(recovery.failure_kind.clone()),

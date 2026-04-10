@@ -255,7 +255,8 @@ impl TaskRegistry {
         if let Some(existing_team_id) = task.team_id.as_deref() {
             if existing_team_id == team_id {
                 task.last_error = None;
-                task.lifecycle = LifecycleStateSnapshot::process_local_task(&task.status.to_string());
+                task.lifecycle =
+                    LifecycleStateSnapshot::process_local_task(&task.status.to_string());
                 return Ok(());
             }
             let error = format!("task {task_id} is already assigned to team {existing_team_id}");
@@ -280,7 +281,8 @@ impl TaskRegistry {
         match task.team_id.as_deref() {
             Some(existing_team_id) if existing_team_id == team_id => {
                 task.team_id = None;
-                task.lifecycle = LifecycleStateSnapshot::process_local_task(&task.status.to_string());
+                task.lifecycle =
+                    LifecycleStateSnapshot::process_local_task(&task.status.to_string());
                 task.updated_at = now_secs();
                 task.last_error = None;
                 Ok(())
@@ -295,7 +297,8 @@ impl TaskRegistry {
             }
             None => {
                 task.last_error = None;
-                task.lifecycle = LifecycleStateSnapshot::process_local_task(&task.status.to_string());
+                task.lifecycle =
+                    LifecycleStateSnapshot::process_local_task(&task.status.to_string());
                 Ok(())
             }
         }

@@ -5294,13 +5294,10 @@ struct ThreadSnapshotValue {
     session: Session,
 }
 
-fn thread_lifecycle_snapshot(
-    state: &ThreadStateSnapshotValue,
-) -> runtime::LifecycleStateSnapshot {
-    state
-        .lifecycle
-        .clone()
-        .unwrap_or_else(|| runtime::LifecycleStateSnapshot::daemon_thread(&state.status, state.recovery.clone()))
+fn thread_lifecycle_snapshot(state: &ThreadStateSnapshotValue) -> runtime::LifecycleStateSnapshot {
+    state.lifecycle.clone().unwrap_or_else(|| {
+        runtime::LifecycleStateSnapshot::daemon_thread(&state.status, state.recovery.clone())
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

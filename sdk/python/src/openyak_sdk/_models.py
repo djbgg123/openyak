@@ -391,7 +391,7 @@ class AwaitingUserInputRunResult:
     run_id: str
     events: list[RunEvent]
     recovered_from_snapshot: bool
-    pending_user_input: UserInputRequestPayload
+    pending_user_input: UserInputRequestPayload | RunWaitingUserInputPayload
     final_text: str | None = None
     usage: TokenUsage | None = None
     snapshot: ThreadSnapshot | None = None
