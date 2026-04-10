@@ -200,7 +200,7 @@ snapshot = thread.read()
 - `run_streamed()` does **not** pretend replay exists; if live streaming fidelity is lost, it raises.
 - 真实本地 server 重启导致的 streamed 断流现在也有 live integration 锁定，并会按当前 attach-first 合约上抛 reconnect-required 语义，而不是假装 replay。
 
-This means the current Python SDK remains compatible with the local-first daemon/control-plane roadmap only at the `/v1/threads` attach-first layer: it can observe persisted interruption state plus the `daemon_local_v1` thread truth label, but it is not itself a client for the CLI's local-only `server start --detach` / `status` / `stop` / `recover` operator actions.
+This means the current Python SDK remains compatible with the local-first daemon/control-plane roadmap only at the `/v1/threads` attach-first layer: it can observe persisted interruption state plus the `daemon_local_v1` thread truth label, but it is not yet a client for daemon start/stop/status/recover operator APIs. More specifically, it is not itself a client for the CLI's local-only `server start --detach` / `status` / `stop` / `recover` operator actions.
 
 ## Minimal package layout
 

@@ -38,8 +38,10 @@
 - 不要再恢复任何内置默认 OAuth 站点。
 - 运行时只使用 `settings.oauth` 中显式配置的 `clientId`、`authorizeUrl`、`tokenUrl` 等参数。
 - OAuth 后端必须由用户配置；不要在 Rust 代码、默认配置或测试夹具里引入隐式默认 URL。
+- 如果 `settings.oauth.tokenUrl` 或 provider `baseUrl` 指向 `localhost` / loopback IP，相关 HTTP 客户端必须绕过继承的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`；不要让本地 token exchange 或本地 gateway 请求被宿主代理截走。
 - 配置了 `manualRedirectUrl` 时，必须进入手动回调输入模式。
 - token 必须优先写系统凭据库；只有系统凭据库不可用时，才允许回退到用户级 `credentials.json`。
+- 覆盖 loopback OAuth refresh / 本地 provider 请求的测试应显式锁定这条 no-proxy 约束，避免回归时只在带代理的宿主环境里暴露故障。
 
 ### Skills
 

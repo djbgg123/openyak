@@ -241,7 +241,7 @@ impl OpenyakApiClient {
         request: &OAuthTokenExchangeRequest,
     ) -> Result<OAuthTokenSet, ApiError> {
         let response = self
-            .http
+            .http_client_for_url(&config.token_url)?
             .post(&config.token_url)
             .header("content-type", "application/x-www-form-urlencoded")
             .form(&request.form_params())
@@ -261,7 +261,7 @@ impl OpenyakApiClient {
         request: &OAuthRefreshRequest,
     ) -> Result<OAuthTokenSet, ApiError> {
         let response = self
-            .http
+            .http_client_for_url(&config.token_url)?
             .post(&config.token_url)
             .header("content-type", "application/x-www-form-urlencoded")
             .form(&request.form_params())
@@ -317,7 +317,7 @@ impl OpenyakApiClient {
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let request_builder = self
-            .http
+            .http_client_for_url(&request_url)?
             .post(&request_url)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json");
@@ -338,6 +338,17 @@ impl OpenyakApiClient {
             .initial_backoff
             .checked_mul(multiplier)
             .map_or(self.max_backoff, |delay| delay.min(self.max_backoff)))
+    }
+
+    fn http_client_for_url(&self, url: &str) -> Result<reqwest::Client, ApiError> {
+        if url_targets_loopback(url) {
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .map_err(ApiError::from)
+        } else {
+            Ok(self.http.clone())
+        }
     }
 }
 
@@ -532,6 +543,19 @@ pub fn read_base_url() -> String {
     std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
 }
 
+fn url_targets_loopback(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
     headers
         .get(REQUEST_ID_HEADER)
@@ -680,6 +704,45 @@ mod tests {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => panic!("cleanup temp dir: {error}"),
         }
+    }
+
+    struct TempEnvVar {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl TempEnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for TempEnvVar {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn force_invalid_proxy_env() -> [TempEnvVar; 5] {
+        [
+            TempEnvVar::set("HTTP_PROXY", "http://127.0.0.1:9"),
+            TempEnvVar::set("HTTPS_PROXY", "http://127.0.0.1:9"),
+            TempEnvVar::set("ALL_PROXY", "http://127.0.0.1:9"),
+            TempEnvVar::remove("NO_PROXY"),
+            TempEnvVar::remove("no_proxy"),
+        ]
     }
 
     fn sample_oauth_config(token_url: String) -> OAuthConfig {
@@ -833,6 +896,7 @@ mod tests {
     fn resolve_saved_oauth_token_refreshes_expired_credentials() {
         let _guard = env_lock();
         let config_home = temp_config_home();
+        let _proxy_env = force_invalid_proxy_env();
         std::env::set_var("OPENYAK_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -921,6 +985,7 @@ mod tests {
     fn resolve_saved_oauth_token_preserves_refresh_token_when_refresh_response_omits_it() {
         let _guard = env_lock();
         let config_home = temp_config_home();
+        let _proxy_env = force_invalid_proxy_env();
         std::env::set_var("OPENYAK_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");

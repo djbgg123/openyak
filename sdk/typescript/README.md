@@ -174,7 +174,7 @@ const snapshot = await thread.read();
 - `runStreamed()` does **not** pretend replay exists; if live streaming fidelity is lost, it throws.
 - 真实本地 server 重启导致的 streamed 断流现在也有 live integration 锁定，并会按当前 attach-first 合约抛出 reconnect-required 语义，而不是假装 replay。
 
-So the current TypeScript SDK is compatible with the daemon/control-plane roadmap only at the `/v1/threads` attach-first boundary: it can observe persisted interruption state plus the `daemon_local_v1` thread truth label, but it is not itself a client for the CLI's local-only `server start --detach` / `status` / `stop` / `recover` operator actions.
+So the current TypeScript SDK is compatible with the daemon/control-plane roadmap only at the `/v1/threads` attach-first boundary: it can observe persisted interruption state plus the `daemon_local_v1` thread truth label, but it is not yet a client for daemon start/stop/status/recover operator APIs. More specifically, it is not itself a client for the CLI's local-only `server start --detach` / `status` / `stop` / `recover` operator actions.
 
 ## Scripts
 
