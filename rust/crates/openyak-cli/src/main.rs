@@ -11821,11 +11821,20 @@ mod tests {
 
     #[test]
     fn system_prompt_builder_uses_injected_date() {
-        let prompt = super::build_system_prompt_with_date("gpt-5.3-codex", "2030-02-03")
-            .expect("system prompt should render");
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-system-prompt-date");
+        fs::create_dir_all(&root).expect("workspace should exist");
+
+        let prompt = {
+            let _cwd = CurrentDirGuard::set(&root);
+            super::build_system_prompt_with_date("gpt-5.3-codex", "2030-02-03")
+                .expect("system prompt should render")
+        };
         let rendered = prompt.join("\n");
         assert!(rendered.contains("Today's date is 2030-02-03."));
         assert!(rendered.contains("Model family: gpt-5.3-codex"));
+
+        crate::cleanup_temp_dir(&root);
     }
 
     #[test]
