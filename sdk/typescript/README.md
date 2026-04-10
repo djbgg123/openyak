@@ -154,6 +154,7 @@ const snapshot = await thread.read();
 - If the local server fails before runtime/provider bootstrap completes, the latest thread snapshot still preserves the submitted turn or user-input response instead of silently dropping it.
 - If the server restarts mid-run, the latest snapshot may come back as `status="interrupted"` with a `recovery_note`; the SDK exposes that persisted truth, but it does not invent daemon-side replay or recovery actions.
 - That interrupted snapshot truth is now also locked in live local-server integration coverage, so buffered attach-first runs can reconcile real restart disconnects back into `recovery_note` plus shared `failure_kind / recovery_kind / recommended_actions`.
+- Fresh attach-first reattachment is now also locked live: after a local server restart, `resumeThread()`, `read()`, and `listThreads()` expose the latest persisted `awaiting_user_input` or `interrupted` snapshot truth without pretending `run()` replay exists.
 - The same snapshot contract also exposes `operator_plane`, `persistence`, and structured recovery fields (`failure_kind`, `recovery_kind`, `recommended_actions`) so attach-first clients can render operator guidance without implying broader daemon controls.
 - That reconciliation is intentionally best-effort for local attach-first, single-writer usage; if the latest snapshot shows a different active `run_id`, `run()` throws `OpenyakReconnectRequiredError` instead of pretending replay exists.
 - `runStreamed()` does **not** pretend replay exists; if live streaming fidelity is lost, it throws.

@@ -6,10 +6,10 @@ import shutil
 import tempfile
 import threading
 import time
-from urllib.parse import urlparse
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import cast
+from urllib.parse import urlparse
 
 import pytest
 
@@ -282,6 +282,137 @@ def test_streamed_sync_run_surfaces_reconnect_required_after_server_restart() ->
 
                 with pytest.raises(OpenyakReconnectRequiredError):
                     list(streamed.events)
+    finally:
+        server.close()
+        mock.close()
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_attach_first_sync_restart_preserves_awaiting_user_input_truth() -> None:
+    mock = start_mock_anthropic_service()
+    workspace = tempfile.mkdtemp(prefix="openyak-python-sdk-reattach-awaiting-")
+    env = {
+        **os.environ,
+        "ANTHROPIC_API_KEY": "test-sdk-key",
+        "ANTHROPIC_BASE_URL": mock.base_url,
+    }
+    server = start_openyak_server_in(workspace, env, cleanup_workspace=False)
+    bind = urlparse(server.base_url).netloc
+
+    try:
+        with OpenyakClient(base_url=server.base_url, timeout_s=30.0) as client:
+            thread = client.create_thread(
+                model="claude-sonnet-4-6",
+                allowed_tools=["read_file"],
+            )
+            accepted = thread.start_turn("PARITY_SCENARIO:request_user_input_roundtrip")
+            waiting = thread.read()
+            if waiting.state.status != "awaiting_user_input":
+                wait_for_thread_status(thread, "awaiting_user_input")
+                waiting = thread.read()
+            pending = waiting.state.pending_user_input
+            assert pending is not None
+            thread_id = thread.thread_id
+
+        server.close()
+        server = start_openyak_server_in(
+            workspace,
+            env,
+            bind=bind,
+            cleanup_workspace=False,
+        )
+
+        with OpenyakClient(base_url=server.base_url, timeout_s=30.0) as restarted_client:
+            reattached = restarted_client.resume_thread(thread_id)
+            recovered = reattached.read()
+            assert recovered.state.status == "awaiting_user_input"
+            assert recovered.state.run_id == accepted.run_id
+            assert recovered.state.pending_user_input is not None
+            assert recovered.state.pending_user_input.request_id == pending.request_id
+
+            listed = restarted_client.list_threads()
+            listed_thread = next(
+                thread_summary
+                for thread_summary in listed.threads
+                if thread_summary.thread_id == thread_id
+            )
+            assert listed_thread.state.status == "awaiting_user_input"
+            assert listed_thread.state.run_id == accepted.run_id
+            assert listed_thread.state.pending_user_input is not None
+            assert listed_thread.state.pending_user_input.request_id == pending.request_id
+
+            resumed = reattached.resume_user_input(
+                request_id=pending.request_id,
+                content="feature",
+                selected_option="feature",
+            )
+            assert resumed.status == "completed"
+            assert resumed.run_id == accepted.run_id
+    finally:
+        server.close()
+        mock.close()
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_attach_first_sync_restart_preserves_interrupted_truth() -> None:
+    mock = start_mock_anthropic_service()
+    workspace = tempfile.mkdtemp(prefix="openyak-python-sdk-reattach-interrupted-")
+    env = {
+        **os.environ,
+        "ANTHROPIC_API_KEY": "test-sdk-key",
+        "ANTHROPIC_BASE_URL": mock.base_url,
+    }
+    server = start_openyak_server_in(workspace, env, cleanup_workspace=False)
+    bind = urlparse(server.base_url).netloc
+
+    try:
+        with OpenyakClient(base_url=server.base_url, timeout_s=30.0) as client:
+            thread = client.create_thread(
+                model="claude-sonnet-4-6",
+                allowed_tools=["read_file"],
+            )
+            accepted = thread.start_turn("PARITY_SCENARIO:delayed_request_user_input_roundtrip")
+            wait_for_thread_status(thread, "running")
+            thread_id = thread.thread_id
+
+        server.close()
+        server = start_openyak_server_in(
+            workspace,
+            env,
+            bind=bind,
+            cleanup_workspace=False,
+        )
+
+        with OpenyakClient(base_url=server.base_url, timeout_s=30.0) as restarted_client:
+            reattached = restarted_client.resume_thread(thread_id)
+            wait_for_thread_status(reattached, "interrupted")
+            recovered = reattached.read()
+            assert recovered.state.status == "interrupted"
+            assert recovered.state.run_id == accepted.run_id
+            assert recovered.state.recovery_note is not None
+            assert "restart or shutdown" in recovered.state.recovery_note
+            assert recovered.state.lifecycle is not None
+            assert recovered.state.lifecycle.failure_kind == "daemon_restart_interrupted_run"
+            assert recovered.state.recovery is not None
+            assert recovered.state.recovery.recovery_kind == "reattach_or_retry"
+
+            listed = restarted_client.list_threads()
+            listed_thread = next(
+                thread_summary
+                for thread_summary in listed.threads
+                if thread_summary.thread_id == thread_id
+            )
+            assert listed_thread.state.status == "interrupted"
+            assert listed_thread.state.run_id == accepted.run_id
+            assert listed_thread.state.recovery_note is not None
+            assert "restart or shutdown" in listed_thread.state.recovery_note
+            assert listed_thread.state.lifecycle is not None
+            assert (
+                listed_thread.state.lifecycle.failure_kind
+                == "daemon_restart_interrupted_run"
+            )
+            assert listed_thread.state.recovery is not None
+            assert listed_thread.state.recovery.recovery_kind == "reattach_or_retry"
     finally:
         server.close()
         mock.close()
@@ -576,6 +707,151 @@ def test_streamed_async_run_surfaces_reconnect_required_after_server_restart() -
                     with pytest.raises(OpenyakReconnectRequiredError):
                         async for _event in streamed.events:
                             pass
+        finally:
+            server.close()
+            mock.close()
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    asyncio.run(case())
+
+
+def test_attach_first_async_restart_preserves_awaiting_user_input_truth() -> None:
+    async def case() -> None:
+        mock = start_mock_anthropic_service()
+        workspace = tempfile.mkdtemp(prefix="openyak-python-sdk-async-reattach-awaiting-")
+        env = {
+            **os.environ,
+            "ANTHROPIC_API_KEY": "test-sdk-key",
+            "ANTHROPIC_BASE_URL": mock.base_url,
+        }
+        server = start_openyak_server_in(workspace, env, cleanup_workspace=False)
+        bind = urlparse(server.base_url).netloc
+
+        try:
+            async with AsyncOpenyakClient(base_url=server.base_url, timeout_s=30.0) as client:
+                thread = await client.create_thread(
+                    model="claude-sonnet-4-6",
+                    allowed_tools=["read_file"],
+                )
+                accepted = await thread.start_turn("PARITY_SCENARIO:request_user_input_roundtrip")
+                waiting = await thread.read()
+                if waiting.state.status != "awaiting_user_input":
+                    await wait_for_thread_status_async(thread, "awaiting_user_input")
+                    waiting = await thread.read()
+                pending = waiting.state.pending_user_input
+                assert pending is not None
+                thread_id = thread.thread_id
+
+            server.close()
+            server = start_openyak_server_in(
+                workspace,
+                env,
+                bind=bind,
+                cleanup_workspace=False,
+            )
+
+            async with AsyncOpenyakClient(
+                base_url=server.base_url,
+                timeout_s=30.0,
+            ) as restarted_client:
+                reattached = restarted_client.resume_thread(thread_id)
+                recovered = await reattached.read()
+                assert recovered.state.status == "awaiting_user_input"
+                assert recovered.state.run_id == accepted.run_id
+                assert recovered.state.pending_user_input is not None
+                assert recovered.state.pending_user_input.request_id == pending.request_id
+
+                listed = await restarted_client.list_threads()
+                listed_thread = next(
+                    thread_summary
+                    for thread_summary in listed.threads
+                    if thread_summary.thread_id == thread_id
+                )
+                assert listed_thread.state.status == "awaiting_user_input"
+                assert listed_thread.state.run_id == accepted.run_id
+                assert listed_thread.state.pending_user_input is not None
+                assert listed_thread.state.pending_user_input.request_id == pending.request_id
+
+                resumed = await reattached.resume_user_input(
+                    request_id=pending.request_id,
+                    content="feature",
+                    selected_option="feature",
+                )
+                assert resumed.status == "completed"
+                assert resumed.run_id == accepted.run_id
+        finally:
+            server.close()
+            mock.close()
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    asyncio.run(case())
+
+
+def test_attach_first_async_restart_preserves_interrupted_truth() -> None:
+    async def case() -> None:
+        mock = start_mock_anthropic_service()
+        workspace = tempfile.mkdtemp(prefix="openyak-python-sdk-async-reattach-interrupted-")
+        env = {
+            **os.environ,
+            "ANTHROPIC_API_KEY": "test-sdk-key",
+            "ANTHROPIC_BASE_URL": mock.base_url,
+        }
+        server = start_openyak_server_in(workspace, env, cleanup_workspace=False)
+        bind = urlparse(server.base_url).netloc
+
+        try:
+            async with AsyncOpenyakClient(base_url=server.base_url, timeout_s=30.0) as client:
+                thread = await client.create_thread(
+                    model="claude-sonnet-4-6",
+                    allowed_tools=["read_file"],
+                )
+                accepted = await thread.start_turn(
+                    "PARITY_SCENARIO:delayed_request_user_input_roundtrip"
+                )
+                await wait_for_thread_status_async(thread, "running")
+                thread_id = thread.thread_id
+
+            server.close()
+            server = start_openyak_server_in(
+                workspace,
+                env,
+                bind=bind,
+                cleanup_workspace=False,
+            )
+
+            async with AsyncOpenyakClient(
+                base_url=server.base_url,
+                timeout_s=30.0,
+            ) as restarted_client:
+                reattached = restarted_client.resume_thread(thread_id)
+                await wait_for_thread_status_async(reattached, "interrupted")
+                recovered = await reattached.read()
+                assert recovered.state.status == "interrupted"
+                assert recovered.state.run_id == accepted.run_id
+                assert recovered.state.recovery_note is not None
+                assert "restart or shutdown" in recovered.state.recovery_note
+                assert recovered.state.lifecycle is not None
+                assert recovered.state.lifecycle.failure_kind == "daemon_restart_interrupted_run"
+                assert recovered.state.recovery is not None
+                assert recovered.state.recovery.recovery_kind == "reattach_or_retry"
+
+                listed = await restarted_client.list_threads()
+                listed_thread = next(
+                    thread_summary
+                    for thread_summary in listed.threads
+                    if thread_summary.thread_id == thread_id
+                )
+                assert listed_thread.state.status == "interrupted"
+                assert listed_thread.state.run_id == accepted.run_id
+                assert listed_thread.state.recovery_note is not None
+                assert "restart or shutdown" in listed_thread.state.recovery_note
+                assert listed_thread.state.lifecycle is not None
+                assert (
+                    listed_thread.state.lifecycle.failure_kind
+                    == "daemon_restart_interrupted_run"
+                )
+                assert listed_thread.state.recovery is not None
+                assert listed_thread.state.recovery.recovery_kind == "reattach_or_retry"
         finally:
             server.close()
             mock.close()

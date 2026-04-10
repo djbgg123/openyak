@@ -331,3 +331,143 @@ test("runStreamed surfaces reconnect-required truth after local server restart",
     await rm(workspace, { recursive: true, force: true });
   }
 });
+
+test("attach-first resumeThread/read/listThreads preserve awaiting_user_input truth after local server restart", async () => {
+  const mock = await startMockAnthropicService();
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "openyak-sdk-reattach-awaiting-"));
+  const env = {
+    ...process.env,
+    ANTHROPIC_API_KEY: "test-sdk-key",
+    ANTHROPIC_BASE_URL: mock.baseUrl,
+  };
+  let server = await startOpenyakServerIn(workspace, env, { cleanupWorkspace: false });
+  const bind = new URL(server.baseUrl).host;
+
+  try {
+    const client = new OpenyakClient({
+      baseUrl: server.baseUrl,
+      timeoutMs: 30_000,
+    });
+
+    const thread = await client.createThread({
+      model: "claude-sonnet-4-6",
+      allowedTools: ["read_file"],
+    });
+    const accepted = await thread.startTurn("PARITY_SCENARIO:request_user_input_roundtrip");
+    let waiting = await thread.read();
+    if (waiting.state.status !== "awaiting_user_input") {
+      await waitForThreadStatus(thread, "awaiting_user_input");
+      waiting = await thread.read();
+    }
+    const pending = waiting.state.pending_user_input;
+    assert.ok(pending);
+    const threadId = thread.threadId;
+
+    await server.close();
+    server = await startOpenyakServerIn(workspace, env, {
+      bind,
+      cleanupWorkspace: false,
+    });
+
+    const restartedClient = new OpenyakClient({
+      baseUrl: server.baseUrl,
+      timeoutMs: 30_000,
+    });
+    const reattached = restartedClient.resumeThread(threadId);
+    const recovered = await reattached.read();
+    assert.equal(recovered.state.status, "awaiting_user_input");
+    assert.equal(recovered.state.run_id, accepted.run_id);
+    assert.ok(recovered.state.pending_user_input);
+    assert.equal(recovered.state.pending_user_input.request_id, pending.request_id);
+
+    const listed = await restartedClient.listThreads();
+    const listedThread = listed.threads.find((value) => value.thread_id === threadId);
+    assert.ok(listedThread);
+    assert.equal(listedThread.state.status, "awaiting_user_input");
+    assert.equal(listedThread.state.run_id, accepted.run_id);
+    assert.equal(listedThread.state.pending_user_input?.request_id, pending.request_id);
+
+    const resumed = await reattached.resumeUserInput({
+      requestId: pending.request_id,
+      content: "feature",
+      selectedOption: "feature",
+    });
+    assert.equal(resumed.status, "completed");
+    assert.equal(resumed.runId, accepted.run_id);
+  } finally {
+    await server.close();
+    await mock.close();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("attach-first resumeThread/read/listThreads preserve interrupted recovery truth after local server restart", async () => {
+  const mock = await startMockAnthropicService();
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "openyak-sdk-reattach-interrupted-"));
+  const env = {
+    ...process.env,
+    ANTHROPIC_API_KEY: "test-sdk-key",
+    ANTHROPIC_BASE_URL: mock.baseUrl,
+  };
+  let server = await startOpenyakServerIn(workspace, env, { cleanupWorkspace: false });
+  const bind = new URL(server.baseUrl).host;
+
+  try {
+    const client = new OpenyakClient({
+      baseUrl: server.baseUrl,
+      timeoutMs: 30_000,
+    });
+
+    const thread = await client.createThread({
+      model: "claude-sonnet-4-6",
+      allowedTools: ["read_file"],
+    });
+    const accepted = await thread.startTurn("PARITY_SCENARIO:delayed_request_user_input_roundtrip");
+    await waitForThreadStatus(thread, "running");
+    const threadId = thread.threadId;
+
+    await server.close();
+    server = await startOpenyakServerIn(workspace, env, {
+      bind,
+      cleanupWorkspace: false,
+    });
+
+    const restartedClient = new OpenyakClient({
+      baseUrl: server.baseUrl,
+      timeoutMs: 30_000,
+    });
+    const reattached = restartedClient.resumeThread(threadId);
+    await waitForThreadStatus(reattached, "interrupted");
+    const recovered = await reattached.read();
+    assert.equal(recovered.state.status, "interrupted");
+    assert.equal(recovered.state.run_id, accepted.run_id);
+    assert.match(recovered.state.recovery_note ?? "", /restart or shutdown/);
+    assert.equal(
+      recovered.state.lifecycle?.failure_kind,
+      "daemon_restart_interrupted_run",
+    );
+    assert.equal(
+      recovered.state.recovery?.recovery_kind,
+      "reattach_or_retry",
+    );
+
+    const listed = await restartedClient.listThreads();
+    const listedThread = listed.threads.find((value) => value.thread_id === threadId);
+    assert.ok(listedThread);
+    assert.equal(listedThread.state.status, "interrupted");
+    assert.equal(listedThread.state.run_id, accepted.run_id);
+    assert.match(listedThread.state.recovery_note ?? "", /restart or shutdown/);
+    assert.equal(
+      listedThread.state.lifecycle?.failure_kind,
+      "daemon_restart_interrupted_run",
+    );
+    assert.equal(
+      listedThread.state.recovery?.recovery_kind,
+      "reattach_or_retry",
+    );
+  } finally {
+    await server.close();
+    await mock.close();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
