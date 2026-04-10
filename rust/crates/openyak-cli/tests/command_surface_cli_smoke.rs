@@ -35,6 +35,7 @@ fn openyak_root_and_subcommand_help_cover_verified_surface() {
         "openyak package-release",
         "openyak server",
         "openyak server start --detach",
+        "openyak server install",
         "openyak server status",
         "openyak server stop",
         "openyak server recover",
@@ -140,6 +141,7 @@ fn openyak_root_and_subcommand_help_cover_verified_surface() {
     for marker in [
         "local `/v1/threads` protocol plus legacy `/sessions` compatibility routes",
         "openyak server start --detach",
+        "openyak server install",
         "openyak server stop",
         "openyak server recover",
         "workspace `.openyak/state.sqlite3` SQLite store",

@@ -1308,6 +1308,10 @@ mod tests {
         assert!(output.contains("openyak init"));
         assert!(output.contains("openyak doctor"));
         assert!(output.contains("Local daemon"), "{output}");
+        assert!(
+            output.contains("openyak server install --bind 127.0.0.1:0"),
+            "{output}"
+        );
         assert!(output.contains("openyak server start --detach"), "{output}");
         assert!(output.contains("openyak server status"), "{output}");
 

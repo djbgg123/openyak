@@ -42,6 +42,10 @@ fn openyak_doctor_reports_healthy_environment() {
         stdout.contains("No workspace local thread server is running"),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("openyak server install --bind 127.0.0.1:0"),
+        "{stdout}"
+    );
 
     fs::remove_dir_all(root).expect("temp dir cleanup should succeed");
 }
@@ -132,6 +136,202 @@ fn openyak_doctor_warns_when_github_cli_is_not_logged_in() {
 }
 
 #[test]
+fn openyak_doctor_reports_staged_install_bundle_guidance() {
+    let root = unique_temp_dir("openyak-doctor-smoke-install-bundle");
+    let workspace = root.join("workspace");
+    let config_home = root.join("openyak-home");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+    write_fake_gh(&bin_dir, true);
+
+    let install_output = Command::new(common::openyak_binary())
+        .args(["server", "install", "--bind", "127.0.0.1:0"])
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("server install should run");
+    assert!(
+        install_output.status.success(),
+        "server install should succeed: {}",
+        String::from_utf8_lossy(&install_output.stderr)
+    );
+
+    let output = Command::new(common::openyak_binary())
+        .arg("doctor")
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .env("ANTHROPIC_API_KEY", "doctor-test-key")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env("PATH", joined_path(&bin_dir))
+        .output()
+        .expect("doctor should run");
+
+    assert!(
+        output.status.success(),
+        "doctor should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("doctor stdout should be utf8");
+    assert!(
+        stdout.contains("bundle-only") && stdout.contains("staged at"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("README.txt"), "{stdout}");
+
+    fs::remove_dir_all(root).expect("temp dir cleanup should succeed");
+}
+
+#[test]
+fn openyak_doctor_warns_when_staged_install_manifest_is_invalid() {
+    let root = unique_temp_dir("openyak-doctor-smoke-install-invalid");
+    let workspace = root.join("workspace");
+    let config_home = root.join("openyak-home");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+    write_fake_gh(&bin_dir, true);
+
+    let install_output = Command::new(common::openyak_binary())
+        .args([
+            "--output-format",
+            "json",
+            "server",
+            "install",
+            "--bind",
+            "127.0.0.1:0",
+        ])
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("server install should run");
+    assert!(
+        install_output.status.success(),
+        "server install should succeed: {}",
+        String::from_utf8_lossy(&install_output.stderr)
+    );
+    let install_report: serde_json::Value =
+        serde_json::from_slice(&install_output.stdout).expect("install report should parse");
+    let readme_path = PathBuf::from(
+        install_report["readme_path"]
+            .as_str()
+            .expect("install readme path should exist"),
+    );
+    fs::remove_file(&readme_path).expect("install readme should remove");
+
+    let output = Command::new(common::openyak_binary())
+        .arg("doctor")
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .env("ANTHROPIC_API_KEY", "doctor-test-key")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env("PATH", joined_path(&bin_dir))
+        .output()
+        .expect("doctor should run");
+
+    assert!(
+        output.status.success(),
+        "doctor should surface invalid staged install as warning, not failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("doctor stdout should be utf8");
+    assert!(stdout.contains("local daemon"), "{stdout}");
+    assert!(stdout.contains("not usable"), "{stdout}");
+    assert!(
+        stdout.contains("rerun `openyak server install --bind 127.0.0.1:0`"),
+        "{stdout}"
+    );
+
+    fs::remove_dir_all(root).expect("temp dir cleanup should succeed");
+}
+
+#[test]
+fn openyak_doctor_warns_when_running_daemon_has_invalid_staged_install_manifest() {
+    let root = unique_temp_dir("openyak-doctor-smoke-running-install-invalid");
+    let workspace = root.join("workspace");
+    let config_home = root.join("openyak-home");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+    write_fake_gh(&bin_dir, true);
+
+    let install_output = Command::new(common::openyak_binary())
+        .args([
+            "--output-format",
+            "json",
+            "server",
+            "install",
+            "--bind",
+            "127.0.0.1:0",
+        ])
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("server install should run");
+    assert!(
+        install_output.status.success(),
+        "server install should succeed: {}",
+        String::from_utf8_lossy(&install_output.stderr)
+    );
+    let install_report: serde_json::Value =
+        serde_json::from_slice(&install_output.stdout).expect("install report should parse");
+    let readme_path = PathBuf::from(
+        install_report["readme_path"]
+            .as_str()
+            .expect("install readme path should exist"),
+    );
+    fs::remove_file(&readme_path).expect("install readme should remove");
+
+    let start_output = Command::new(common::openyak_binary())
+        .args(["server", "start", "--detach"])
+        .current_dir(&workspace)
+        .output()
+        .expect("server start --detach should run");
+    assert!(
+        start_output.status.success(),
+        "server start --detach should succeed: {}",
+        String::from_utf8_lossy(&start_output.stderr)
+    );
+
+    let output = Command::new(common::openyak_binary())
+        .arg("doctor")
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .env("ANTHROPIC_API_KEY", "doctor-test-key")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env("PATH", joined_path(&bin_dir))
+        .output()
+        .expect("doctor should run");
+
+    let _ = Command::new(common::openyak_binary())
+        .args(["server", "stop"])
+        .current_dir(&workspace)
+        .output();
+
+    assert!(
+        output.status.success(),
+        "doctor should surface invalid staged install as warning while daemon is running: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("doctor stdout should be utf8");
+    assert!(stdout.contains("local daemon"), "{stdout}");
+    assert!(
+        stdout.contains("reachable at http://127.0.0.1:"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("not usable"), "{stdout}");
+    assert!(
+        stdout.contains("rerun `openyak server install --bind 127.0.0.1:0`"),
+        "{stdout}"
+    );
+
+    fs::remove_dir_all(root).expect("temp dir cleanup should succeed");
+}
+
+#[test]
 fn openyak_doctor_reports_running_local_daemon() {
     let root = unique_temp_dir("openyak-doctor-smoke-daemon-running");
     let workspace = root.join("workspace");
@@ -180,6 +380,155 @@ fn openyak_doctor_reports_running_local_daemon() {
         "{stdout}"
     );
     assert!(stdout.contains("daemon_local_v1"), "{stdout}");
+
+    fs::remove_dir_all(root).expect("temp dir cleanup should succeed");
+}
+
+#[test]
+fn openyak_doctor_warns_when_running_daemon_has_degraded_mcp_capability() {
+    let root = unique_temp_dir("openyak-doctor-smoke-daemon-mcp-degraded");
+    let workspace = root.join("workspace");
+    let config_home = root.join("openyak-home");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(workspace.join(".openyak")).expect("workspace config dir should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+    write_fake_gh(&bin_dir, true);
+    fs::write(
+        workspace.join(".openyak").join("settings.json"),
+        r#"{
+  "mcpServers": {
+    "config-auth-required": {
+      "type": "http",
+      "url": "https://vendor.example/mcp",
+      "oauth": {
+        "clientId": "demo-client"
+      }
+    }
+  }
+}"#,
+    )
+    .expect("settings should write");
+
+    let start_output = Command::new(common::openyak_binary())
+        .args(["server", "start", "--detach"])
+        .current_dir(&workspace)
+        .output()
+        .expect("server start --detach should run");
+    assert!(
+        start_output.status.success(),
+        "server start --detach should succeed: {}",
+        String::from_utf8_lossy(&start_output.stderr)
+    );
+
+    let output = Command::new(common::openyak_binary())
+        .arg("doctor")
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .env("ANTHROPIC_API_KEY", "doctor-test-key")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env("PATH", joined_path(&bin_dir))
+        .output()
+        .expect("doctor should run");
+
+    let _ = Command::new(common::openyak_binary())
+        .args(["server", "stop"])
+        .current_dir(&workspace)
+        .output();
+
+    assert!(
+        output.status.success(),
+        "doctor should surface degraded MCP capability as warning, not failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("doctor stdout should be utf8");
+    assert!(stdout.contains("local daemon"), "{stdout}");
+    assert!(
+        stdout.contains("Local MCP capability is auth_required"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("complete auth for configured MCP servers"),
+        "{stdout}"
+    );
+
+    fs::remove_dir_all(root).expect("temp dir cleanup should succeed");
+}
+
+#[test]
+fn openyak_doctor_warns_when_running_daemon_has_mixed_mcp_capability_blockers() {
+    let root = unique_temp_dir("openyak-doctor-smoke-daemon-mcp-mixed");
+    let workspace = root.join("workspace");
+    let config_home = root.join("openyak-home");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(workspace.join(".openyak")).expect("workspace config dir should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+    write_fake_gh(&bin_dir, true);
+    fs::write(
+        workspace.join(".openyak").join("settings.json"),
+        r#"{
+  "mcpServers": {
+    "config-auth-required": {
+      "type": "http",
+      "url": "https://vendor.example/mcp",
+      "oauth": {
+        "clientId": "demo-client"
+      }
+    },
+    "config-unsupported-sdk": {
+      "type": "sdk",
+      "name": "demo-sdk"
+    }
+  }
+}"#,
+    )
+    .expect("settings should write");
+
+    let start_output = Command::new(common::openyak_binary())
+        .args(["server", "start", "--detach"])
+        .current_dir(&workspace)
+        .output()
+        .expect("server start --detach should run");
+    assert!(
+        start_output.status.success(),
+        "server start --detach should succeed: {}",
+        String::from_utf8_lossy(&start_output.stderr)
+    );
+
+    let output = Command::new(common::openyak_binary())
+        .arg("doctor")
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .env("ANTHROPIC_API_KEY", "doctor-test-key")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env("PATH", joined_path(&bin_dir))
+        .output()
+        .expect("doctor should run");
+
+    let _ = Command::new(common::openyak_binary())
+        .args(["server", "stop"])
+        .current_dir(&workspace)
+        .output();
+
+    assert!(
+        output.status.success(),
+        "doctor should surface mixed MCP blockers as warning, not failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("doctor stdout should be utf8");
+    assert!(
+        stdout.contains("Local MCP capability is degraded"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("repair unsupported MCP transports or invalid MCP config"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("complete auth for configured MCP servers"),
+        "{stdout}"
+    );
 
     fs::remove_dir_all(root).expect("temp dir cleanup should succeed");
 }

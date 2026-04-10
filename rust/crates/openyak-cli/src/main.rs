@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -44,11 +45,12 @@ use runtime::{
     parse_oauth_callback_request_target, pricing_for_model, resolve_command_path,
     save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent, CompactionConfig,
     CompactionSummaryMode, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
-    ConversationRuntime, MessageRole, OAuthAuthorizationRequest, OAuthConfig,
-    OAuthTokenExchangeRequest, PendingUserInputRequest, PermissionMode, PermissionPolicy,
-    ProjectContext, RuntimeError, Session, SessionAccountingStatus, TokenUsage, ToolError,
-    ToolExecutor, ToolProfileBashPolicy, UsageTracker, UserInputOutcome, UserInputPrompter,
-    UserInputRequest, UserInputResponse,
+    ConversationRuntime, LifecycleStateSnapshot, McpClientBootstrap, McpClientTransport,
+    MessageRole, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
+    PendingUserInputRequest, PermissionMode, PermissionPolicy, ProjectContext,
+    RecoveryGuidanceSnapshot, RuntimeError, ScopedMcpServerConfig, Session,
+    SessionAccountingStatus, TokenUsage, ToolError, ToolExecutor, ToolProfileBashPolicy,
+    UsageTracker, UserInputOutcome, UserInputPrompter, UserInputRequest, UserInputResponse,
 };
 use serde_json::json;
 use tools::{
@@ -59,6 +61,9 @@ const DEFAULT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_SERVER_BIND: &str = "127.0.0.1:3000";
 const DEFAULT_DETACHED_SERVER_BIND: &str = "127.0.0.1:0";
 const DEFAULT_RELEASE_OUTPUT_DIR: &str = "dist";
+const THREAD_SERVER_INSTALLS_DIR: &str = "server-installs";
+const THREAD_SERVER_INSTALL_MANIFEST_FILENAME: &str = "install-manifest.json";
+const THREAD_SERVER_INSTALL_README_FILENAME: &str = "README.txt";
 const REQUEST_USER_INPUT_TOOL_NAME: &str = "openyak_request_user_input";
 const REQUEST_USER_INPUT_PROMPT: &str = "answer> ";
 const BROWSER_OBSERVE_TOOL_NAME: &str = "BrowserObserve";
@@ -334,6 +339,36 @@ struct ThreadServerStatusReport {
     attach_api: Option<String>,
     problem: Option<String>,
     recommended_actions: Vec<String>,
+    install: ThreadServerInstallInspection,
+    capabilities: ThreadServerOperatorCapabilities,
+    lifecycle: LifecycleStateSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadServerOperatorCapabilities {
+    mcp: ThreadServerMcpCapabilityReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadServerMcpCapabilityReport {
+    status: &'static str,
+    source: &'static str,
+    configured_count: usize,
+    ready_count: usize,
+    auth_required_count: usize,
+    degraded_count: usize,
+    problem: Option<String>,
+    recommended_actions: Vec<String>,
+    servers: Vec<ThreadServerMcpServerCapability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadServerMcpServerCapability {
+    server: String,
+    status: &'static str,
+    transport: String,
+    auth_state: &'static str,
+    error_message: Option<String>,
 }
 
 fn thread_server_info_candidates(cwd: &Path) -> Vec<(PathBuf, &'static str)> {
@@ -598,15 +633,287 @@ fn persisted_thread_truth_available(cwd: &Path) -> Result<bool, Box<dyn std::err
     server::has_persisted_threads(cwd).map_err(Into::into)
 }
 
+fn unsupported_mcp_transport_message(scoped: &ScopedMcpServerConfig) -> String {
+    format!(
+        "transport {} is configured but not supported by the current local MCP bootstrap path",
+        format!("{:?}", scoped.transport()).to_ascii_lowercase()
+    )
+}
+
+fn inspect_thread_server_mcp_server_capability(
+    server_name: &str,
+    scoped: &ScopedMcpServerConfig,
+) -> ThreadServerMcpServerCapability {
+    let bootstrap = McpClientBootstrap::from_scoped_config(server_name, scoped);
+    let transport = format!("{:?}", scoped.transport()).to_ascii_lowercase();
+    let (status, auth_state, error_message) = match &bootstrap.transport {
+        McpClientTransport::Stdio(transport) => {
+            if resolve_command_path(&transport.command).is_some() {
+                ("ready", "local", None)
+            } else {
+                (
+                    "degraded",
+                    "error",
+                    Some(format!(
+                        "stdio command `{}` is not resolvable on PATH for local MCP bootstrap",
+                        transport.command
+                    )),
+                )
+            }
+        }
+        McpClientTransport::Sse(transport) | McpClientTransport::Http(transport) => {
+            if transport.auth.requires_user_auth() {
+                ("auth_required", "required", None)
+            } else {
+                (
+                    "degraded",
+                    "error",
+                    Some(unsupported_mcp_transport_message(scoped)),
+                )
+            }
+        }
+        McpClientTransport::WebSocket(_)
+        | McpClientTransport::Sdk(_)
+        | McpClientTransport::ManagedProxy(_) => (
+            "degraded",
+            "error",
+            Some(unsupported_mcp_transport_message(scoped)),
+        ),
+    };
+    ThreadServerMcpServerCapability {
+        server: server_name.to_string(),
+        status,
+        transport,
+        auth_state,
+        error_message,
+    }
+}
+
+fn thread_server_mcp_capability_problem_report(
+    problem: String,
+    recommended_actions: Vec<String>,
+) -> ThreadServerMcpCapabilityReport {
+    ThreadServerMcpCapabilityReport {
+        status: "degraded",
+        source: "config_bootstrap_v1",
+        configured_count: 0,
+        ready_count: 0,
+        auth_required_count: 0,
+        degraded_count: 0,
+        problem: Some(problem),
+        recommended_actions,
+        servers: Vec::new(),
+    }
+}
+
+fn thread_server_mcp_capability_recommended_actions(
+    degraded_count: usize,
+    auth_required_count: usize,
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    if degraded_count > 0 {
+        actions.push(
+            "repair unsupported MCP transports or invalid MCP config before relying on MCP-backed operator capability"
+                .to_string(),
+        );
+        actions.push("rerun `openyak server status` after the MCP config is adjusted".to_string());
+    }
+    if auth_required_count > 0 {
+        actions.push(
+            "complete auth for configured MCP servers before relying on MCP-backed operator capability"
+                .to_string(),
+        );
+        actions
+            .push("rerun `openyak server status` after the MCP auth path is available".to_string());
+    }
+    actions
+}
+
+fn thread_server_mcp_capability_report_from_servers(
+    servers: Vec<ThreadServerMcpServerCapability>,
+) -> ThreadServerMcpCapabilityReport {
+    let configured_count = servers.len();
+    if configured_count == 0 {
+        return ThreadServerMcpCapabilityReport {
+            status: "disabled",
+            source: "config_bootstrap_v1",
+            configured_count,
+            ready_count: 0,
+            auth_required_count: 0,
+            degraded_count: 0,
+            problem: None,
+            recommended_actions: Vec::new(),
+            servers,
+        };
+    }
+
+    let ready_count = servers
+        .iter()
+        .filter(|server| server.status == "ready")
+        .count();
+    let auth_required_count = servers
+        .iter()
+        .filter(|server| server.status == "auth_required")
+        .count();
+    let degraded_count = servers
+        .iter()
+        .filter(|server| server.status == "degraded")
+        .count();
+    let status = if degraded_count > 0 {
+        "degraded"
+    } else if auth_required_count > 0 {
+        "auth_required"
+    } else {
+        "ready"
+    };
+    ThreadServerMcpCapabilityReport {
+        status,
+        source: "config_bootstrap_v1",
+        configured_count,
+        ready_count,
+        auth_required_count,
+        degraded_count,
+        problem: None,
+        recommended_actions: thread_server_mcp_capability_recommended_actions(
+            degraded_count,
+            auth_required_count,
+        ),
+        servers,
+    }
+}
+
+fn inspect_thread_server_mcp_capability_for(cwd: &Path) -> ThreadServerMcpCapabilityReport {
+    let workspace_root = match cwd.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            return thread_server_mcp_capability_problem_report(
+                format!("failed to resolve workspace root for MCP capability inspection: {error}"),
+                vec![
+                    "repair the current workspace path resolution before relying on MCP-backed operator capability"
+                        .to_string(),
+                    "rerun `openyak server status` after the workspace path is stable".to_string(),
+                ],
+            );
+        }
+    };
+    let config = match ConfigLoader::default_for(&workspace_root).load() {
+        Ok(config) => config,
+        Err(error) => {
+            return thread_server_mcp_capability_problem_report(
+                format!("failed to load runtime config for MCP capability inspection: {error}"),
+                vec![
+                    "repair the current workspace or user settings before relying on MCP-backed operator capability"
+                        .to_string(),
+                    "rerun `openyak server status` after the MCP config loads cleanly".to_string(),
+                ],
+            );
+        }
+    };
+    let mut servers: Vec<_> = config
+        .mcp()
+        .servers()
+        .iter()
+        .map(|(server_name, scoped)| {
+            inspect_thread_server_mcp_server_capability(server_name, scoped)
+        })
+        .collect();
+    servers.sort_by(|left, right| left.server.cmp(&right.server));
+    thread_server_mcp_capability_report_from_servers(servers)
+}
+
+fn inspect_thread_server_capabilities_for(cwd: &Path) -> ThreadServerOperatorCapabilities {
+    ThreadServerOperatorCapabilities {
+        mcp: inspect_thread_server_mcp_capability_for(cwd),
+    }
+}
+
+fn thread_server_capabilities_are_degraded(
+    capabilities: &ThreadServerOperatorCapabilities,
+) -> bool {
+    matches!(capabilities.mcp.status, "degraded" | "auth_required")
+}
+
+fn thread_server_operator_lifecycle(
+    status: &str,
+    problem: Option<&str>,
+    recommended_actions: &[String],
+) -> LifecycleStateSnapshot {
+    match status {
+        "stale_registration" => LifecycleStateSnapshot::with_recovery(
+            "stale_registration",
+            RecoveryGuidanceSnapshot {
+                failure_kind: "daemon_local_stale_registration".to_string(),
+                recovery_kind: "clear_stale_and_restart".to_string(),
+                recommended_actions: recommended_actions.to_vec(),
+            },
+        ),
+        "invalid_registration" => LifecycleStateSnapshot::with_recovery(
+            "invalid_registration",
+            RecoveryGuidanceSnapshot {
+                failure_kind: "daemon_local_invalid_registration".to_string(),
+                recovery_kind: "manual_repair_required".to_string(),
+                recommended_actions: recommended_actions.to_vec(),
+            },
+        ),
+        "start_failed" => LifecycleStateSnapshot::with_recovery(
+            "start_failed",
+            RecoveryGuidanceSnapshot {
+                failure_kind: "daemon_local_start_failed".to_string(),
+                recovery_kind: "inspect_error_and_retry".to_string(),
+                recommended_actions: recommended_actions.to_vec(),
+            },
+        ),
+        "bind_conflict" => LifecycleStateSnapshot::with_recovery(
+            "bind_conflict",
+            RecoveryGuidanceSnapshot {
+                failure_kind: "daemon_local_bind_conflict".to_string(),
+                recovery_kind: "stop_and_restart_with_requested_bind".to_string(),
+                recommended_actions: recommended_actions.to_vec(),
+            },
+        ),
+        "recover_failed" => LifecycleStateSnapshot::with_recovery(
+            "recover_failed",
+            RecoveryGuidanceSnapshot {
+                failure_kind: "daemon_local_recovery_failed".to_string(),
+                recovery_kind: "inspect_error_and_retry".to_string(),
+                recommended_actions: recommended_actions.to_vec(),
+            },
+        ),
+        "stop_failed" => LifecycleStateSnapshot::with_recovery(
+            "stop_failed",
+            RecoveryGuidanceSnapshot {
+                failure_kind: "daemon_local_stop_failed".to_string(),
+                recovery_kind: "inspect_error_and_retry".to_string(),
+                recommended_actions: recommended_actions.to_vec(),
+            },
+        ),
+        "not_running" if problem.is_some() => LifecycleStateSnapshot::with_recovery(
+            "not_running",
+            RecoveryGuidanceSnapshot {
+                failure_kind: "daemon_local_not_running".to_string(),
+                recovery_kind: "reattach_or_start".to_string(),
+                recommended_actions: recommended_actions.to_vec(),
+            },
+        ),
+        other => LifecycleStateSnapshot::status(other),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn invalid_thread_server_status_report(
     workspace_root: &Path,
     workspace_state_root: &Path,
     state_db_path: &Path,
     state_db_present: bool,
+    install: ThreadServerInstallInspection,
+    capabilities: ThreadServerOperatorCapabilities,
     path: PathBuf,
     source: &'static str,
-    problem: String,
+    problem: &str,
 ) -> ThreadServerStatusReport {
+    let recommended_actions = vec![
+        "rewrite the discovery file by starting `openyak server start --detach --bind 127.0.0.1:0` in this workspace".to_string(),
+    ];
     ThreadServerStatusReport {
         status: "invalid_registration",
         workspace_root: workspace_root.to_path_buf(),
@@ -622,18 +929,26 @@ fn invalid_thread_server_status_report(
         operator_plane: None,
         persistence: None,
         attach_api: None,
-        problem: Some(problem),
-        recommended_actions: vec![
-            "rewrite the discovery file by starting `openyak server start --detach --bind 127.0.0.1:0` in this workspace".to_string(),
-        ],
+        problem: Some(problem.to_string()),
+        recommended_actions: recommended_actions.clone(),
+        install,
+        capabilities,
+        lifecycle: thread_server_operator_lifecycle(
+            "invalid_registration",
+            Some(problem),
+            &recommended_actions,
+        ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn status_report_from_thread_server_info(
     workspace_root: &Path,
     workspace_state_root: &Path,
     state_db_path: &Path,
     state_db_present: bool,
+    install: ThreadServerInstallInspection,
+    capabilities: ThreadServerOperatorCapabilities,
     path: PathBuf,
     source: &'static str,
     info: ThreadServerInfoRecord,
@@ -687,8 +1002,15 @@ fn status_report_from_thread_server_info(
         operator_plane: Some(info.operator_plane),
         persistence: Some(info.persistence),
         attach_api: Some(info.attach_api),
-        problem,
-        recommended_actions,
+        problem: problem.clone(),
+        recommended_actions: recommended_actions.clone(),
+        install,
+        capabilities,
+        lifecycle: thread_server_operator_lifecycle(
+            status,
+            problem.as_deref(),
+            &recommended_actions,
+        ),
     }
 }
 
@@ -699,6 +1021,8 @@ fn inspect_thread_server_status_for(
     let workspace_state_root = workspace_root.join(".openyak");
     let state_db_path = workspace_state_root.join("state.sqlite3");
     let state_db_present = state_db_path.is_file();
+    let install = inspect_thread_server_install_for(&workspace_root)?;
+    let capabilities = inspect_thread_server_capabilities_for(&workspace_root);
 
     for (path, source) in thread_server_info_candidates(cwd) {
         if !path.is_file() {
@@ -716,9 +1040,11 @@ fn inspect_thread_server_status_for(
                     &workspace_state_root,
                     &state_db_path,
                     state_db_present,
+                    install.clone(),
+                    capabilities.clone(),
                     path,
                     source,
-                    problem,
+                    &problem,
                 ));
             }
         };
@@ -728,6 +1054,8 @@ fn inspect_thread_server_status_for(
             &workspace_state_root,
             &state_db_path,
             state_db_present,
+            install.clone(),
+            capabilities.clone(),
             path,
             source,
             info,
@@ -742,6 +1070,7 @@ fn inspect_thread_server_status_for(
             .to_string()
     };
 
+    let recommended_actions = vec![recommended_action];
     Ok(ThreadServerStatusReport {
         status: "not_running",
         workspace_root,
@@ -758,7 +1087,10 @@ fn inspect_thread_server_status_for(
         persistence: None,
         attach_api: None,
         problem: None,
-        recommended_actions: vec![recommended_action],
+        recommended_actions: recommended_actions.clone(),
+        install,
+        capabilities,
+        lifecycle: LifecycleStateSnapshot::status("not_running"),
     })
 }
 
@@ -780,9 +1112,177 @@ fn thread_server_status_json(report: &ThreadServerStatusReport) -> serde_json::V
             "persistence": report.persistence.as_deref(),
             "attach_api": report.attach_api.as_deref(),
         },
+        "lifecycle": &report.lifecycle,
         "problem": report.problem.as_deref(),
         "recommended_actions": &report.recommended_actions,
+        "install": thread_server_install_inspection_json(&report.install),
+        "capabilities": thread_server_capabilities_json(&report.capabilities),
     })
+}
+
+fn thread_server_capabilities_json(
+    capabilities: &ThreadServerOperatorCapabilities,
+) -> serde_json::Value {
+    json!({
+        "mcp": {
+            "status": capabilities.mcp.status,
+            "source": capabilities.mcp.source,
+            "configured_count": capabilities.mcp.configured_count,
+            "ready_count": capabilities.mcp.ready_count,
+            "auth_required_count": capabilities.mcp.auth_required_count,
+            "degraded_count": capabilities.mcp.degraded_count,
+            "problem": capabilities.mcp.problem.as_deref(),
+            "recommended_actions": &capabilities.mcp.recommended_actions,
+            "servers": capabilities.mcp.servers.iter().map(|server| json!({
+                "server": &server.server,
+                "status": server.status,
+                "transport": &server.transport,
+                "auth_state": server.auth_state,
+                "error_message": server.error_message.as_deref(),
+            })).collect::<Vec<_>>()
+        }
+    })
+}
+
+fn thread_server_install_inspection_json(
+    inspection: &ThreadServerInstallInspection,
+) -> serde_json::Value {
+    match inspection {
+        ThreadServerInstallInspection::Missing { manifest_path } => json!({
+            "status": "missing",
+            "manifest_path": manifest_path.display().to_string(),
+            "suggested_command": format!(
+                "openyak server install --bind {}",
+                DEFAULT_DETACHED_SERVER_BIND
+            ),
+        }),
+        ThreadServerInstallInspection::Present(bundle) => json!({
+            "status": "bundle_staged",
+            "install_mode": &bundle.install_mode,
+            "requested_bind": &bundle.requested_bind,
+            "install_root": bundle.install_root.display().to_string(),
+            "manifest_path": bundle.manifest_path.display().to_string(),
+            "readme_path": bundle.readme_path.display().to_string(),
+            "service_manager": &bundle.service_manager,
+            "service_label": &bundle.service_label,
+            "activation_commands": &bundle.activation_commands,
+            "removal_commands": &bundle.removal_commands,
+        }),
+        ThreadServerInstallInspection::Invalid {
+            manifest_path,
+            problem,
+        } => json!({
+            "status": "invalid_manifest",
+            "manifest_path": manifest_path.display().to_string(),
+            "problem": problem,
+            "suggested_command": format!(
+                "openyak server install --bind {}",
+                DEFAULT_DETACHED_SERVER_BIND
+            ),
+        }),
+    }
+}
+
+fn push_thread_server_install_status_lines(
+    lines: &mut Vec<String>,
+    inspection: &ThreadServerInstallInspection,
+) {
+    match inspection {
+        ThreadServerInstallInspection::Missing { manifest_path } => {
+            lines.push("  Install status   missing".to_string());
+            lines.push(format!("  Install manifest {}", manifest_path.display()));
+            lines.push(format!(
+                "  Install stage    openyak server install --bind {DEFAULT_DETACHED_SERVER_BIND}"
+            ));
+        }
+        ThreadServerInstallInspection::Present(bundle) => {
+            lines.push("  Install status   bundle_staged".to_string());
+            lines.push(format!("  Install mode     {}", bundle.install_mode));
+            lines.push(format!("  Install bind     {}", bundle.requested_bind));
+            lines.push(format!(
+                "  Install root     {}",
+                bundle.install_root.display()
+            ));
+            lines.push(format!(
+                "  Install manifest {}",
+                bundle.manifest_path.display()
+            ));
+            lines.push(format!(
+                "  Install readme   {}",
+                bundle.readme_path.display()
+            ));
+            lines.push(format!("  Service manager  {}", bundle.service_manager));
+            lines.push(format!("  Service label    {}", bundle.service_label));
+            for (index, command) in bundle.activation_commands.iter().enumerate() {
+                let label = if index == 0 {
+                    "  Install activate "
+                } else {
+                    "                   "
+                };
+                lines.push(format!("{label}{command}"));
+            }
+            for (index, command) in bundle.removal_commands.iter().enumerate() {
+                let label = if index == 0 {
+                    "  Install remove   "
+                } else {
+                    "                   "
+                };
+                lines.push(format!("{label}{command}"));
+            }
+        }
+        ThreadServerInstallInspection::Invalid {
+            manifest_path,
+            problem,
+        } => {
+            lines.push("  Install status   invalid_manifest".to_string());
+            lines.push(format!("  Install manifest {}", manifest_path.display()));
+            lines.push(format!("  Install problem  {problem}"));
+            lines.push(format!(
+                "  Install repair   openyak server install --bind {DEFAULT_DETACHED_SERVER_BIND}"
+            ));
+        }
+    }
+}
+
+fn push_thread_server_capability_lines(
+    lines: &mut Vec<String>,
+    capabilities: &ThreadServerOperatorCapabilities,
+) {
+    lines.push(format!("  MCP capability   {}", capabilities.mcp.status));
+    lines.push(format!(
+        "  MCP scope        {} ({} configured / {} ready / {} auth_required / {} degraded)",
+        capabilities.mcp.source,
+        capabilities.mcp.configured_count,
+        capabilities.mcp.ready_count,
+        capabilities.mcp.auth_required_count,
+        capabilities.mcp.degraded_count
+    ));
+    if let Some(problem) = &capabilities.mcp.problem {
+        lines.push(format!("  MCP problem      {problem}"));
+    }
+    for (index, server) in capabilities.mcp.servers.iter().enumerate() {
+        let label = if index == 0 {
+            "  MCP server       "
+        } else {
+            "                   "
+        };
+        let mut line = format!(
+            "{label}{} ({}, transport {}, auth {})",
+            server.server, server.status, server.transport, server.auth_state
+        );
+        if let Some(error_message) = &server.error_message {
+            let _ = write!(line, " - {error_message}");
+        }
+        lines.push(line);
+    }
+    for (index, action) in capabilities.mcp.recommended_actions.iter().enumerate() {
+        let label = if index == 0 {
+            "  MCP try          "
+        } else {
+            "                   "
+        };
+        lines.push(format!("{label}{action}"));
+    }
 }
 
 fn render_thread_server_status(report: &ThreadServerStatusReport) -> String {
@@ -836,6 +1336,9 @@ fn render_thread_server_status(report: &ThreadServerStatusReport) -> String {
     if let Some(problem) = &report.problem {
         lines.push(format!("  Problem          {problem}"));
     }
+    lines.push(format!("  Lifecycle        {}", report.lifecycle.status));
+    push_thread_server_install_status_lines(&mut lines, &report.install);
+    push_thread_server_capability_lines(&mut lines, &report.capabilities);
     for (index, action) in report.recommended_actions.iter().enumerate() {
         let label = if index == 0 {
             "  Try              "
@@ -866,6 +1369,24 @@ fn run_server_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+fn run_server_install(
+    bind: &str,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let report = install_thread_server_bundle_for(&cwd, bind)?;
+    match output_format {
+        CliOutputFormat::Text => print!("{}", render_thread_server_install(&report)),
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&thread_server_install_json(&report))?
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ThreadServerStartReport {
     status: &'static str,
@@ -886,6 +1407,8 @@ struct ThreadServerStartReport {
     attach_api: Option<String>,
     problem: Option<String>,
     recommended_actions: Vec<String>,
+    capabilities: ThreadServerOperatorCapabilities,
+    lifecycle: LifecycleStateSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -907,6 +1430,8 @@ struct ThreadServerStopReport {
     attach_api: Option<String>,
     problem: Option<String>,
     recommended_actions: Vec<String>,
+    capabilities: ThreadServerOperatorCapabilities,
+    lifecycle: LifecycleStateSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -930,6 +1455,1151 @@ struct ThreadServerRecoverReport {
     problem: Option<String>,
     performed_actions: Vec<String>,
     recommended_actions: Vec<String>,
+    capabilities: ThreadServerOperatorCapabilities,
+    lifecycle: LifecycleStateSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadServerInstallReport {
+    status: &'static str,
+    install_mode: &'static str,
+    requested_bind: String,
+    replaced_existing_bundle: bool,
+    workspace_root: PathBuf,
+    workspace_state_root: PathBuf,
+    state_db_path: PathBuf,
+    state_db_present: bool,
+    config_home: PathBuf,
+    install_id: String,
+    install_root: PathBuf,
+    manifest_path: PathBuf,
+    readme_path: PathBuf,
+    launcher_path: PathBuf,
+    helper_paths: Vec<PathBuf>,
+    service_manager: &'static str,
+    service_label: String,
+    service_definition_path: Option<PathBuf>,
+    executable_path: PathBuf,
+    performed_actions: Vec<String>,
+    activation_commands: Vec<String>,
+    removal_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadServerInstallArtifacts {
+    launcher_path: PathBuf,
+    helper_paths: Vec<PathBuf>,
+    service_label: String,
+    service_definition_path: Option<PathBuf>,
+    performed_actions: Vec<String>,
+    activation_commands: Vec<String>,
+    removal_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadServerInstallBundleStatus {
+    install_mode: String,
+    requested_bind: String,
+    install_root: PathBuf,
+    manifest_path: PathBuf,
+    readme_path: PathBuf,
+    service_manager: String,
+    service_label: String,
+    activation_commands: Vec<String>,
+    removal_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadServerInstallBundleContract {
+    install_root: PathBuf,
+    manifest_path: PathBuf,
+    readme_path: PathBuf,
+    launcher_path: PathBuf,
+    required_paths: Vec<PathBuf>,
+    service_manager: &'static str,
+    service_label: String,
+    activation_commands: Vec<String>,
+    removal_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ThreadServerInstallInspection {
+    Missing {
+        manifest_path: PathBuf,
+    },
+    Present(ThreadServerInstallBundleStatus),
+    Invalid {
+        manifest_path: PathBuf,
+        problem: String,
+    },
+}
+
+fn thread_server_install_service_manager() -> &'static str {
+    if cfg!(windows) {
+        "windows_task_scheduler"
+    } else if cfg!(target_os = "macos") {
+        "launchd_agent"
+    } else {
+        "systemd_user"
+    }
+}
+
+fn sanitize_thread_server_install_component(value: &str) -> String {
+    let mut sanitized = String::new();
+    let mut last_was_dash = false;
+    for character in value.chars() {
+        let lower = character.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            sanitized.push(lower);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            sanitized.push('-');
+            last_was_dash = true;
+        }
+    }
+    let trimmed = sanitized.trim_matches('-');
+    if trimmed.is_empty() {
+        "workspace".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn thread_server_install_id(workspace_root: &Path) -> String {
+    let base = workspace_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(
+            || "workspace".to_string(),
+            sanitize_thread_server_install_component,
+        );
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    workspace_root.to_string_lossy().hash(&mut hasher);
+    format!("{base}-{:016x}", hasher.finish())
+}
+
+fn thread_server_service_label(install_id: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("com.openyak.thread-server.{install_id}")
+    } else {
+        format!("openyak-thread-server-{install_id}")
+    }
+}
+
+fn thread_server_install_service_manager_label(service_manager: &str) -> &'static str {
+    match service_manager {
+        "windows_task_scheduler" => "Windows Task Scheduler task",
+        "launchd_agent" => "launchd agent",
+        "systemd_user" => "systemd --user service",
+        _ => "local service bundle",
+    }
+}
+
+fn sh_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn powershell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn write_install_bundle_file(path: &Path, contents: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, contents)?;
+    Ok(())
+}
+
+fn write_executable_install_bundle_file(path: &Path, contents: &str) -> io::Result<()> {
+    write_install_bundle_file(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+fn clear_existing_thread_server_install_root(
+    bundle_parent_root: &Path,
+    bundle_root: &Path,
+) -> io::Result<bool> {
+    if !bundle_root.exists() {
+        return Ok(false);
+    }
+    let canonical_bundle_parent_root = bundle_parent_root.canonicalize()?;
+    let canonical_bundle_root = bundle_root.canonicalize()?;
+    if !canonical_bundle_root.starts_with(&canonical_bundle_parent_root) {
+        return Err(io::Error::other(format!(
+            "refusing to replace install root `{}` because it escaped `{}`",
+            canonical_bundle_root.display(),
+            canonical_bundle_parent_root.display()
+        )));
+    }
+    fs::remove_dir_all(&canonical_bundle_root)?;
+    Ok(true)
+}
+
+fn stage_thread_server_unix_launcher(
+    install_root: &Path,
+    workspace_root: &Path,
+    config_home: &Path,
+    executable_path: &Path,
+    bind: &str,
+) -> io::Result<PathBuf> {
+    let launcher_path = install_root.join("start-openyak-server.sh");
+    write_executable_install_bundle_file(
+        &launcher_path,
+        &format!(
+            "#!/bin/sh\nset -eu\ncd {}\nexport OPENYAK_CONFIG_HOME={}\nexec {} server --bind {}\n",
+            sh_single_quote(&workspace_root.display().to_string()),
+            sh_single_quote(&config_home.display().to_string()),
+            sh_single_quote(&executable_path.display().to_string()),
+            sh_single_quote(bind),
+        ),
+    )?;
+    Ok(launcher_path)
+}
+
+fn stage_thread_server_systemd_user_bundle(
+    install_root: &Path,
+    workspace_root: &Path,
+    config_home: &Path,
+    executable_path: &Path,
+    bind: &str,
+    service_label: &str,
+) -> io::Result<ThreadServerInstallArtifacts> {
+    let launcher_path = stage_thread_server_unix_launcher(
+        install_root,
+        workspace_root,
+        config_home,
+        executable_path,
+        bind,
+    )?;
+
+    let service_dir = install_root.join("systemd-user");
+    let service_name = format!("{service_label}.service");
+    let service_path = service_dir.join(&service_name);
+    let exec_command = format!(
+        "exec {}",
+        sh_single_quote(&launcher_path.display().to_string())
+    );
+    write_install_bundle_file(
+        &service_path,
+        &format!(
+            "[Unit]\nDescription=openyak workspace thread server ({})\nAfter=default.target\n\n[Service]\nType=simple\nExecStart=/bin/sh -lc {}\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
+            workspace_root.display(),
+            sh_single_quote(&exec_command),
+        ),
+    )?;
+
+    let destination = format!("~/.config/systemd/user/{service_name}");
+    Ok(ThreadServerInstallArtifacts {
+        launcher_path,
+        helper_paths: Vec::new(),
+        service_label: service_name.clone(),
+        service_definition_path: Some(service_path.clone()),
+        performed_actions: vec![
+            format!(
+                "wrote a foreground launcher script at `{}`",
+                install_root.join("start-openyak-server.sh").display()
+            ),
+            format!(
+                "wrote a user-scoped systemd unit at `{}`",
+                service_path.display()
+            ),
+        ],
+        activation_commands: vec![
+            "mkdir -p ~/.config/systemd/user".to_string(),
+            format!(
+                "cp {} {}",
+                sh_single_quote(&service_path.display().to_string()),
+                sh_single_quote(&destination)
+            ),
+            "systemctl --user daemon-reload".to_string(),
+            format!("systemctl --user enable --now {service_name}"),
+            "openyak server status".to_string(),
+        ],
+        removal_commands: vec![
+            format!("systemctl --user disable --now {service_name}"),
+            format!("rm -f {}", sh_single_quote(&destination)),
+            format!(
+                "rm -rf {}",
+                sh_single_quote(&install_root.display().to_string())
+            ),
+        ],
+    })
+}
+
+fn stage_thread_server_launchd_bundle(
+    install_root: &Path,
+    workspace_root: &Path,
+    config_home: &Path,
+    executable_path: &Path,
+    bind: &str,
+    service_label: &str,
+) -> io::Result<ThreadServerInstallArtifacts> {
+    let launcher_path = stage_thread_server_unix_launcher(
+        install_root,
+        workspace_root,
+        config_home,
+        executable_path,
+        bind,
+    )?;
+
+    let plist_dir = install_root.join("launchd");
+    let plist_name = format!("{service_label}.plist");
+    let plist_path = plist_dir.join(&plist_name);
+    let stdout_log = install_root.join("server.stdout.log");
+    let stderr_log = install_root.join("server.stderr.log");
+    write_install_bundle_file(
+        &plist_path,
+        &format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{}</string>\n  </array>\n  <key>WorkingDirectory</key>\n  <string>{}</string>\n  <key>RunAtLoad</key>\n  <true/>\n  <key>KeepAlive</key>\n  <true/>\n  <key>StandardOutPath</key>\n  <string>{}</string>\n  <key>StandardErrorPath</key>\n  <string>{}</string>\n</dict>\n</plist>\n",
+            xml_escape(service_label),
+            xml_escape(&launcher_path.display().to_string()),
+            xml_escape(&workspace_root.display().to_string()),
+            xml_escape(&stdout_log.display().to_string()),
+            xml_escape(&stderr_log.display().to_string()),
+        ),
+    )?;
+
+    let destination = format!("~/Library/LaunchAgents/{plist_name}");
+    Ok(ThreadServerInstallArtifacts {
+        launcher_path,
+        helper_paths: Vec::new(),
+        service_label: service_label.to_string(),
+        service_definition_path: Some(plist_path.clone()),
+        performed_actions: vec![
+            format!(
+                "wrote a foreground launcher script at `{}`",
+                install_root.join("start-openyak-server.sh").display()
+            ),
+            format!("wrote a launchd agent plist at `{}`", plist_path.display()),
+        ],
+        activation_commands: vec![
+            "mkdir -p ~/Library/LaunchAgents".to_string(),
+            format!(
+                "cp {} {}",
+                sh_single_quote(&plist_path.display().to_string()),
+                sh_single_quote(&destination)
+            ),
+            format!(
+                "launchctl unload -w {} >/dev/null 2>&1 || true",
+                sh_single_quote(&destination)
+            ),
+            format!("launchctl load -w {}", sh_single_quote(&destination)),
+            "openyak server status".to_string(),
+        ],
+        removal_commands: vec![
+            format!(
+                "launchctl unload -w {} >/dev/null 2>&1 || true",
+                sh_single_quote(&destination)
+            ),
+            format!("rm -f {}", sh_single_quote(&destination)),
+            format!(
+                "rm -rf {}",
+                sh_single_quote(&install_root.display().to_string())
+            ),
+        ],
+    })
+}
+
+fn stage_thread_server_windows_task_bundle(
+    install_root: &Path,
+    workspace_root: &Path,
+    config_home: &Path,
+    executable_path: &Path,
+    bind: &str,
+    service_label: &str,
+) -> io::Result<ThreadServerInstallArtifacts> {
+    let launcher_path = install_root.join("start-openyak-server.ps1");
+    write_executable_install_bundle_file(
+        &launcher_path,
+        &format!(
+            "$ErrorActionPreference = 'Stop'\nSet-Location -LiteralPath {}\n$env:OPENYAK_CONFIG_HOME = {}\n& {} 'server' '--bind' {}\nexit $LASTEXITCODE\n",
+            powershell_single_quote(&workspace_root.display().to_string()),
+            powershell_single_quote(&config_home.display().to_string()),
+            powershell_single_quote(&executable_path.display().to_string()),
+            powershell_single_quote(bind),
+        ),
+    )?;
+
+    let register_path = install_root.join("register-task.ps1");
+    write_executable_install_bundle_file(
+        &register_path,
+        &format!(
+            "$ErrorActionPreference = 'Stop'\n$taskName = {}\n$launcher = {}\n$argument = '-NoProfile -ExecutionPolicy Bypass -File \"{0}\"' -f $launcher\n$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument\n$trigger = New-ScheduledTaskTrigger -AtLogOn\n$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)\n$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited\nRegister-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description 'openyak workspace thread server' -Force | Out-Null\nStart-ScheduledTask -TaskName $taskName\nWrite-Output ('Registered scheduled task {0}' -f $taskName)\n",
+            powershell_single_quote(service_label),
+            powershell_single_quote(&launcher_path.display().to_string()),
+        ),
+    )?;
+
+    let unregister_path = install_root.join("unregister-task.ps1");
+    write_executable_install_bundle_file(
+        &unregister_path,
+        &format!(
+            "$ErrorActionPreference = 'Stop'\n$taskName = {}\n$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue\nif ($null -ne $existing) {{\n  Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Out-Null\n  Unregister-ScheduledTask -TaskName $taskName -Confirm:$false\n  Write-Output ('Unregistered scheduled task {0}' -f $taskName)\n}} else {{\n  Write-Output ('Scheduled task {0} was already absent' -f $taskName)\n}}\n",
+            powershell_single_quote(service_label),
+        ),
+    )?;
+
+    Ok(ThreadServerInstallArtifacts {
+        launcher_path,
+        helper_paths: vec![register_path.clone(), unregister_path.clone()],
+        service_label: service_label.to_string(),
+        service_definition_path: None,
+        performed_actions: vec![
+            format!(
+                "wrote a foreground launcher script at `{}`",
+                install_root.join("start-openyak-server.ps1").display()
+            ),
+            format!(
+                "wrote a scheduled-task registration helper at `{}`",
+                register_path.display()
+            ),
+            format!(
+                "wrote a scheduled-task removal helper at `{}`",
+                unregister_path.display()
+            ),
+        ],
+        activation_commands: vec![
+            format!(
+                "powershell -NoProfile -ExecutionPolicy Bypass -File {}",
+                powershell_single_quote(&register_path.display().to_string())
+            ),
+            "openyak server status".to_string(),
+        ],
+        removal_commands: vec![
+            format!(
+                "powershell -NoProfile -ExecutionPolicy Bypass -File {}",
+                powershell_single_quote(&unregister_path.display().to_string())
+            ),
+            format!(
+                "Remove-Item -LiteralPath {} -Recurse -Force",
+                powershell_single_quote(&install_root.display().to_string())
+            ),
+        ],
+    })
+}
+
+fn stage_thread_server_install_artifacts(
+    install_root: &Path,
+    workspace_root: &Path,
+    config_home: &Path,
+    executable_path: &Path,
+    bind: &str,
+    service_label: &str,
+) -> io::Result<ThreadServerInstallArtifacts> {
+    if cfg!(windows) {
+        stage_thread_server_windows_task_bundle(
+            install_root,
+            workspace_root,
+            config_home,
+            executable_path,
+            bind,
+            service_label,
+        )
+    } else if cfg!(target_os = "macos") {
+        stage_thread_server_launchd_bundle(
+            install_root,
+            workspace_root,
+            config_home,
+            executable_path,
+            bind,
+            service_label,
+        )
+    } else {
+        stage_thread_server_systemd_user_bundle(
+            install_root,
+            workspace_root,
+            config_home,
+            executable_path,
+            bind,
+            service_label,
+        )
+    }
+}
+
+fn thread_server_install_json(report: &ThreadServerInstallReport) -> serde_json::Value {
+    json!({
+        "status": report.status,
+        "install_mode": report.install_mode,
+        "requested_bind": report.requested_bind,
+        "replaced_existing_bundle": report.replaced_existing_bundle,
+        "workspace_root": report.workspace_root.display().to_string(),
+        "workspace_state_root": report.workspace_state_root.display().to_string(),
+        "state_db_path": report.state_db_path.display().to_string(),
+        "state_db_present": report.state_db_present,
+        "config_home": report.config_home.display().to_string(),
+        "install_id": report.install_id,
+        "install_root": report.install_root.display().to_string(),
+        "manifest_path": report.manifest_path.display().to_string(),
+        "readme_path": report.readme_path.display().to_string(),
+        "launcher_path": report.launcher_path.display().to_string(),
+        "helper_paths": report
+            .helper_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        "service_manager": report.service_manager,
+        "service_label": report.service_label,
+        "service_definition_path": report
+            .service_definition_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        "executable_path": report.executable_path.display().to_string(),
+        "performed_actions": &report.performed_actions,
+        "activation_commands": &report.activation_commands,
+        "removal_commands": &report.removal_commands,
+    })
+}
+
+fn render_thread_server_install(report: &ThreadServerInstallReport) -> String {
+    let mut lines = vec![
+        "Local thread server install bundle".to_string(),
+        format!("  Status           {}", report.status),
+        format!("  Install mode     {}", report.install_mode),
+        format!("  Requested bind   {}", report.requested_bind),
+        format!(
+            "  Replaced bundle  {}",
+            if report.replaced_existing_bundle {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+        format!("  Workspace        {}", report.workspace_root.display()),
+        format!(
+            "  State root       {}",
+            report.workspace_state_root.display()
+        ),
+        format!(
+            "  State DB         {} ({})",
+            report.state_db_path.display(),
+            if report.state_db_present {
+                "present"
+            } else {
+                "missing"
+            }
+        ),
+        format!("  Config home      {}", report.config_home.display()),
+        format!("  Install root     {}", report.install_root.display()),
+        format!("  Manifest         {}", report.manifest_path.display()),
+        format!("  README           {}", report.readme_path.display()),
+        format!("  Launcher         {}", report.launcher_path.display()),
+        format!("  Service manager  {}", report.service_manager),
+        format!("  Service label    {}", report.service_label),
+        format!("  Executable       {}", report.executable_path.display()),
+    ];
+    if let Some(service_definition_path) = &report.service_definition_path {
+        lines.push(format!(
+            "  Service file     {}",
+            service_definition_path.display()
+        ));
+    }
+    for helper_path in &report.helper_paths {
+        lines.push(format!("  Helper           {}", helper_path.display()));
+    }
+    for action in &report.performed_actions {
+        lines.push(format!("  Wrote            {action}"));
+    }
+    for (index, command) in report.activation_commands.iter().enumerate() {
+        let label = if index == 0 {
+            "  Activate         "
+        } else {
+            "                   "
+        };
+        lines.push(format!("{label}{command}"));
+    }
+    for (index, command) in report.removal_commands.iter().enumerate() {
+        let label = if index == 0 {
+            "  Remove           "
+        } else {
+            "                   "
+        };
+        lines.push(format!("{label}{command}"));
+    }
+    lines.push(
+        "  Scope            bundle-only local service-management path; registration/start remains explicit and current-workspace only".to_string(),
+    );
+    format!("{}\n", lines.join("\n"))
+}
+
+fn render_thread_server_install_readme(report: &ThreadServerInstallReport) -> String {
+    let mut text = format!(
+        "openyak local thread server install bundle\n\nStatus: {}\nInstall mode: {}\nRequested bind: {}\nWorkspace: {}\nConfig home: {}\nInstall root: {}\nManifest: {}\nLauncher: {}\nService manager: {}\nService label: {}\nExecutable: {}\n\n",
+        report.status,
+        report.install_mode,
+        report.requested_bind,
+        report.workspace_root.display(),
+        report.config_home.display(),
+        report.install_root.display(),
+        report.manifest_path.display(),
+        report.launcher_path.display(),
+        report.service_manager,
+        report.service_label,
+        report.executable_path.display(),
+    );
+    text.push_str("Activation:\n");
+    for (index, command) in report.activation_commands.iter().enumerate() {
+        let _ = writeln!(text, "{}. {}", index + 1, command);
+    }
+    text.push_str("\nRemoval:\n");
+    for (index, command) in report.removal_commands.iter().enumerate() {
+        let _ = writeln!(text, "{}. {}", index + 1, command);
+    }
+    text.push_str(
+        "\nNotes:\n- This command only stages a reversible local bundle; it does not auto-register a daemon.\n- The launched server still serves only the current workspace `/v1/threads` truth.\n- This surface does not add remote operator access, hosted control planes, or broader daemon truth layers.\n",
+    );
+    text
+}
+
+fn install_thread_server_bundle_for(
+    cwd: &Path,
+    bind: &str,
+) -> Result<ThreadServerInstallReport, Box<dyn std::error::Error>> {
+    validate_server_bind_target(bind)?;
+    let workspace_root = cwd.canonicalize()?;
+    let workspace_state_root = server::resolve_workspace_state_root(&workspace_root)?;
+    let state_db_path = workspace_state_root.join("state.sqlite3");
+    let state_db_present = state_db_path.is_file();
+    let loader = ConfigLoader::default_for(&workspace_root);
+    let config_home = loader.config_home().to_path_buf();
+    fs::create_dir_all(&config_home)?;
+    let config_home = config_home.canonicalize()?;
+    let bundle_parent_root = config_home.join(THREAD_SERVER_INSTALLS_DIR);
+    fs::create_dir_all(&bundle_parent_root)?;
+    let bundle_parent_root = bundle_parent_root.canonicalize()?;
+    let install_id = thread_server_install_id(&workspace_root);
+    let bundle_root = bundle_parent_root.join(&install_id);
+    let replaced_existing_bundle =
+        clear_existing_thread_server_install_root(&bundle_parent_root, &bundle_root)?;
+    fs::create_dir_all(&bundle_root)?;
+    let bundle_root = bundle_root.canonicalize()?;
+    let executable_path = env::current_exe()?;
+    if !executable_path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "current openyak executable not found: {}",
+                executable_path.display()
+            ),
+        )
+        .into());
+    }
+    let service_label = thread_server_service_label(&install_id);
+    let artifacts = stage_thread_server_install_artifacts(
+        &bundle_root,
+        &workspace_root,
+        &config_home,
+        &executable_path,
+        bind,
+        &service_label,
+    )?;
+    let manifest_path = bundle_root.join(THREAD_SERVER_INSTALL_MANIFEST_FILENAME);
+    let readme_path = bundle_root.join(THREAD_SERVER_INSTALL_README_FILENAME);
+    let mut performed_actions = artifacts.performed_actions.clone();
+    if replaced_existing_bundle {
+        performed_actions.insert(
+            0,
+            format!(
+                "replaced the existing install bundle rooted at `{}`",
+                bundle_root.display()
+            ),
+        );
+    }
+    let mut report = ThreadServerInstallReport {
+        status: "bundle_staged",
+        install_mode: "bundle_only",
+        requested_bind: bind.to_string(),
+        replaced_existing_bundle,
+        workspace_root,
+        workspace_state_root,
+        state_db_path,
+        state_db_present,
+        config_home,
+        install_id,
+        install_root: bundle_root,
+        manifest_path: manifest_path.clone(),
+        readme_path: readme_path.clone(),
+        launcher_path: artifacts.launcher_path,
+        helper_paths: artifacts.helper_paths,
+        service_manager: thread_server_install_service_manager(),
+        service_label: artifacts.service_label,
+        service_definition_path: artifacts.service_definition_path,
+        executable_path,
+        performed_actions,
+        activation_commands: artifacts.activation_commands,
+        removal_commands: artifacts.removal_commands,
+    };
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&thread_server_install_json(&report))?,
+    )?;
+    report.performed_actions.push(format!(
+        "wrote install manifest at `{}`",
+        manifest_path.display()
+    ));
+    fs::write(&readme_path, render_thread_server_install_readme(&report))?;
+    report.performed_actions.push(format!(
+        "wrote install instructions at `{}`",
+        readme_path.display()
+    ));
+    Ok(report)
+}
+
+fn thread_server_install_manifest_path_for(
+    cwd: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let workspace_root = cwd.canonicalize()?;
+    let loader = ConfigLoader::default_for(&workspace_root);
+    let config_home = loader.config_home().to_path_buf();
+    let config_home = config_home.canonicalize().unwrap_or(config_home);
+    Ok(config_home
+        .join(THREAD_SERVER_INSTALLS_DIR)
+        .join(thread_server_install_id(&workspace_root))
+        .join(THREAD_SERVER_INSTALL_MANIFEST_FILENAME))
+}
+
+fn thread_server_install_manifest_string_field(
+    manifest: &serde_json::Value,
+    key: &str,
+) -> Result<String, String> {
+    manifest
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("install manifest missing string field `{key}`"))
+}
+
+fn thread_server_install_manifest_path_field(
+    manifest: &serde_json::Value,
+    key: &str,
+) -> Result<PathBuf, String> {
+    thread_server_install_manifest_string_field(manifest, key).map(PathBuf::from)
+}
+
+fn thread_server_install_windows_bundle_contract(
+    install_root: &Path,
+    manifest_path: &Path,
+    readme_path: &Path,
+    service_label: &str,
+) -> ThreadServerInstallBundleContract {
+    let launcher_path = install_root.join("start-openyak-server.ps1");
+    let register_path = install_root.join("register-task.ps1");
+    let unregister_path = install_root.join("unregister-task.ps1");
+    ThreadServerInstallBundleContract {
+        install_root: install_root.to_path_buf(),
+        manifest_path: manifest_path.to_path_buf(),
+        readme_path: readme_path.to_path_buf(),
+        launcher_path: launcher_path.clone(),
+        required_paths: vec![
+            readme_path.to_path_buf(),
+            launcher_path,
+            register_path.clone(),
+            unregister_path.clone(),
+        ],
+        service_manager: "windows_task_scheduler",
+        service_label: service_label.to_string(),
+        activation_commands: vec![
+            format!(
+                "powershell -NoProfile -ExecutionPolicy Bypass -File {}",
+                powershell_single_quote(&register_path.display().to_string())
+            ),
+            "openyak server status".to_string(),
+        ],
+        removal_commands: vec![
+            format!(
+                "powershell -NoProfile -ExecutionPolicy Bypass -File {}",
+                powershell_single_quote(&unregister_path.display().to_string())
+            ),
+            format!(
+                "Remove-Item -LiteralPath {} -Recurse -Force",
+                powershell_single_quote(&install_root.display().to_string())
+            ),
+        ],
+    }
+}
+
+fn thread_server_install_launchd_bundle_contract(
+    install_root: &Path,
+    manifest_path: &Path,
+    readme_path: &Path,
+    service_label: &str,
+) -> ThreadServerInstallBundleContract {
+    let launcher_path = install_root.join("start-openyak-server.sh");
+    let plist_name = format!("{service_label}.plist");
+    let plist_path = install_root.join("launchd").join(&plist_name);
+    let destination = format!("~/Library/LaunchAgents/{plist_name}");
+    ThreadServerInstallBundleContract {
+        install_root: install_root.to_path_buf(),
+        manifest_path: manifest_path.to_path_buf(),
+        readme_path: readme_path.to_path_buf(),
+        launcher_path: launcher_path.clone(),
+        required_paths: vec![readme_path.to_path_buf(), launcher_path, plist_path.clone()],
+        service_manager: "launchd_agent",
+        service_label: service_label.to_string(),
+        activation_commands: vec![
+            "mkdir -p ~/Library/LaunchAgents".to_string(),
+            format!(
+                "cp {} {}",
+                sh_single_quote(&plist_path.display().to_string()),
+                sh_single_quote(&destination)
+            ),
+            format!(
+                "launchctl unload -w {} >/dev/null 2>&1 || true",
+                sh_single_quote(&destination)
+            ),
+            format!("launchctl load -w {}", sh_single_quote(&destination)),
+            "openyak server status".to_string(),
+        ],
+        removal_commands: vec![
+            format!(
+                "launchctl unload -w {} >/dev/null 2>&1 || true",
+                sh_single_quote(&destination)
+            ),
+            format!("rm -f {}", sh_single_quote(&destination)),
+            format!(
+                "rm -rf {}",
+                sh_single_quote(&install_root.display().to_string())
+            ),
+        ],
+    }
+}
+
+fn thread_server_install_systemd_bundle_contract(
+    install_root: &Path,
+    manifest_path: &Path,
+    readme_path: &Path,
+    service_label: &str,
+) -> ThreadServerInstallBundleContract {
+    let launcher_path = install_root.join("start-openyak-server.sh");
+    let service_name = format!("{service_label}.service");
+    let service_path = install_root.join("systemd-user").join(&service_name);
+    let destination = format!("~/.config/systemd/user/{service_name}");
+    ThreadServerInstallBundleContract {
+        install_root: install_root.to_path_buf(),
+        manifest_path: manifest_path.to_path_buf(),
+        readme_path: readme_path.to_path_buf(),
+        launcher_path: launcher_path.clone(),
+        required_paths: vec![
+            readme_path.to_path_buf(),
+            launcher_path,
+            service_path.clone(),
+        ],
+        service_manager: "systemd_user",
+        service_label: service_name.clone(),
+        activation_commands: vec![
+            "mkdir -p ~/.config/systemd/user".to_string(),
+            format!(
+                "cp {} {}",
+                sh_single_quote(&service_path.display().to_string()),
+                sh_single_quote(&destination)
+            ),
+            "systemctl --user daemon-reload".to_string(),
+            format!("systemctl --user enable --now {service_name}"),
+            "openyak server status".to_string(),
+        ],
+        removal_commands: vec![
+            format!("systemctl --user disable --now {service_name}"),
+            format!("rm -f {}", sh_single_quote(&destination)),
+            format!(
+                "rm -rf {}",
+                sh_single_quote(&install_root.display().to_string())
+            ),
+        ],
+    }
+}
+
+fn thread_server_install_bundle_contract_for(
+    manifest_path: &Path,
+) -> Result<ThreadServerInstallBundleContract, String> {
+    let install_root = manifest_path
+        .parent()
+        .ok_or_else(|| {
+            format!(
+                "install manifest `{}` did not have a bundle root parent",
+                manifest_path.display()
+            )
+        })?
+        .to_path_buf();
+    let install_id = install_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "install root `{}` did not expose a valid install id",
+                install_root.display()
+            )
+        })?;
+    let base_service_label = thread_server_service_label(install_id);
+    let readme_path = install_root.join(THREAD_SERVER_INSTALL_README_FILENAME);
+
+    if cfg!(windows) {
+        return Ok(thread_server_install_windows_bundle_contract(
+            &install_root,
+            manifest_path,
+            &readme_path,
+            &base_service_label,
+        ));
+    }
+
+    if cfg!(target_os = "macos") {
+        return Ok(thread_server_install_launchd_bundle_contract(
+            &install_root,
+            manifest_path,
+            &readme_path,
+            &base_service_label,
+        ));
+    }
+
+    Ok(thread_server_install_systemd_bundle_contract(
+        &install_root,
+        manifest_path,
+        &readme_path,
+        &base_service_label,
+    ))
+}
+
+fn validate_thread_server_install_bundle_artifacts(
+    contract: &ThreadServerInstallBundleContract,
+    requested_bind: &str,
+) -> Result<(), String> {
+    if !contract.install_root.is_dir() {
+        return Err(format!(
+            "staged bundle root `{}` is missing",
+            contract.install_root.display()
+        ));
+    }
+    for path in &contract.required_paths {
+        if !path.is_file() {
+            return Err(format!(
+                "staged bundle artifact missing at `{}`",
+                path.display()
+            ));
+        }
+    }
+    let launcher = fs::read_to_string(&contract.launcher_path).map_err(|error| {
+        format!(
+            "failed to read staged launcher `{}`: {error}",
+            contract.launcher_path.display()
+        )
+    })?;
+    let bind_fragment = if cfg!(windows) {
+        format!("'--bind' {}", powershell_single_quote(requested_bind))
+    } else {
+        format!("--bind {}", sh_single_quote(requested_bind))
+    };
+    if !launcher.contains(&bind_fragment) {
+        return Err(format!(
+            "staged launcher `{}` did not match requested_bind `{requested_bind}`",
+            contract.launcher_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn thread_server_install_manifest_string_array_field(
+    manifest: &serde_json::Value,
+    key: &str,
+) -> Result<Vec<String>, String> {
+    let items = manifest
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("install manifest missing string array field `{key}`"))?;
+    items
+        .iter()
+        .map(|item| {
+            item.as_str().map(str::to_string).ok_or_else(|| {
+                format!("install manifest field `{key}` contained a non-string item")
+            })
+        })
+        .collect()
+}
+
+fn parse_thread_server_install_bundle_status(
+    manifest_path: &Path,
+    manifest: &serde_json::Value,
+) -> Result<ThreadServerInstallBundleStatus, String> {
+    let contract = thread_server_install_bundle_contract_for(manifest_path)?;
+    let status = thread_server_install_manifest_string_field(manifest, "status")?;
+    if status != "bundle_staged" {
+        return Err(format!(
+            "install manifest `{}` advertised unexpected status `{status}`",
+            manifest_path.display()
+        ));
+    }
+
+    let install_mode = thread_server_install_manifest_string_field(manifest, "install_mode")?;
+    if install_mode != "bundle_only" {
+        return Err(format!(
+            "install manifest `{}` advertised unexpected install_mode `{install_mode}`",
+            manifest_path.display()
+        ));
+    }
+
+    let requested_bind = thread_server_install_manifest_string_field(manifest, "requested_bind")?;
+    validate_server_bind_target(&requested_bind).map_err(|error| {
+        format!(
+            "install manifest `{}` advertised invalid requested_bind `{requested_bind}`: {error}",
+            manifest_path.display()
+        )
+    })?;
+
+    let install_root = thread_server_install_manifest_path_field(manifest, "install_root")?;
+    if install_root != contract.install_root {
+        return Err(format!(
+            "install manifest `{}` advertised install_root `{}` but expected `{}`",
+            manifest_path.display(),
+            install_root.display(),
+            contract.install_root.display()
+        ));
+    }
+
+    let advertised_manifest_path =
+        thread_server_install_manifest_path_field(manifest, "manifest_path")?;
+    if advertised_manifest_path != contract.manifest_path {
+        return Err(format!(
+            "install manifest `{}` advertised manifest_path `{}` but expected `{}`",
+            manifest_path.display(),
+            advertised_manifest_path.display(),
+            contract.manifest_path.display()
+        ));
+    }
+
+    let readme_path = thread_server_install_manifest_path_field(manifest, "readme_path")?;
+    if readme_path != contract.readme_path {
+        return Err(format!(
+            "install manifest `{}` advertised readme_path `{}` but expected `{}`",
+            manifest_path.display(),
+            readme_path.display(),
+            contract.readme_path.display()
+        ));
+    }
+
+    let service_manager = thread_server_install_manifest_string_field(manifest, "service_manager")?;
+    if service_manager != contract.service_manager {
+        return Err(format!(
+            "install manifest `{}` advertised unexpected service_manager `{service_manager}`",
+            manifest_path.display()
+        ));
+    }
+
+    let service_label = thread_server_install_manifest_string_field(manifest, "service_label")?;
+    if service_label != contract.service_label {
+        return Err(format!(
+            "install manifest `{}` advertised unexpected service_label `{service_label}`",
+            manifest_path.display()
+        ));
+    }
+
+    let activation_commands =
+        thread_server_install_manifest_string_array_field(manifest, "activation_commands")?;
+    if activation_commands != contract.activation_commands {
+        return Err(format!(
+            "install manifest `{}` advertised activation_commands that did not match the staged bundle contract",
+            manifest_path.display()
+        ));
+    }
+
+    let removal_commands =
+        thread_server_install_manifest_string_array_field(manifest, "removal_commands")?;
+    if removal_commands != contract.removal_commands {
+        return Err(format!(
+            "install manifest `{}` advertised removal_commands that did not match the staged bundle contract",
+            manifest_path.display()
+        ));
+    }
+    validate_thread_server_install_bundle_artifacts(&contract, &requested_bind)?;
+
+    Ok(ThreadServerInstallBundleStatus {
+        install_mode,
+        requested_bind,
+        install_root: contract.install_root,
+        manifest_path: contract.manifest_path,
+        readme_path: contract.readme_path,
+        service_manager: contract.service_manager.to_string(),
+        service_label: contract.service_label,
+        activation_commands: contract.activation_commands,
+        removal_commands: contract.removal_commands,
+    })
+}
+
+fn inspect_thread_server_install_for(
+    cwd: &Path,
+) -> Result<ThreadServerInstallInspection, Box<dyn std::error::Error>> {
+    let manifest_path = thread_server_install_manifest_path_for(cwd)?;
+    if !manifest_path.is_file() {
+        return Ok(ThreadServerInstallInspection::Missing { manifest_path });
+    }
+
+    let actual_manifest_path = match manifest_path.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(ThreadServerInstallInspection::Invalid {
+                manifest_path: manifest_path.clone(),
+                problem: format!("failed to resolve install manifest path: {error}"),
+            });
+        }
+    };
+    if actual_manifest_path != manifest_path {
+        return Ok(ThreadServerInstallInspection::Invalid {
+            manifest_path: actual_manifest_path.clone(),
+            problem: format!(
+                "install manifest resolved outside the expected local bundle path `{}`",
+                manifest_path.display()
+            ),
+        });
+    }
+
+    let contents = match fs::read_to_string(&actual_manifest_path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            return Ok(ThreadServerInstallInspection::Invalid {
+                manifest_path: actual_manifest_path,
+                problem: format!("failed to read install manifest: {error}"),
+            });
+        }
+    };
+    let manifest = match serde_json::from_str::<serde_json::Value>(&contents) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Ok(ThreadServerInstallInspection::Invalid {
+                manifest_path: actual_manifest_path,
+                problem: format!("failed to parse install manifest: {error}"),
+            });
+        }
+    };
+
+    match parse_thread_server_install_bundle_status(&actual_manifest_path, &manifest) {
+        Ok(bundle) => Ok(ThreadServerInstallInspection::Present(bundle)),
+        Err(problem) => Ok(ThreadServerInstallInspection::Invalid {
+            manifest_path: actual_manifest_path,
+            problem,
+        }),
+    }
+}
+
+fn thread_server_install_command_sequence(commands: &[String]) -> String {
+    commands
+        .iter()
+        .map(|command| format!("`{command}`"))
+        .collect::<Vec<_>>()
+        .join(", then ")
 }
 
 fn start_report_from_status(
@@ -940,6 +2610,8 @@ fn start_report_from_status(
     problem: Option<String>,
     recommended_actions: Vec<String>,
 ) -> ThreadServerStartReport {
+    let lifecycle =
+        thread_server_operator_lifecycle(status, problem.as_deref(), &recommended_actions);
     ThreadServerStartReport {
         status,
         requested_bind: requested_bind.to_string(),
@@ -959,6 +2631,8 @@ fn start_report_from_status(
         attach_api: status_report.attach_api,
         problem,
         recommended_actions,
+        capabilities: status_report.capabilities,
+        lifecycle,
     }
 }
 
@@ -971,6 +2645,8 @@ fn recover_report_from_status(
     performed_actions: Vec<String>,
     recommended_actions: Vec<String>,
 ) -> ThreadServerRecoverReport {
+    let lifecycle =
+        thread_server_operator_lifecycle(status, problem.as_deref(), &recommended_actions);
     ThreadServerRecoverReport {
         status,
         recovery_kind,
@@ -991,6 +2667,8 @@ fn recover_report_from_status(
         problem,
         performed_actions,
         recommended_actions,
+        capabilities: status_report.capabilities,
+        lifecycle,
     }
 }
 
@@ -1002,6 +2680,8 @@ fn recover_report_from_start(
     performed_actions: Vec<String>,
     recommended_actions: Vec<String>,
 ) -> ThreadServerRecoverReport {
+    let lifecycle =
+        thread_server_operator_lifecycle(status, problem.as_deref(), &recommended_actions);
     ThreadServerRecoverReport {
         status,
         recovery_kind,
@@ -1022,6 +2702,8 @@ fn recover_report_from_start(
         problem,
         performed_actions,
         recommended_actions,
+        capabilities: start_report.capabilities,
+        lifecycle,
     }
 }
 
@@ -1045,8 +2727,10 @@ fn thread_server_start_json(report: &ThreadServerStartReport) -> serde_json::Val
             "persistence": report.persistence.as_deref(),
             "attach_api": report.attach_api.as_deref(),
         },
+        "lifecycle": &report.lifecycle,
         "problem": report.problem.as_deref(),
         "recommended_actions": &report.recommended_actions,
+        "capabilities": thread_server_capabilities_json(&report.capabilities),
     })
 }
 
@@ -1109,6 +2793,8 @@ fn render_thread_server_start(report: &ThreadServerStartReport) -> String {
     if let Some(problem) = &report.problem {
         lines.push(format!("  Problem          {problem}"));
     }
+    lines.push(format!("  Lifecycle        {}", report.lifecycle.status));
+    push_thread_server_capability_lines(&mut lines, &report.capabilities);
     for (index, action) in report.recommended_actions.iter().enumerate() {
         let label = if index == 0 {
             "  Try              "
@@ -1470,9 +3156,11 @@ fn thread_server_recover_json(report: &ThreadServerRecoverReport) -> serde_json:
             "persistence": report.persistence.as_deref(),
             "attach_api": report.attach_api.as_deref(),
         },
+        "lifecycle": &report.lifecycle,
         "problem": report.problem.as_deref(),
         "performed_actions": &report.performed_actions,
         "recommended_actions": &report.recommended_actions,
+        "capabilities": thread_server_capabilities_json(&report.capabilities),
     })
 }
 
@@ -1535,6 +3223,8 @@ fn render_thread_server_recover(report: &ThreadServerRecoverReport) -> String {
     if let Some(problem) = &report.problem {
         lines.push(format!("  Problem          {problem}"));
     }
+    lines.push(format!("  Lifecycle        {}", report.lifecycle.status));
+    push_thread_server_capability_lines(&mut lines, &report.capabilities);
     for (index, action) in report.performed_actions.iter().enumerate() {
         let label = if index == 0 {
             "  Did              "
@@ -1895,6 +3585,8 @@ fn stop_report_from_status(
     problem: Option<String>,
     recommended_actions: Vec<String>,
 ) -> ThreadServerStopReport {
+    let lifecycle =
+        thread_server_operator_lifecycle(status, problem.as_deref(), &recommended_actions);
     ThreadServerStopReport {
         status,
         workspace_root: status_report.workspace_root,
@@ -1913,6 +3605,8 @@ fn stop_report_from_status(
         attach_api: status_report.attach_api,
         problem,
         recommended_actions,
+        capabilities: status_report.capabilities,
+        lifecycle,
     }
 }
 
@@ -2060,8 +3754,10 @@ fn thread_server_stop_json(report: &ThreadServerStopReport) -> serde_json::Value
             "persistence": report.persistence.as_deref(),
             "attach_api": report.attach_api.as_deref(),
         },
+        "lifecycle": &report.lifecycle,
         "problem": report.problem.as_deref(),
         "recommended_actions": &report.recommended_actions,
+        "capabilities": thread_server_capabilities_json(&report.capabilities),
     })
 }
 
@@ -2127,6 +3823,8 @@ fn render_thread_server_stop(report: &ThreadServerStopReport) -> String {
     if let Some(problem) = &report.problem {
         lines.push(format!("  Problem          {problem}"));
     }
+    lines.push(format!("  Lifecycle        {}", report.lifecycle.status));
+    push_thread_server_capability_lines(&mut lines, &report.capabilities);
     for (index, action) in report.recommended_actions.iter().enumerate() {
         let label = if index == 0 {
             "  Try              "
@@ -2327,6 +4025,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             bind,
             output_format,
         } => run_server_start_detached(&bind, output_format)?,
+        CliAction::ServerInstall {
+            bind,
+            output_format,
+        } => run_server_install(&bind, output_format)?,
         CliAction::ServerStatus { output_format } => run_server_status(output_format)?,
         CliAction::ServerStop { output_format } => run_server_stop(output_format)?,
         CliAction::ServerRecover { output_format } => run_server_recover(output_format)?,
@@ -2390,6 +4092,10 @@ enum CliAction {
         bind: String,
     },
     ServerStartDetached {
+        bind: String,
+        output_format: CliOutputFormat,
+    },
+    ServerInstall {
         bind: String,
         output_format: CliOutputFormat,
     },
@@ -2805,6 +4511,9 @@ fn parse_server_args(args: &[String], output_format: CliOutputFormat) -> Result<
         }
         return Err(format!("unknown server recover argument: {}", args[1]));
     }
+    if matches!(args.first().map(String::as_str), Some("install")) {
+        return parse_server_install_args(&args[1..], output_format);
+    }
 
     let mut bind = DEFAULT_SERVER_BIND.to_string();
     let mut index = 0;
@@ -2830,6 +4539,40 @@ fn parse_server_args(args: &[String], output_format: CliOutputFormat) -> Result<
     }
 
     Ok(CliAction::Server { bind })
+}
+
+fn parse_server_install_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    if is_help_args(args) {
+        return Ok(CliAction::Help(HelpTopic::Server));
+    }
+    let mut bind = DEFAULT_DETACHED_SERVER_BIND.to_string();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--bind" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for server install --bind".to_string())?;
+                bind.clone_from(value);
+                index += 2;
+            }
+            flag if flag.starts_with("--bind=") => {
+                bind = flag[7..].to_string();
+                index += 1;
+            }
+            other => return Err(format!("unknown server install argument: {other}")),
+        }
+    }
+    if bind.trim().is_empty() {
+        return Err("server install --bind must not be empty".to_string());
+    }
+    Ok(CliAction::ServerInstall {
+        bind,
+        output_format,
+    })
 }
 
 fn parse_doctor_args(args: &[String], model: Option<String>) -> Result<CliAction, String> {
@@ -3839,21 +5582,86 @@ fn doctor_active_model_auth_check(
     }
 }
 
+fn doctor_local_daemon_summary_with_install(
+    mut summary: String,
+    install_inspection: Option<&ThreadServerInstallInspection>,
+) -> String {
+    match install_inspection {
+        Some(ThreadServerInstallInspection::Present(bundle)) => {
+            let _ = write!(
+                summary,
+                " A bundle-only {} is already staged at {}.",
+                thread_server_install_service_manager_label(&bundle.service_manager),
+                bundle.install_root.display()
+            );
+        }
+        Some(ThreadServerInstallInspection::Invalid { manifest_path, .. }) => {
+            let _ = write!(
+                summary,
+                " A staged install manifest exists at {} but is not usable.",
+                manifest_path.display()
+            );
+        }
+        Some(ThreadServerInstallInspection::Missing { .. }) | None => {}
+    }
+    summary
+}
+
+fn doctor_local_daemon_summary_with_capabilities(
+    mut summary: String,
+    capabilities: &ThreadServerOperatorCapabilities,
+) -> String {
+    match capabilities.mcp.status {
+        "auth_required" => {
+            let _ = write!(
+                summary,
+                " Local MCP capability is auth_required ({} configured, {} still need auth).",
+                capabilities.mcp.configured_count, capabilities.mcp.auth_required_count
+            );
+        }
+        "degraded" => {
+            let _ = write!(
+                summary,
+                " Local MCP capability is degraded ({} configured, {} degraded, {} auth_required).",
+                capabilities.mcp.configured_count,
+                capabilities.mcp.degraded_count,
+                capabilities.mcp.auth_required_count
+            );
+        }
+        _ => {}
+    }
+    summary
+}
+
 fn doctor_local_daemon_check(cwd: &Path) -> DoctorCheck {
     match inspect_thread_server_status_for(cwd) {
-        Ok(report) => match report.status {
-            "running" => DoctorCheck::ok(
-                "local daemon",
-                format!(
-                    "Workspace local thread server is reachable at {} and advertises {}.",
-                    report.base_url.as_deref().unwrap_or("<unknown>"),
-                    report.truth_layer.as_deref().unwrap_or("daemon_local_v1")
-                ),
-                Some(
-                    "Run `openyak server status` for full operator details, or `openyak server stop` if you need to shut it down."
-                        .to_string(),
-                ),
-            ),
+        Ok(report) => {
+            let install_inspection = Some(&report.install);
+            match report.status {
+            "running" => {
+                let summary = doctor_local_daemon_summary_with_install(
+                    doctor_local_daemon_summary_with_capabilities(
+                        format!(
+                            "Workspace local thread server is reachable at {} and advertises {}.",
+                            report.base_url.as_deref().unwrap_or("<unknown>"),
+                            report.truth_layer.as_deref().unwrap_or("daemon_local_v1")
+                        ),
+                        &report.capabilities,
+                    ),
+                    install_inspection,
+                );
+                let hint = doctor_local_daemon_hint(&report, install_inspection);
+                if thread_server_capabilities_are_degraded(&report.capabilities)
+                    || matches!(
+                        install_inspection,
+                        Some(ThreadServerInstallInspection::Invalid { .. })
+                    )
+                {
+                    DoctorCheck::warning("local daemon", summary, Some(hint))
+                } else {
+                    DoctorCheck::ok("local daemon", summary, Some(hint))
+                }
+            }
             "not_running" => {
                 let summary = if report.state_db_present {
                     format!(
@@ -3863,29 +5671,45 @@ fn doctor_local_daemon_check(cwd: &Path) -> DoctorCheck {
                 } else {
                     "No workspace local thread server is running for this workspace.".to_string()
                 };
-                DoctorCheck::ok("local daemon", summary, Some(doctor_local_daemon_hint(&report)))
+                let summary =
+                    doctor_local_daemon_summary_with_install(summary, install_inspection);
+                let hint = doctor_local_daemon_hint(&report, install_inspection);
+                if matches!(
+                    install_inspection,
+                    Some(ThreadServerInstallInspection::Invalid { .. })
+                ) {
+                    DoctorCheck::warning("local daemon", summary, Some(hint))
+                } else {
+                    DoctorCheck::ok("local daemon", summary, Some(hint))
+                }
             }
             "stale_registration" => DoctorCheck::warning(
                 "local daemon",
-                format!(
-                    "Workspace discovery points to a stale daemon_local_v1 record{}{}.",
-                    report
-                        .base_url
-                        .as_deref()
-                        .map_or(String::new(), |base_url| format!(" at {base_url}")),
-                    report
-                        .pid
-                        .map_or(String::new(), |pid| format!(" (pid {pid})"))
+                doctor_local_daemon_summary_with_install(
+                    format!(
+                        "Workspace discovery points to a stale daemon_local_v1 record{}{}.",
+                        report
+                            .base_url
+                            .as_deref()
+                            .map_or(String::new(), |base_url| format!(" at {base_url}")),
+                        report
+                            .pid
+                            .map_or(String::new(), |pid| format!(" (pid {pid})"))
+                    ),
+                    install_inspection,
                 ),
-                Some(doctor_local_daemon_hint(&report)),
+                Some(doctor_local_daemon_hint(&report, install_inspection)),
             ),
             "invalid_registration" => DoctorCheck::error(
                 "local daemon",
-                format!(
-                    "Workspace discovery is not safe to treat as daemon_local_v1: {}",
-                    report.problem.as_deref().unwrap_or("unexpected contract mismatch")
+                doctor_local_daemon_summary_with_install(
+                    format!(
+                        "Workspace discovery is not safe to treat as daemon_local_v1: {}",
+                        report.problem.as_deref().unwrap_or("unexpected contract mismatch")
+                    ),
+                    install_inspection,
                 ),
-                Some(doctor_local_daemon_hint(&report)),
+                Some(doctor_local_daemon_hint(&report, install_inspection)),
             ),
             other => DoctorCheck::warning(
                 "local daemon",
@@ -3895,7 +5719,8 @@ fn doctor_local_daemon_check(cwd: &Path) -> DoctorCheck {
                         .to_string(),
                 ),
             ),
-        },
+        }
+        }
         Err(error) => DoctorCheck::error(
             "local daemon",
             format!("Failed to inspect the workspace local thread server: {error}"),
@@ -3907,8 +5732,17 @@ fn doctor_local_daemon_check(cwd: &Path) -> DoctorCheck {
     }
 }
 
-fn doctor_local_daemon_hint(report: &ThreadServerStatusReport) -> String {
+fn doctor_local_daemon_hint(
+    report: &ThreadServerStatusReport,
+    install_inspection: Option<&ThreadServerInstallInspection>,
+) -> String {
     let mut actions = report.recommended_actions.clone();
+    if report.status == "running" {
+        actions.push(
+            "run `openyak server stop` in this workspace if you need to shut the local daemon down"
+                .to_string(),
+        );
+    }
     if report.status == "stale_registration"
         && !actions
             .iter()
@@ -3918,6 +5752,47 @@ fn doctor_local_daemon_hint(report: &ThreadServerStatusReport) -> String {
             "run `openyak server stop` in this workspace if you only want to clear the stale discovery record"
                 .to_string(),
         );
+    }
+    match install_inspection {
+        Some(ThreadServerInstallInspection::Missing { .. }) if report.status != "running" => {
+            actions.push(
+                "run `openyak server install --bind 127.0.0.1:0` in this workspace to stage a user-scoped local service bundle for repeatable daemon activation"
+                    .to_string(),
+            );
+        }
+        Some(ThreadServerInstallInspection::Present(bundle)) if report.status != "running" => {
+            actions.push(format!(
+                "activate the staged {} rooted at `{}` with {}",
+                thread_server_install_service_manager_label(&bundle.service_manager),
+                bundle.install_root.display(),
+                thread_server_install_command_sequence(&bundle.activation_commands)
+            ));
+            actions.push(format!(
+                "full activation/removal steps remain documented in `{}`",
+                bundle.readme_path.display()
+            ));
+            if matches!(report.status, "stale_registration" | "invalid_registration") {
+                actions.push(format!(
+                    "rerun `openyak server install --bind {}` in this workspace if you need to replace the staged bundle",
+                    bundle.requested_bind
+                ));
+            }
+        }
+        Some(ThreadServerInstallInspection::Invalid {
+            manifest_path,
+            problem,
+        }) => actions.push(format!(
+            "existing install manifest `{}` is not usable ({problem}); rerun `openyak server install --bind 127.0.0.1:0` in this workspace to replace the staged bundle",
+            manifest_path.display()
+        )),
+        Some(
+            ThreadServerInstallInspection::Missing { .. }
+            | ThreadServerInstallInspection::Present(_),
+        )
+        | None => {}
+    }
+    if report.status == "running" && thread_server_capabilities_are_degraded(&report.capabilities) {
+        actions.extend(report.capabilities.mcp.recommended_actions.clone());
     }
     actions.push(
         "run `openyak server status` in this workspace for the full discovery snapshot".to_string(),
@@ -9065,6 +10940,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  openyak server install [--bind HOST:PORT]         Stage a user-scoped local service-install bundle"
+    )?;
+    writeln!(
+        out,
         "  openyak server status                    Inspect local thread-server discovery + operator status"
     )?;
     writeln!(
@@ -9155,6 +11034,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  openyak package-release --output-dir dist")?;
     writeln!(out, "  openyak server --bind 127.0.0.1:0")?;
     writeln!(out, "  openyak server start --detach --bind 127.0.0.1:0")?;
+    writeln!(out, "  openyak server install --bind 127.0.0.1:0")?;
     writeln!(out, "  openyak server status")?;
     writeln!(out, "  openyak server stop")?;
     writeln!(out, "  openyak server recover")?;
@@ -9202,7 +11082,7 @@ fn render_help_topic(topic: HelpTopic) -> &'static str {
             "Usage: openyak package-release [--output-dir PATH] [--binary PATH]\n\nStage a release artifact directory containing the packaged openyak binary plus generated install metadata.\nBy default the command packages the currently running openyak executable into ./dist."
         }
         HelpTopic::Server => {
-            "Usage: openyak server [--bind HOST:PORT]\n       openyak server start --detach [--bind HOST:PORT]\n       openyak server status\n       openyak server stop\n       openyak server recover\n\nRun the local HTTP/SSE thread server backed by the `server` crate, launch the current workspace server as a detached local-only background process, inspect the current workspace's local thread-server discovery/liveness metadata, stop the current workspace server via its local discovery record, or attempt a narrow local recovery when persisted thread truth or stale discovery makes that safe.\nThe server exposes the local `/v1/threads` protocol plus legacy `/sessions` compatibility routes, persists thread state in the workspace `.openyak/state.sqlite3` SQLite store, prints the actual bound address on startup, keeps serving until interrupted, and only supports loopback binds.\n`openyak server start --detach` stays local-only, validates/clears workspace discovery preflight, waits for a running discovery record, and keeps foreground startup on `openyak server --bind ...`.\n`openyak server status` stays read-only and reports local loopback operator truth.\n`openyak server stop` stays local-only, validates the reachable operator identity against workspace discovery before signaling a pid.\n`openyak server recover` stays local-only, only acts on current-workspace `daemon_local_v1` thread truth, and still refuses malformed or unsafe discovery records instead of widening into broader daemon lifecycle management."
+            "Usage: openyak server [--bind HOST:PORT]\n       openyak server start --detach [--bind HOST:PORT]\n       openyak server install [--bind HOST:PORT]\n       openyak server status\n       openyak server stop\n       openyak server recover\n\nRun the local HTTP/SSE thread server backed by the `server` crate, launch the current workspace server as a detached local-only background process, stage a user-scoped local service-install bundle for that workspace server, inspect the current workspace's local thread-server discovery/liveness metadata, stop the current workspace server via its local discovery record, or attempt a narrow local recovery when persisted thread truth or stale discovery makes that safe.\nThe server exposes the local `/v1/threads` protocol plus legacy `/sessions` compatibility routes, persists thread state in the workspace `.openyak/state.sqlite3` SQLite store, prints the actual bound address on startup, keeps serving until interrupted, and only supports loopback binds.\n`openyak server start --detach` stays local-only, validates/clears workspace discovery preflight, waits for a running discovery record, and keeps foreground startup on `openyak server --bind ...`.\n`openyak server install` stays bundle-only for now: it writes a reversible user-scoped service bundle under `OPENYAK_CONFIG_HOME` plus explicit activation/removal commands, but does not auto-register a platform daemon or widen into remote operator access.\n`openyak server status` stays read-only and reports local loopback operator truth.\n`openyak server stop` stays local-only, validates the reachable operator identity against workspace discovery before signaling a pid.\n`openyak server recover` stays local-only, only acts on current-workspace `daemon_local_v1` thread truth, and still refuses malformed or unsafe discovery records instead of widening into broader daemon lifecycle management."
         }
         HelpTopic::Prompt => {
             "Usage: openyak prompt [--tool-profile NAME] <text>\n       openyak -p [--tool-profile NAME] <text>\n\nRun one non-interactive prompt and exit.\nUse --tool-profile to apply a named local tool-profile ceiling for this process only.\nHidden optional browser tools such as BrowserObserve and BrowserInteract still require browserControl.enabled=true plus explicit --allowedTools BrowserObserve or --allowedTools BrowserInteract.\nIf the model requests structured follow-up input, this mode fails explicitly instead of guessing a reply."
@@ -9222,7 +11102,9 @@ mod tests {
         format_plan_permissions_blocked_report, format_resume_report, format_status_report,
         format_tool_call_start, format_tool_result, git_args_excluding_local_artifacts,
         git_branch_diff_summary, git_workspace_diff_summary_for_commit_prompt, initialize_repo,
-        inspect_thread_server_status_for, load_session_from_reference, normalize_permission_mode,
+        inspect_thread_server_capabilities_for, inspect_thread_server_install_for,
+        inspect_thread_server_mcp_capability_for, inspect_thread_server_status_for,
+        install_thread_server_bundle_for, load_session_from_reference, normalize_permission_mode,
         parse_args, parse_commit_push_pr_draft, parse_git_status_metadata,
         parse_manual_oauth_callback_input, parse_user_input_submission, permission_policy,
         print_help_to, push_output_block, render_config_report, render_diff_report,
@@ -9232,20 +11114,23 @@ mod tests {
         resolve_effective_model, resolve_model_alias, response_to_events,
         resume_supported_slash_commands, run_github_titled_body_create, run_resume_command,
         sessions_dir, slash_command_completion_candidates, stage_release_artifact, status_context,
-        status_context_or_fallback_for_cwd, stop_thread_server_for, summarize_command_stderr,
+        status_context_or_fallback_for_cwd, stop_running_thread_server, stop_thread_server_for,
+        summarize_command_stderr, thread_server_status_json, thread_server_stop_json,
         validate_server_bind_target, write_temp_text_file, CliAction, CliOutputFormat,
         CliUserInputPrompter, ConfigLoader, DefaultRuntimeClient, DoctorCheckStatus, HelpTopic,
         InternalPromptProgressEvent, InternalPromptProgressState, SlashCommand, StatusUsage,
-        ThreadServerInfoGuard, BROWSER_INTERACT_TOOL_NAME, BROWSER_OBSERVE_TOOL_NAME,
-        DEFAULT_DETACHED_SERVER_BIND, DEFAULT_MODEL, DEFAULT_RELEASE_OUTPUT_DIR,
-        DEFAULT_SERVER_BIND, REQUEST_USER_INPUT_TOOL_NAME, THREAD_SERVER_INFO_FILENAME, VERSION,
+        ThreadServerInfoGuard, ThreadServerInstallInspection, ThreadServerStatusReport,
+        BROWSER_INTERACT_TOOL_NAME, BROWSER_OBSERVE_TOOL_NAME, DEFAULT_DETACHED_SERVER_BIND,
+        DEFAULT_MODEL, DEFAULT_RELEASE_OUTPUT_DIR, DEFAULT_SERVER_BIND,
+        REQUEST_USER_INPUT_TOOL_NAME, THREAD_SERVER_INFO_FILENAME, VERSION,
     };
     use api::{InputContentBlock, MessageResponse, OutputContentBlock, ProviderKind, Usage};
     use plugins::{PluginHooks, PluginTool, PluginToolDefinition, PluginToolPermission};
     use runtime::{
         resolve_command_path, AssistantEvent, CompactionSummaryMode, ContentBlock,
-        ConversationMessage, MessageRole, PermissionMode, Session, SessionAccountingStatus,
-        SessionTelemetry, UserInputOutcome, UserInputPrompter, UserInputRequest,
+        ConversationMessage, LifecycleStateSnapshot, MessageRole, PermissionMode, Session,
+        SessionAccountingStatus, SessionTelemetry, UserInputOutcome, UserInputPrompter,
+        UserInputRequest,
     };
     use serde_json::json;
     use std::ffi::OsString;
@@ -9926,6 +11811,7 @@ mod tests {
         );
         assert!(render_help_topic(HelpTopic::Server).contains("Usage: openyak server"));
         assert!(render_help_topic(HelpTopic::Server).contains("openyak server start --detach"));
+        assert!(render_help_topic(HelpTopic::Server).contains("openyak server install"));
         assert!(render_help_topic(HelpTopic::Server).contains("openyak server status"));
         assert!(render_help_topic(HelpTopic::Server).contains("openyak server stop"));
         assert!(render_help_topic(HelpTopic::Server).contains("openyak server recover"));
@@ -10079,6 +11965,14 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&["server".to_string(), "install".to_string()])
+                .expect("server install should parse"),
+            CliAction::ServerInstall {
+                bind: DEFAULT_DETACHED_SERVER_BIND.to_string(),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
             parse_args(&[
                 "server".to_string(),
                 "start".to_string(),
@@ -10134,6 +12028,20 @@ mod tests {
                 "--output-format".to_string(),
                 "json".to_string(),
                 "server".to_string(),
+                "install".to_string(),
+                "--bind=127.0.0.1:0".to_string(),
+            ])
+            .expect("json server install should parse"),
+            CliAction::ServerInstall {
+                bind: "127.0.0.1:0".to_string(),
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "--output-format".to_string(),
+                "json".to_string(),
+                "server".to_string(),
                 "stop".to_string(),
             ])
             .expect("json server stop should parse"),
@@ -10169,6 +12077,12 @@ mod tests {
         assert_eq!(report.status, "not_running");
         assert!(!report.state_db_present);
         assert!(report.discovery_path.is_none());
+        assert!(matches!(
+            &report.install,
+            ThreadServerInstallInspection::Missing { .. }
+        ));
+        assert_eq!(report.capabilities.mcp.status, "disabled");
+        assert_eq!(report.capabilities.mcp.configured_count, 0);
         assert!(
             report.recommended_actions[0]
                 .contains("openyak server start --detach --bind 127.0.0.1:0"),
@@ -10181,6 +12095,238 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("State DB"), "{rendered}");
+        assert!(rendered.contains("Install status   missing"), "{rendered}");
+        assert!(rendered.contains("MCP capability   disabled"), "{rendered}");
+        assert!(
+            rendered.contains("Install stage    openyak server install --bind 127.0.0.1:0"),
+            "{rendered}"
+        );
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn thread_server_mcp_capability_problem_report_keeps_server_counts_consistent() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-mcp-capability-invalid-cwd");
+        let missing = root.join("missing-workspace");
+
+        let report = inspect_thread_server_mcp_capability_for(&missing);
+
+        assert_eq!(report.status, "degraded");
+        assert_eq!(report.configured_count, 0);
+        assert_eq!(report.ready_count, 0);
+        assert_eq!(report.auth_required_count, 0);
+        assert_eq!(report.degraded_count, 0);
+        assert!(report.servers.is_empty(), "{report:?}");
+        assert!(
+            report
+                .problem
+                .as_deref()
+                .is_some_and(|problem| problem.contains("failed to resolve workspace root")),
+            "{report:?}"
+        );
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn thread_server_status_surfaces_staged_install_bundle_metadata() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-server-status-install");
+        let workspace = root.join("workspace");
+        let config_home = root.join("openyak-home");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::create_dir_all(&config_home).expect("config home should exist");
+        let config_home_env = config_home.to_string_lossy().to_string();
+        let _openyak_home = EnvVarGuard::set("OPENYAK_CONFIG_HOME", Some(&config_home_env));
+
+        let install_report = {
+            let _cwd = CurrentDirGuard::set(&workspace);
+            install_thread_server_bundle_for(&workspace, DEFAULT_DETACHED_SERVER_BIND)
+                .expect("install bundle should stage")
+        };
+        let report = {
+            let _cwd = CurrentDirGuard::set(&workspace);
+            inspect_thread_server_status_for(&workspace).expect("status inspection should succeed")
+        };
+
+        match &report.install {
+            ThreadServerInstallInspection::Present(bundle) => {
+                assert_eq!(bundle.requested_bind, DEFAULT_DETACHED_SERVER_BIND);
+                assert_eq!(bundle.install_root, install_report.install_root);
+                assert_eq!(bundle.readme_path, install_report.readme_path);
+                assert_eq!(bundle.service_label, install_report.service_label);
+                assert_eq!(
+                    bundle.activation_commands,
+                    install_report.activation_commands
+                );
+            }
+            other => panic!("expected staged install metadata, got {other:?}"),
+        }
+
+        let status_json = thread_server_status_json(&report);
+        assert_eq!(status_json["install"]["status"], "bundle_staged");
+        assert_eq!(
+            status_json["install"]["install_root"],
+            install_report.install_root.display().to_string()
+        );
+        assert_eq!(
+            status_json["install"]["readme_path"],
+            install_report.readme_path.display().to_string()
+        );
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn thread_server_status_rejects_tampered_install_mode_manifest() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-server-status-install-mode-tamper");
+        let workspace = root.join("workspace");
+        let config_home = root.join("openyak-home");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::create_dir_all(&config_home).expect("config home should exist");
+        let config_home_env = config_home.to_string_lossy().to_string();
+        let _openyak_home = EnvVarGuard::set("OPENYAK_CONFIG_HOME", Some(&config_home_env));
+
+        let install_report = {
+            let _cwd = CurrentDirGuard::set(&workspace);
+            install_thread_server_bundle_for(&workspace, DEFAULT_DETACHED_SERVER_BIND)
+                .expect("install bundle should stage")
+        };
+        let mut manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&install_report.manifest_path).expect("manifest should read"),
+        )
+        .expect("manifest should parse");
+        manifest["install_mode"] = json!("hosted_control_plane");
+        fs::write(
+            &install_report.manifest_path,
+            serde_json::to_string_pretty(&manifest).expect("manifest should serialize"),
+        )
+        .expect("tampered manifest should write");
+
+        let report = {
+            let _cwd = CurrentDirGuard::set(&workspace);
+            inspect_thread_server_status_for(&workspace).expect("status inspection should succeed")
+        };
+
+        match &report.install {
+            ThreadServerInstallInspection::Invalid {
+                manifest_path,
+                problem,
+            } => {
+                assert_eq!(manifest_path, &install_report.manifest_path);
+                assert!(problem.contains("install_mode"), "{problem}");
+            }
+            other => panic!("expected invalid manifest, got {other:?}"),
+        }
+
+        let rendered = render_thread_server_status(&report);
+        assert!(
+            rendered.contains("Install status   invalid_manifest"),
+            "{rendered}"
+        );
+        let status_json = thread_server_status_json(&report);
+        assert_eq!(status_json["install"]["status"], "invalid_manifest");
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn thread_server_status_rejects_tampered_install_command_contract() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-server-status-command-tamper");
+        let workspace = root.join("workspace");
+        let config_home = root.join("openyak-home");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::create_dir_all(&config_home).expect("config home should exist");
+        let config_home_env = config_home.to_string_lossy().to_string();
+        let _openyak_home = EnvVarGuard::set("OPENYAK_CONFIG_HOME", Some(&config_home_env));
+
+        let install_report = {
+            let _cwd = CurrentDirGuard::set(&workspace);
+            install_thread_server_bundle_for(&workspace, DEFAULT_DETACHED_SERVER_BIND)
+                .expect("install bundle should stage")
+        };
+        let mut manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&install_report.manifest_path).expect("manifest should read"),
+        )
+        .expect("manifest should parse");
+        manifest["activation_commands"] = json!(["echo forged-command"]);
+        fs::write(
+            &install_report.manifest_path,
+            serde_json::to_string_pretty(&manifest).expect("manifest should serialize"),
+        )
+        .expect("tampered manifest should write");
+
+        let report = {
+            let _cwd = CurrentDirGuard::set(&workspace);
+            inspect_thread_server_status_for(&workspace).expect("status inspection should succeed")
+        };
+
+        match &report.install {
+            ThreadServerInstallInspection::Invalid {
+                manifest_path,
+                problem,
+            } => {
+                assert_eq!(manifest_path, &install_report.manifest_path);
+                assert!(problem.contains("activation_commands"), "{problem}");
+            }
+            other => panic!("expected invalid manifest, got {other:?}"),
+        }
+
+        let status_json = thread_server_status_json(&report);
+        assert_eq!(status_json["install"]["status"], "invalid_manifest");
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn thread_server_status_rejects_tampered_requested_bind_manifest() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-server-status-bind-tamper");
+        let workspace = root.join("workspace");
+        let config_home = root.join("openyak-home");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::create_dir_all(&config_home).expect("config home should exist");
+        let config_home_env = config_home.to_string_lossy().to_string();
+        let _openyak_home = EnvVarGuard::set("OPENYAK_CONFIG_HOME", Some(&config_home_env));
+
+        let install_report = {
+            let _cwd = CurrentDirGuard::set(&workspace);
+            install_thread_server_bundle_for(&workspace, "127.0.0.1:43123")
+                .expect("install bundle should stage")
+        };
+        let mut manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&install_report.manifest_path).expect("manifest should read"),
+        )
+        .expect("manifest should parse");
+        manifest["requested_bind"] = json!("127.0.0.1:4312");
+        fs::write(
+            &install_report.manifest_path,
+            serde_json::to_string_pretty(&manifest).expect("manifest should serialize"),
+        )
+        .expect("tampered manifest should write");
+
+        let report = {
+            let _cwd = CurrentDirGuard::set(&workspace);
+            inspect_thread_server_status_for(&workspace).expect("status inspection should succeed")
+        };
+
+        match &report.install {
+            ThreadServerInstallInspection::Invalid {
+                manifest_path,
+                problem,
+            } => {
+                assert_eq!(manifest_path, &install_report.manifest_path);
+                assert!(problem.contains("requested_bind"), "{problem}");
+            }
+            other => panic!("expected invalid manifest, got {other:?}"),
+        }
+
+        let status_json = thread_server_status_json(&report);
+        assert_eq!(status_json["install"]["status"], "invalid_manifest");
 
         crate::cleanup_temp_dir(&root);
     }
@@ -10199,12 +12345,20 @@ mod tests {
         assert_eq!(report.status, "already_stopped");
         assert!(!report.discovery_cleared);
         assert!(!report.reachable_before_stop);
+        assert_eq!(report.capabilities.mcp.status, "disabled");
+        assert_eq!(report.lifecycle.status, "already_stopped");
+        assert!(report.lifecycle.recovery.is_none());
 
         let rendered = render_thread_server_stop(&report);
         assert!(
             rendered.contains("Status           already_stopped"),
             "{rendered}"
         );
+        assert!(
+            rendered.contains("Lifecycle        already_stopped"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("MCP capability   disabled"), "{rendered}");
 
         crate::cleanup_temp_dir(&root);
     }
@@ -10238,12 +12392,20 @@ mod tests {
         assert_eq!(report.status, "stale_registration_cleared");
         assert!(report.discovery_cleared);
         assert!(!openyak_dir.join(THREAD_SERVER_INFO_FILENAME).exists());
+        assert_eq!(report.capabilities.mcp.status, "disabled");
+        assert_eq!(report.lifecycle.status, "stale_registration_cleared");
+        assert!(report.lifecycle.recovery.is_none());
 
         let rendered = render_thread_server_stop(&report);
         assert!(
             rendered.contains("Status           stale_registration_cleared"),
             "{rendered}"
         );
+        assert!(
+            rendered.contains("Lifecycle        stale_registration_cleared"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("MCP capability   disabled"), "{rendered}");
 
         crate::cleanup_temp_dir(&root);
     }
@@ -10277,6 +12439,20 @@ mod tests {
 
         assert_eq!(report.status, "invalid_registration");
         assert!(!report.discovery_cleared);
+        assert_eq!(report.capabilities.mcp.status, "disabled");
+        assert_eq!(report.lifecycle.status, "invalid_registration");
+        assert_eq!(
+            report.lifecycle.failure_kind.as_deref(),
+            Some("daemon_local_invalid_registration")
+        );
+        assert_eq!(
+            report
+                .lifecycle
+                .recovery
+                .as_ref()
+                .map(|recovery| recovery.recovery_kind.as_str()),
+            Some("manual_repair_required")
+        );
         assert!(
             discovery_path.exists(),
             "unsafe discovery should remain for inspection"
@@ -10288,6 +12464,89 @@ mod tests {
                 .is_some_and(|problem| problem.contains("truthLayer")),
             "{report:?}"
         );
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn stop_running_thread_server_reports_stop_failed_for_current_process_pid() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-server-stop-self-pid");
+        fs::create_dir_all(&root).expect("workspace should exist");
+        let openyak_dir = root.join(".openyak");
+        fs::create_dir_all(&openyak_dir).expect("openyak dir should exist");
+        let state_db_path = openyak_dir.join("state.sqlite3");
+        let install =
+            inspect_thread_server_install_for(&root).expect("install inspection should work");
+        let capabilities = inspect_thread_server_capabilities_for(&root);
+        let status_report = ThreadServerStatusReport {
+            status: "running",
+            workspace_root: root.clone(),
+            workspace_state_root: openyak_dir,
+            state_db_path,
+            state_db_present: false,
+            discovery_path: None,
+            discovery_source: None,
+            reachable: true,
+            base_url: Some("http://127.0.0.1:0".to_string()),
+            pid: Some(std::process::id()),
+            truth_layer: Some("daemon_local_v1".to_string()),
+            operator_plane: Some("local_loopback_operator_v1".to_string()),
+            persistence: Some("workspace_sqlite_v1".to_string()),
+            attach_api: Some("/v1/threads".to_string()),
+            problem: None,
+            recommended_actions: Vec::new(),
+            install,
+            capabilities,
+            lifecycle: LifecycleStateSnapshot::status("running"),
+        };
+
+        let report =
+            stop_running_thread_server(status_report).expect("self pid stop should return report");
+
+        assert_eq!(report.status, "stop_failed");
+        assert_eq!(report.capabilities.mcp.status, "disabled");
+        assert_eq!(report.lifecycle.status, "stop_failed");
+        assert_eq!(
+            report.lifecycle.failure_kind.as_deref(),
+            Some("daemon_local_stop_failed")
+        );
+        assert_eq!(
+            report
+                .lifecycle
+                .recovery
+                .as_ref()
+                .map(|recovery| recovery.recovery_kind.as_str()),
+            Some("inspect_error_and_retry")
+        );
+        assert!(
+            report
+                .recommended_actions
+                .iter()
+                .any(|action| action.contains("run `openyak server stop` from a separate process")),
+            "{report:?}"
+        );
+        let json_report = thread_server_stop_json(&report);
+        assert_eq!(json_report["status"], "stop_failed");
+        assert_eq!(
+            json_report["lifecycle"]["failure_kind"],
+            "daemon_local_stop_failed"
+        );
+        assert_eq!(
+            json_report["lifecycle"]["recovery"]["recovery_kind"],
+            "inspect_error_and_retry"
+        );
+        assert_eq!(json_report["capabilities"]["mcp"]["status"], "disabled");
+        let rendered = render_thread_server_stop(&report);
+        assert!(
+            rendered.contains("Status           stop_failed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Lifecycle        stop_failed"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("MCP capability   disabled"), "{rendered}");
 
         crate::cleanup_temp_dir(&root);
     }
@@ -10323,6 +12582,10 @@ mod tests {
         assert!(report.state_db_present);
         assert_eq!(report.base_url.as_deref(), Some("http://127.0.0.1:9"));
         assert_eq!(report.truth_layer.as_deref(), Some("daemon_local_v1"));
+        assert!(matches!(
+            &report.install,
+            ThreadServerInstallInspection::Missing { .. }
+        ));
         assert!(
             report.recommended_actions[0].contains("openyak server recover"),
             "{report:?}"
@@ -11177,6 +13440,7 @@ mod tests {
         assert!(help.contains("openyak foundations"));
         assert!(help.contains("openyak package-release"));
         assert!(help.contains("openyak server"));
+        assert!(help.contains("openyak server install"));
         assert!(help.contains("openyak agents"));
         assert!(help.contains("openyak skills"));
         assert!(help.contains("openyak /skills"));
@@ -11232,6 +13496,88 @@ mod tests {
         let error = stage_release_artifact(&binary_path, &output_dir)
             .expect_err("packaging should reject a source binary inside the destination dir");
         assert!(error.to_string().contains("destination artifact directory"));
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn install_thread_server_bundle_stages_reversible_local_artifacts() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-server-install");
+        let workspace = root.join("workspace");
+        let config_home = root.join("openyak-home");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::create_dir_all(&config_home).expect("config home should exist");
+        let config_home_env = config_home.to_string_lossy().to_string();
+        let _openyak_home = EnvVarGuard::set("OPENYAK_CONFIG_HOME", Some(&config_home_env));
+
+        let first_report = {
+            let _cwd = CurrentDirGuard::set(&workspace);
+            install_thread_server_bundle_for(&workspace, DEFAULT_DETACHED_SERVER_BIND)
+                .expect("install bundle should stage")
+        };
+        let canonical_config_home = config_home.canonicalize().expect("config home canonical");
+        assert_eq!(first_report.status, "bundle_staged");
+        assert_eq!(first_report.install_mode, "bundle_only");
+        assert!(!first_report.replaced_existing_bundle);
+        assert!(first_report
+            .install_root
+            .starts_with(&canonical_config_home));
+        assert!(first_report.manifest_path.is_file());
+        assert!(first_report.readme_path.is_file());
+        assert!(first_report.launcher_path.is_file());
+        assert!(
+            !first_report.activation_commands.is_empty(),
+            "{first_report:?}"
+        );
+        assert!(
+            !first_report.removal_commands.is_empty(),
+            "{first_report:?}"
+        );
+        if cfg!(windows) {
+            assert_eq!(first_report.service_manager, "windows_task_scheduler");
+            assert_eq!(first_report.helper_paths.len(), 2, "{first_report:?}");
+            assert!(first_report.helper_paths.iter().all(|path| path.is_file()));
+            assert!(first_report.service_definition_path.is_none());
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(first_report.service_manager, "launchd_agent");
+            assert!(first_report
+                .service_definition_path
+                .as_ref()
+                .is_some_and(|path| path.is_file()));
+        } else {
+            assert_eq!(first_report.service_manager, "systemd_user");
+            assert!(first_report
+                .service_definition_path
+                .as_ref()
+                .is_some_and(|path| path.is_file()));
+        }
+
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&first_report.manifest_path).expect("manifest should read"),
+        )
+        .expect("manifest should parse");
+        assert_eq!(manifest["status"], "bundle_staged");
+        assert_eq!(manifest["install_mode"], "bundle_only");
+        assert_eq!(manifest["requested_bind"], DEFAULT_DETACHED_SERVER_BIND);
+        assert_eq!(
+            manifest["install_root"],
+            first_report.install_root.display().to_string()
+        );
+        assert!(
+            fs::read_to_string(&first_report.readme_path)
+                .expect("readme should read")
+                .contains("This command only stages a reversible local bundle"),
+            "install README should explain bundle-only scope"
+        );
+
+        let second_report = {
+            let _cwd = CurrentDirGuard::set(&workspace);
+            install_thread_server_bundle_for(&workspace, DEFAULT_DETACHED_SERVER_BIND)
+                .expect("second install bundle should restage")
+        };
+        assert!(second_report.replaced_existing_bundle);
+        assert_eq!(second_report.install_root, first_report.install_root);
 
         crate::cleanup_temp_dir(&root);
     }
@@ -11325,15 +13671,62 @@ mod tests {
             "{local_daemon_check:?}"
         );
         assert!(
-            local_daemon_check
-                .hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("openyak server start --detach")),
+            local_daemon_check.hint.as_deref().is_some_and(|hint| {
+                hint.contains("openyak server start --detach")
+                    && hint.contains("openyak server install --bind 127.0.0.1:0")
+            }),
             "{local_daemon_check:?}"
         );
         assert_eq!(
             doctor_check(&report, "github cli").status,
             DoctorCheckStatus::Ok
+        );
+
+        crate::cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn doctor_report_surfaces_staged_install_bundle_guidance() {
+        let _lock = env_lock();
+        let root = unique_temp_dir("openyak-cli-doctor-install-bundle");
+        let cwd = root.join("workspace");
+        let config_home = root.join("openyak-home");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&cwd).expect("workspace should exist");
+        fs::create_dir_all(&config_home).expect("config home should exist");
+        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        write_fake_command(&bin_dir, "gh");
+        let config_home_env = config_home.to_string_lossy().to_string();
+        let path_env = std::env::join_paths([bin_dir.as_path()])
+            .expect("path should join")
+            .to_string_lossy()
+            .to_string();
+        let _openyak_home = EnvVarGuard::set("OPENYAK_CONFIG_HOME", Some(&config_home_env));
+        let _path = EnvVarGuard::set("PATH", Some(&path_env));
+        let _api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", Some("doctor-test-key"));
+        let _auth_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+
+        let install_report = install_thread_server_bundle_for(&cwd, DEFAULT_DETACHED_SERVER_BIND)
+            .expect("install bundle should stage");
+        let report = super::collect_doctor_report(&cwd);
+        let local_daemon_check = doctor_check(&report, "local daemon");
+
+        assert_eq!(local_daemon_check.status, DoctorCheckStatus::Ok);
+        assert!(
+            local_daemon_check
+                .summary
+                .contains(&install_report.install_root.display().to_string()),
+            "{local_daemon_check:?}"
+        );
+        assert!(
+            local_daemon_check.hint.as_deref().is_some_and(|hint| {
+                hint.contains(&install_report.readme_path.display().to_string())
+                    && install_report
+                        .activation_commands
+                        .iter()
+                        .any(|command| hint.contains(command))
+            }),
+            "{local_daemon_check:?}"
         );
 
         crate::cleanup_temp_dir(&root);
@@ -11533,10 +13926,10 @@ mod tests {
             "{local_daemon_check:?}"
         );
         assert!(
-            local_daemon_check
-                .hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("openyak server start --detach")),
+            local_daemon_check.hint.as_deref().is_some_and(|hint| {
+                hint.contains("openyak server start --detach")
+                    && hint.contains("openyak server install --bind 127.0.0.1:0")
+            }),
             "{local_daemon_check:?}"
         );
 

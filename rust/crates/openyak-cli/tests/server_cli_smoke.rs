@@ -131,6 +131,46 @@ impl Drop for DetachedWorkspaceGuard {
     }
 }
 
+fn assert_daemon_local_thread_contract(report: &Value) {
+    assert_eq!(report["contract"]["truth_layer"], "daemon_local_v1");
+    assert_eq!(
+        report["contract"]["operator_plane"],
+        "local_loopback_operator_v1"
+    );
+    assert_eq!(report["contract"]["persistence"], "workspace_sqlite_v1");
+    assert_eq!(report["contract"]["attach_api"], "/v1/threads");
+}
+
+fn assert_missing_thread_contract(report: &Value) {
+    assert!(report["contract"]["truth_layer"].is_null(), "{report}");
+    assert!(report["contract"]["operator_plane"].is_null(), "{report}");
+    assert!(report["contract"]["persistence"].is_null(), "{report}");
+    assert!(report["contract"]["attach_api"].is_null(), "{report}");
+}
+
+fn assert_disabled_mcp_capability(report: &Value) {
+    assert_eq!(report["capabilities"]["mcp"]["status"], "disabled");
+    assert_eq!(report["capabilities"]["mcp"]["configured_count"], 0);
+    assert_eq!(report["capabilities"]["mcp"]["ready_count"], 0);
+    assert_eq!(report["capabilities"]["mcp"]["auth_required_count"], 0);
+    assert_eq!(report["capabilities"]["mcp"]["degraded_count"], 0);
+    assert!(
+        report["capabilities"]["mcp"]["servers"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{report}"
+    );
+}
+
+fn assert_lifecycle_status(report: &Value, status: &str) {
+    assert_eq!(report["lifecycle"]["status"], status);
+}
+
+fn assert_lifecycle_has_no_recovery(report: &Value) {
+    assert!(report["lifecycle"]["failure_kind"].is_null(), "{report}");
+    assert!(report["lifecycle"]["recovery"].is_null(), "{report}");
+}
+
 #[test]
 fn openyak_server_surfaces_thread_routes() {
     let mut child = ChildGuard::spawn();
@@ -382,6 +422,8 @@ fn openyak_server_status_reports_running_operator_surface() {
         "{stdout}"
     );
     assert!(stdout.contains("Attach API       /v1/threads"), "{stdout}");
+    assert!(stdout.contains("Install status   missing"), "{stdout}");
+    assert!(stdout.contains("MCP capability   disabled"), "{stdout}");
 
     let json_output = Command::new(common::openyak_binary())
         .args(["--output-format", "json", "server", "status"])
@@ -405,6 +447,8 @@ fn openyak_server_status_reports_running_operator_surface() {
     );
     assert_eq!(report["contract"]["persistence"], "workspace_sqlite_v1");
     assert_eq!(report["contract"]["attach_api"], "/v1/threads");
+    assert_eq!(report["install"]["status"], "missing");
+    assert_eq!(report["capabilities"]["mcp"]["status"], "disabled");
 
     drop(child);
     let _ = std::fs::remove_dir_all(workspace);
@@ -423,6 +467,12 @@ fn openyak_server_status_reports_not_running_workspace_guidance() {
     assert!(output.status.success(), "server status should succeed");
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(stdout.contains("Status           not_running"), "{stdout}");
+    assert!(stdout.contains("Install status   missing"), "{stdout}");
+    assert!(stdout.contains("MCP capability   disabled"), "{stdout}");
+    assert!(
+        stdout.contains("Install stage    openyak server install --bind 127.0.0.1:0"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("openyak server start --detach --bind 127.0.0.1:0"),
         "{stdout}"
@@ -442,8 +492,542 @@ fn openyak_server_status_reports_not_running_workspace_guidance() {
     assert_eq!(report["status"], "not_running");
     assert_eq!(report["reachable"], false);
     assert_eq!(report["state_db_present"], false);
+    assert_eq!(report["install"]["status"], "missing");
+    assert_eq!(report["capabilities"]["mcp"]["status"], "disabled");
+    assert_eq!(
+        report["install"]["suggested_command"],
+        "openyak server install --bind 127.0.0.1:0"
+    );
 
     let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn openyak_server_status_surfaces_mcp_degraded_capability_states() {
+    let workspace = unique_temp_dir("openyak-server-status-mcp-capabilities");
+    std::fs::create_dir_all(workspace.join(".openyak"))
+        .expect("workspace config dir should create");
+    std::fs::write(
+        workspace.join(".openyak").join("settings.json"),
+        r#"{
+  "mcpServers": {
+    "config-auth-required": {
+      "type": "http",
+      "url": "https://vendor.example/mcp",
+      "oauth": {
+        "clientId": "demo-client"
+      }
+    },
+    "config-unsupported-sdk": {
+      "type": "sdk",
+      "name": "demo-sdk"
+    },
+    "config-stdio": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["--version"]
+    }
+  }
+}"#,
+    )
+    .expect("settings should write");
+
+    let text_output = Command::new(common::openyak_binary())
+        .args(["server", "status"])
+        .current_dir(&workspace)
+        .output()
+        .expect("server status should run");
+    assert!(text_output.status.success(), "server status should succeed");
+    let stdout = String::from_utf8(text_output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("MCP capability   degraded"), "{stdout}");
+    assert!(stdout.contains("config-auth-required"), "{stdout}");
+    assert!(stdout.contains("config-unsupported-sdk"), "{stdout}");
+    assert!(stdout.contains("config-stdio"), "{stdout}");
+
+    let json_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "status"])
+        .current_dir(&workspace)
+        .output()
+        .expect("json server status should run");
+    assert!(
+        json_output.status.success(),
+        "json server status should succeed"
+    );
+    let report: Value =
+        serde_json::from_slice(&json_output.stdout).expect("json server status should parse");
+    assert_eq!(report["capabilities"]["mcp"]["status"], "degraded");
+    assert_eq!(report["capabilities"]["mcp"]["configured_count"], 3);
+    assert_eq!(report["capabilities"]["mcp"]["ready_count"], 1);
+    assert_eq!(report["capabilities"]["mcp"]["auth_required_count"], 1);
+    assert_eq!(report["capabilities"]["mcp"]["degraded_count"], 1);
+    assert!(
+        report["capabilities"]["mcp"]["recommended_actions"]
+            .as_array()
+            .is_some_and(|actions| actions.iter().any(|action| action
+                == "repair unsupported MCP transports or invalid MCP config before relying on MCP-backed operator capability")),
+        "{report}"
+    );
+    assert!(
+        report["capabilities"]["mcp"]["recommended_actions"]
+            .as_array()
+            .is_some_and(|actions| actions.iter().any(|action| action
+                == "complete auth for configured MCP servers before relying on MCP-backed operator capability")),
+        "{report}"
+    );
+    assert!(
+        report["capabilities"]["mcp"]["servers"]
+            .as_array()
+            .is_some_and(|servers| servers
+                .iter()
+                .any(|server| server["server"] == "config-auth-required")),
+        "{report}"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn openyak_server_status_surfaces_ready_mcp_capability_state() {
+    let workspace = unique_temp_dir("openyak-server-status-mcp-ready");
+    std::fs::create_dir_all(workspace.join(".openyak"))
+        .expect("workspace config dir should create");
+    std::fs::write(
+        workspace.join(".openyak").join("settings.json"),
+        r#"{
+  "mcpServers": {
+    "config-stdio": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["--version"]
+    }
+  }
+}"#,
+    )
+    .expect("settings should write");
+
+    let text_output = Command::new(common::openyak_binary())
+        .args(["server", "status"])
+        .current_dir(&workspace)
+        .output()
+        .expect("server status should run");
+    assert!(text_output.status.success(), "server status should succeed");
+    let stdout = String::from_utf8(text_output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("MCP capability   ready"), "{stdout}");
+    assert!(
+        stdout.contains("config-stdio (ready, transport stdio, auth local)"),
+        "{stdout}"
+    );
+
+    let json_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "status"])
+        .current_dir(&workspace)
+        .output()
+        .expect("json server status should run");
+    assert!(
+        json_output.status.success(),
+        "json server status should succeed"
+    );
+    let report: Value =
+        serde_json::from_slice(&json_output.stdout).expect("json server status should parse");
+    assert_eq!(report["capabilities"]["mcp"]["status"], "ready");
+    assert_eq!(report["capabilities"]["mcp"]["configured_count"], 1);
+    assert_eq!(report["capabilities"]["mcp"]["ready_count"], 1);
+    assert_eq!(report["capabilities"]["mcp"]["auth_required_count"], 0);
+    assert_eq!(report["capabilities"]["mcp"]["degraded_count"], 0);
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn openyak_server_status_keeps_auth_required_mcp_capability_with_saved_oauth_credentials() {
+    let workspace = unique_temp_dir("openyak-server-status-mcp-auth-required-with-creds");
+    let config_home = unique_temp_dir("openyak-server-status-mcp-auth-required-home");
+    std::fs::create_dir_all(workspace.join(".openyak"))
+        .expect("workspace config dir should create");
+    std::fs::create_dir_all(&config_home).expect("config home should create");
+    std::fs::write(
+        config_home.join("credentials.json"),
+        r#"{
+  "oauth": {
+    "accessToken": "demo-access-token",
+    "refreshToken": "demo-refresh-token",
+    "expiresAt": 4102444800,
+    "scopes": ["mcp:test"]
+  }
+}"#,
+    )
+    .expect("credentials should write");
+    std::fs::write(
+        workspace.join(".openyak").join("settings.json"),
+        r#"{
+  "mcpServers": {
+    "config-auth-required": {
+      "type": "http",
+      "url": "https://vendor.example/mcp",
+      "oauth": {
+        "clientId": "demo-client"
+      }
+    }
+  }
+}"#,
+    )
+    .expect("settings should write");
+
+    let json_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "status"])
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("json server status should run");
+    assert!(
+        json_output.status.success(),
+        "json server status should succeed"
+    );
+    let report: Value =
+        serde_json::from_slice(&json_output.stdout).expect("json server status should parse");
+    assert_eq!(report["capabilities"]["mcp"]["status"], "auth_required");
+    assert_eq!(report["capabilities"]["mcp"]["configured_count"], 1);
+    assert_eq!(report["capabilities"]["mcp"]["ready_count"], 0);
+    assert_eq!(report["capabilities"]["mcp"]["auth_required_count"], 1);
+    assert_eq!(report["capabilities"]["mcp"]["degraded_count"], 0);
+
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&config_home);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn openyak_server_install_stages_local_service_bundle() {
+    let workspace = unique_temp_dir("openyak-server-install");
+    let config_home = unique_temp_dir("openyak-server-install-home");
+    std::fs::create_dir_all(&workspace).expect("workspace should create");
+    std::fs::create_dir_all(&config_home).expect("config home should create");
+
+    let first_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "install"])
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("server install should run");
+    assert!(
+        first_output.status.success(),
+        "server install should succeed: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    let first_report: Value =
+        serde_json::from_slice(&first_output.stdout).expect("server install json should parse");
+    assert_eq!(first_report["status"], "bundle_staged");
+    assert_eq!(first_report["install_mode"], "bundle_only");
+    assert_eq!(first_report["requested_bind"], "127.0.0.1:0");
+    assert_eq!(first_report["replaced_existing_bundle"], false);
+    assert_eq!(first_report["state_db_present"], false);
+    assert!(
+        first_report["activation_commands"]
+            .as_array()
+            .is_some_and(|commands| !commands.is_empty()),
+        "{first_report}"
+    );
+    assert!(
+        first_report["removal_commands"]
+            .as_array()
+            .is_some_and(|commands| !commands.is_empty()),
+        "{first_report}"
+    );
+    let canonical_config_home = config_home.canonicalize().expect("config home canonical");
+    let install_root = PathBuf::from(
+        first_report["install_root"]
+            .as_str()
+            .expect("install_root should be present"),
+    );
+    assert!(
+        install_root.starts_with(&canonical_config_home),
+        "install root should stay under config home: {first_report}"
+    );
+    let manifest_path = PathBuf::from(
+        first_report["manifest_path"]
+            .as_str()
+            .expect("manifest_path should be present"),
+    );
+    let readme_path = PathBuf::from(
+        first_report["readme_path"]
+            .as_str()
+            .expect("readme_path should be present"),
+    );
+    let launcher_path = PathBuf::from(
+        first_report["launcher_path"]
+            .as_str()
+            .expect("launcher_path should be present"),
+    );
+    assert!(manifest_path.is_file(), "{first_report}");
+    assert!(readme_path.is_file(), "{first_report}");
+    assert!(launcher_path.is_file(), "{first_report}");
+    let readme = std::fs::read_to_string(&readme_path).expect("install readme should read");
+    assert!(
+        readme.contains("This command only stages a reversible local bundle"),
+        "{readme}"
+    );
+    if cfg!(windows) {
+        assert_eq!(first_report["service_manager"], "windows_task_scheduler");
+        assert!(first_report["service_definition_path"].is_null());
+        let helper_paths = first_report["helper_paths"]
+            .as_array()
+            .expect("helper_paths should be present");
+        assert_eq!(helper_paths.len(), 2, "{first_report}");
+        for helper_path in helper_paths {
+            assert!(
+                PathBuf::from(helper_path.as_str().expect("helper path should be string"))
+                    .is_file(),
+                "{first_report}"
+            );
+        }
+    } else if cfg!(target_os = "macos") {
+        assert_eq!(first_report["service_manager"], "launchd_agent");
+        assert!(
+            first_report["service_definition_path"]
+                .as_str()
+                .is_some_and(|path| PathBuf::from(path).is_file()),
+            "{first_report}"
+        );
+    } else {
+        assert_eq!(first_report["service_manager"], "systemd_user");
+        assert!(
+            first_report["service_definition_path"]
+                .as_str()
+                .is_some_and(|path| PathBuf::from(path).is_file()),
+            "{first_report}"
+        );
+    }
+
+    let status_text_output = Command::new(common::openyak_binary())
+        .args(["server", "status"])
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("server status should run after install");
+    assert!(
+        status_text_output.status.success(),
+        "server status should succeed after install"
+    );
+    let status_stdout =
+        String::from_utf8(status_text_output.stdout).expect("status stdout should be utf8");
+    assert!(
+        status_stdout.contains("Install status   bundle_staged"),
+        "{status_stdout}"
+    );
+    assert!(
+        status_stdout.contains(&format!("Install root     {}", install_root.display())),
+        "{status_stdout}"
+    );
+    assert!(
+        status_stdout.contains("Install activate "),
+        "{status_stdout}"
+    );
+    assert!(
+        status_stdout.contains("Install remove   "),
+        "{status_stdout}"
+    );
+
+    let status_json_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "status"])
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("json server status should run after install");
+    assert!(
+        status_json_output.status.success(),
+        "json server status should succeed after install"
+    );
+    let status_report: Value =
+        serde_json::from_slice(&status_json_output.stdout).expect("status json should parse");
+    assert_eq!(status_report["status"], "not_running");
+    assert_eq!(status_report["install"]["status"], "bundle_staged");
+    assert_eq!(
+        status_report["install"]["install_root"],
+        install_root.display().to_string()
+    );
+    assert_eq!(
+        status_report["install"]["readme_path"],
+        readme_path.display().to_string()
+    );
+    assert_eq!(
+        status_report["install"]["manifest_path"],
+        manifest_path.display().to_string()
+    );
+    assert!(
+        status_report["install"]["activation_commands"]
+            .as_array()
+            .is_some_and(|commands| !commands.is_empty()),
+        "{status_report}"
+    );
+
+    let second_output = Command::new(common::openyak_binary())
+        .args(["server", "install"])
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("second server install should run");
+    assert!(
+        second_output.status.success(),
+        "second server install should succeed"
+    );
+    let second_stdout = String::from_utf8(second_output.stdout).expect("stdout should be utf8");
+    assert!(
+        second_stdout.contains("Status           bundle_staged"),
+        "{second_stdout}"
+    );
+    assert!(
+        second_stdout.contains("Replaced bundle  yes"),
+        "{second_stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&config_home);
+}
+
+#[test]
+fn openyak_server_status_rejects_tampered_install_paths() {
+    let workspace = unique_temp_dir("openyak-server-install-path-tamper");
+    let config_home = unique_temp_dir("openyak-server-install-path-tamper-home");
+    let forged_root = unique_temp_dir("openyak-server-install-forged-root");
+    std::fs::create_dir_all(&workspace).expect("workspace should create");
+    std::fs::create_dir_all(&config_home).expect("config home should create");
+
+    let install_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "install"])
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("server install should run");
+    assert!(
+        install_output.status.success(),
+        "server install should succeed: {}",
+        String::from_utf8_lossy(&install_output.stderr)
+    );
+    let install_report: Value =
+        serde_json::from_slice(&install_output.stdout).expect("install report should parse");
+    let manifest_path = PathBuf::from(
+        install_report["manifest_path"]
+            .as_str()
+            .expect("install manifest path should exist"),
+    );
+
+    let mut manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path).expect("manifest should read"),
+    )
+    .expect("manifest should parse");
+    manifest["install_root"] = Value::String(forged_root.display().to_string());
+    manifest["manifest_path"] = Value::String(
+        forged_root
+            .join("install-manifest.json")
+            .display()
+            .to_string(),
+    );
+    manifest["readme_path"] = Value::String(forged_root.join("README.txt").display().to_string());
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).expect("manifest should serialize"),
+    )
+    .expect("tampered manifest should write");
+
+    let status_text_output = Command::new(common::openyak_binary())
+        .args(["server", "status"])
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("server status should run after tamper");
+    assert!(
+        status_text_output.status.success(),
+        "server status should still succeed after tamper"
+    );
+    let status_stdout =
+        String::from_utf8(status_text_output.stdout).expect("status stdout should be utf8");
+    assert!(
+        status_stdout.contains("Install status   invalid_manifest"),
+        "{status_stdout}"
+    );
+    assert!(
+        status_stdout.contains(&format!("Install manifest {}", manifest_path.display())),
+        "{status_stdout}"
+    );
+
+    let status_json_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "status"])
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("json server status should run after tamper");
+    assert!(
+        status_json_output.status.success(),
+        "json server status should still succeed after tamper"
+    );
+    let status_report: Value =
+        serde_json::from_slice(&status_json_output.stdout).expect("status report should parse");
+    assert_eq!(status_report["install"]["status"], "invalid_manifest");
+    assert_eq!(
+        status_report["install"]["manifest_path"],
+        manifest_path.display().to_string()
+    );
+    assert!(
+        status_report["install"]["problem"]
+            .as_str()
+            .is_some_and(|problem| problem.contains("install_root")),
+        "{status_report}"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&config_home);
+    let _ = std::fs::remove_dir_all(&forged_root);
+}
+
+#[test]
+fn openyak_server_status_rejects_missing_install_artifacts() {
+    let workspace = unique_temp_dir("openyak-server-install-artifact-tamper");
+    let config_home = unique_temp_dir("openyak-server-install-artifact-tamper-home");
+    std::fs::create_dir_all(&workspace).expect("workspace should create");
+    std::fs::create_dir_all(&config_home).expect("config home should create");
+
+    let install_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "install"])
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("server install should run");
+    assert!(
+        install_output.status.success(),
+        "server install should succeed: {}",
+        String::from_utf8_lossy(&install_output.stderr)
+    );
+    let install_report: Value =
+        serde_json::from_slice(&install_output.stdout).expect("install report should parse");
+    let readme_path = PathBuf::from(
+        install_report["readme_path"]
+            .as_str()
+            .expect("install readme path should exist"),
+    );
+    std::fs::remove_file(&readme_path).expect("readme should remove");
+
+    let status_json_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "status"])
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("json server status should run after artifact removal");
+    assert!(
+        status_json_output.status.success(),
+        "json server status should still succeed after artifact removal"
+    );
+    let status_report: Value =
+        serde_json::from_slice(&status_json_output.stdout).expect("status report should parse");
+    assert_eq!(status_report["install"]["status"], "invalid_manifest");
+    assert!(
+        status_report["install"]["problem"]
+            .as_str()
+            .is_some_and(|problem| problem.contains(&readme_path.display().to_string())),
+        "{status_report}"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&config_home);
 }
 
 #[test]
@@ -470,13 +1054,16 @@ fn openyak_server_start_detached_launches_local_server() {
     let pid = report["pid"]
         .as_u64()
         .expect("started report should include pid");
-    assert_eq!(report["contract"]["truth_layer"], "daemon_local_v1");
-    assert_eq!(
-        report["contract"]["operator_plane"],
-        "local_loopback_operator_v1"
+    assert_daemon_local_thread_contract(&report);
+    assert_lifecycle_status(&report, "started");
+    assert_lifecycle_has_no_recovery(&report);
+    assert_disabled_mcp_capability(&report);
+    assert!(
+        report["recommended_actions"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{report}"
     );
-    assert_eq!(report["contract"]["persistence"], "workspace_sqlite_v1");
-    assert_eq!(report["contract"]["attach_api"], "/v1/threads");
     let address = base_url
         .strip_prefix("http://")
         .expect("base_url should be http");
@@ -517,6 +1104,49 @@ fn openyak_server_start_detached_launches_local_server() {
     assert_eq!(status_report["status"], "running");
     assert_eq!(status_report["pid"], pid);
     assert_eq!(status_report["base_url"], base_url);
+}
+
+#[test]
+fn openyak_server_start_detached_text_reports_operator_contract() {
+    let workspace = DetachedWorkspaceGuard::new("openyak-server-start-detached-text-contract");
+
+    let output = Command::new(common::openyak_binary())
+        .args(["server", "start", "--detach"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("server start --detach should run");
+    assert!(
+        output.status.success(),
+        "server start --detach should succeed"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("Local thread server start"), "{stdout}");
+    assert!(stdout.contains("Status           started"), "{stdout}");
+    assert!(
+        stdout.contains("Base URL         http://127.0.0.1:"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Truth layer      daemon_local_v1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Operator plane   local_loopback_operator_v1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Persistence      workspace_sqlite_v1"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Attach API       /v1/threads"), "{stdout}");
+    assert!(stdout.contains("Lifecycle        started"), "{stdout}");
+    assert!(stdout.contains("MCP capability   disabled"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "Scope            local-only detached start action; broader daemon lifecycle controls remain unshipped"
+        ),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -654,6 +1284,38 @@ fn openyak_server_start_detached_rejects_unsafe_registration() {
     )
     .expect("thread server info should write");
 
+    let json_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "start", "--detach"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("detached start json should run");
+    assert!(
+        !json_output.status.success(),
+        "detached start should reject unsafe discovery"
+    );
+    let report: Value =
+        serde_json::from_slice(&json_output.stdout).expect("start json should parse");
+    assert_eq!(report["status"], "invalid_registration");
+    assert_missing_thread_contract(&report);
+    assert_lifecycle_status(&report, "invalid_registration");
+    assert_eq!(
+        report["lifecycle"]["failure_kind"],
+        "daemon_local_invalid_registration"
+    );
+    assert_eq!(
+        report["lifecycle"]["recovery"]["recovery_kind"],
+        "manual_repair_required"
+    );
+    assert_disabled_mcp_capability(&report);
+    assert!(
+        report["recommended_actions"]
+            .as_array()
+            .is_some_and(|actions| actions.iter().any(|value| value
+                .as_str()
+                .is_some_and(|action| action.contains("openyak server start --detach")))),
+        "{report}"
+    );
+
     let output = Command::new(common::openyak_binary())
         .args(["server", "start", "--detach"])
         .current_dir(workspace.workspace())
@@ -666,6 +1328,17 @@ fn openyak_server_start_detached_rejects_unsafe_registration() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(
         stdout.contains("Status           invalid_registration"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Lifecycle        invalid_registration"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("MCP capability   disabled"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "Scope            local-only detached start action; broader daemon lifecycle controls remain unshipped"
+        ),
         "{stdout}"
     );
     assert!(
@@ -691,6 +1364,10 @@ fn openyak_server_recover_reports_nothing_to_recover_without_persisted_truth() {
     assert_eq!(report["recovery_kind"], "no_persisted_truth");
     assert_eq!(report["reachable"], false);
     assert_eq!(report["state_db_present"], false);
+    assert_missing_thread_contract(&report);
+    assert_lifecycle_status(&report, "nothing_to_recover");
+    assert_lifecycle_has_no_recovery(&report);
+    assert_disabled_mcp_capability(&report);
     assert!(
         report["recommended_actions"]
             .as_array()
@@ -700,6 +1377,37 @@ fn openyak_server_recover_reports_nothing_to_recover_without_persisted_truth() {
                 .as_str()
                 .is_some_and(|line| line.contains("openyak server start --detach"))),
         "{report}"
+    );
+
+    let text_output = Command::new(common::openyak_binary())
+        .args(["server", "recover"])
+        .current_dir(&workspace)
+        .output()
+        .expect("server recover text should run");
+    assert!(
+        text_output.status.success(),
+        "server recover text should succeed"
+    );
+    let stdout = String::from_utf8(text_output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("Local thread server recovery"), "{stdout}");
+    assert!(
+        stdout.contains("Status           nothing_to_recover"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Recovery kind    no_persisted_truth"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Lifecycle        nothing_to_recover"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("MCP capability   disabled"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "Scope            local-only recovery action for current-workspace daemon_local_v1 thread truth"
+        ),
+        "{stdout}"
     );
 
     let _ = std::fs::remove_dir_all(workspace);
@@ -740,6 +1448,10 @@ fn openyak_server_recover_reports_nothing_to_recover_for_empty_state_db() {
     assert_eq!(report["status"], "nothing_to_recover");
     assert_eq!(report["recovery_kind"], "no_persisted_truth");
     assert_eq!(report["state_db_present"], true);
+    assert_missing_thread_contract(&report);
+    assert_lifecycle_status(&report, "nothing_to_recover");
+    assert_lifecycle_has_no_recovery(&report);
+    assert_disabled_mcp_capability(&report);
 }
 
 #[test]
@@ -788,6 +1500,16 @@ fn openyak_server_recover_reattaches_persisted_truth() {
     assert_eq!(report["status"], "recovered");
     assert_eq!(report["recovery_kind"], "reattach_persisted_truth");
     assert_eq!(report["state_db_present"], true);
+    assert_daemon_local_thread_contract(&report);
+    assert_lifecycle_status(&report, "recovered");
+    assert_lifecycle_has_no_recovery(&report);
+    assert_disabled_mcp_capability(&report);
+    assert!(
+        report["recommended_actions"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{report}"
+    );
     let base_url = report["base_url"]
         .as_str()
         .expect("recover report should include base_url");
@@ -859,6 +1581,10 @@ fn openyak_server_recover_clears_stale_registration_and_restores_server() {
     assert_eq!(report["status"], "recovered");
     assert_eq!(report["recovery_kind"], "clear_stale_and_restart");
     assert_eq!(report["stale_registration_cleared"], true);
+    assert_daemon_local_thread_contract(&report);
+    assert_lifecycle_status(&report, "recovered");
+    assert_lifecycle_has_no_recovery(&report);
+    assert_disabled_mcp_capability(&report);
     assert_ne!(report["base_url"], "http://127.0.0.1:9");
     let performed_actions = report["performed_actions"]
         .as_array()
@@ -884,6 +1610,66 @@ fn openyak_server_recover_clears_stale_registration_and_restores_server() {
 }
 
 #[test]
+fn openyak_server_recover_text_reports_operator_contract_after_stale_restart() {
+    let workspace = DetachedWorkspaceGuard::new("openyak-server-recover-stale-text-contract");
+    let openyak_dir = workspace.workspace().join(".openyak");
+    std::fs::create_dir_all(&openyak_dir).expect("openyak dir should create");
+    std::fs::write(
+        openyak_dir.join("thread-server.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "baseUrl": "http://127.0.0.1:9",
+            "pid": 4242_u32,
+            "truthLayer": "daemon_local_v1",
+            "operatorPlane": "local_loopback_operator_v1",
+            "persistence": "workspace_sqlite_v1",
+            "attachApi": "/v1/threads",
+            "operatorToken": "fixture-token"
+        }))
+        .expect("thread server info should serialize"),
+    )
+    .expect("thread server info should write");
+
+    let output = Command::new(common::openyak_binary())
+        .args(["server", "recover"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("server recover should run");
+    assert!(output.status.success(), "server recover should succeed");
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("Local thread server recovery"), "{stdout}");
+    assert!(stdout.contains("Status           recovered"), "{stdout}");
+    assert!(
+        stdout.contains("Recovery kind    clear_stale_and_restart"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Truth layer      daemon_local_v1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Operator plane   local_loopback_operator_v1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Persistence      workspace_sqlite_v1"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Attach API       /v1/threads"), "{stdout}");
+    assert!(stdout.contains("Lifecycle        recovered"), "{stdout}");
+    assert!(stdout.contains("MCP capability   disabled"), "{stdout}");
+    assert!(
+        stdout.contains("Did              cleared the stale workspace discovery record"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "Scope            local-only recovery action for current-workspace daemon_local_v1 thread truth"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn openyak_server_recover_rejects_unsafe_registration() {
     let workspace = DetachedWorkspaceGuard::new("openyak-server-recover-unsafe");
     let openyak_dir = workspace.workspace().join(".openyak");
@@ -904,6 +1690,39 @@ fn openyak_server_recover_rejects_unsafe_registration() {
     )
     .expect("thread server info should write");
 
+    let json_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "recover"])
+        .current_dir(workspace.workspace())
+        .output()
+        .expect("server recover json should run");
+    assert!(
+        !json_output.status.success(),
+        "server recover should reject unsafe discovery"
+    );
+    let report: Value =
+        serde_json::from_slice(&json_output.stdout).expect("recover json should parse");
+    assert_eq!(report["status"], "invalid_registration");
+    assert_eq!(report["recovery_kind"], "manual_repair_required");
+    assert_missing_thread_contract(&report);
+    assert_lifecycle_status(&report, "invalid_registration");
+    assert_eq!(
+        report["lifecycle"]["failure_kind"],
+        "daemon_local_invalid_registration"
+    );
+    assert_eq!(
+        report["lifecycle"]["recovery"]["recovery_kind"],
+        "manual_repair_required"
+    );
+    assert_disabled_mcp_capability(&report);
+    assert!(
+        report["recommended_actions"]
+            .as_array()
+            .is_some_and(|actions| actions.iter().any(|value| value
+                .as_str()
+                .is_some_and(|action| action.contains("openyak server start --detach")))),
+        "{report}"
+    );
+
     let output = Command::new(common::openyak_binary())
         .args(["server", "recover"])
         .current_dir(workspace.workspace())
@@ -916,6 +1735,21 @@ fn openyak_server_recover_rejects_unsafe_registration() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(
         stdout.contains("Status           invalid_registration"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Recovery kind    manual_repair_required"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Lifecycle        invalid_registration"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("MCP capability   disabled"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "Scope            local-only recovery action for current-workspace daemon_local_v1 thread truth"
+        ),
         "{stdout}"
     );
     assert!(
@@ -945,6 +1779,27 @@ fn openyak_server_stop_stops_running_local_server() {
         "{stdout}"
     );
     assert!(stdout.contains("Discovery clear  yes"), "{stdout}");
+    assert!(
+        stdout.contains("Truth layer      daemon_local_v1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Operator plane   local_loopback_operator_v1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Persistence      workspace_sqlite_v1"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Attach API       /v1/threads"), "{stdout}");
+    assert!(stdout.contains("Lifecycle        stopped"), "{stdout}");
+    assert!(stdout.contains("MCP capability   disabled"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "Scope            local-only stop action; broader daemon lifecycle controls remain unshipped"
+        ),
+        "{stdout}"
+    );
 
     child.wait_for_exit();
     assert!(
@@ -964,8 +1819,45 @@ fn openyak_server_stop_stops_running_local_server() {
     let report: Value =
         serde_json::from_slice(&json_output.stdout).expect("json server stop should parse");
     assert_eq!(report["status"], "already_stopped");
+    assert_missing_thread_contract(&report);
+    assert_lifecycle_status(&report, "already_stopped");
+    assert_lifecycle_has_no_recovery(&report);
+    assert_disabled_mcp_capability(&report);
 
     drop(child);
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn openyak_server_stop_json_reports_operator_contract_for_running_server() {
+    let workspace = unique_temp_dir("openyak-server-stop-running-json");
+    std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+    let mut child = ChildGuard::spawn_in(workspace.clone(), false);
+    let _address = child.advertised_address();
+
+    let output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "stop"])
+        .current_dir(child.workspace())
+        .output()
+        .expect("server stop should run");
+    assert!(output.status.success(), "server stop should succeed");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("stop json should parse");
+    assert_eq!(report["status"], "stopped");
+    assert_eq!(report["discovery_cleared"], true);
+    assert_eq!(report["reachable_before_stop"], true);
+    assert_daemon_local_thread_contract(&report);
+    assert_lifecycle_status(&report, "stopped");
+    assert_lifecycle_has_no_recovery(&report);
+    assert_disabled_mcp_capability(&report);
+    assert!(
+        report["recommended_actions"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{report}"
+    );
+
+    child.wait_for_exit();
     let _ = std::fs::remove_dir_all(workspace);
 }
 
@@ -973,6 +1865,29 @@ fn openyak_server_stop_stops_running_local_server() {
 fn openyak_server_stop_is_idempotent_without_running_server() {
     let workspace = unique_temp_dir("openyak-server-stop-missing");
     std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+    let json_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "stop"])
+        .current_dir(&workspace)
+        .output()
+        .expect("json server stop should run");
+    assert!(
+        json_output.status.success(),
+        "json server stop should succeed"
+    );
+    let report: Value =
+        serde_json::from_slice(&json_output.stdout).expect("stop json should parse");
+    assert_eq!(report["status"], "already_stopped");
+    assert_missing_thread_contract(&report);
+    assert_lifecycle_status(&report, "already_stopped");
+    assert_lifecycle_has_no_recovery(&report);
+    assert_disabled_mcp_capability(&report);
+    assert!(
+        report["recommended_actions"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{report}"
+    );
 
     let output = Command::new(common::openyak_binary())
         .args(["server", "stop"])
@@ -985,6 +1900,17 @@ fn openyak_server_stop_is_idempotent_without_running_server() {
         stdout.contains("Status           already_stopped"),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("Lifecycle        already_stopped"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("MCP capability   disabled"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "Scope            local-only stop action; broader daemon lifecycle controls remain unshipped"
+        ),
+        "{stdout}"
+    );
 
     let _ = std::fs::remove_dir_all(workspace);
 }
@@ -994,20 +1920,52 @@ fn openyak_server_stop_clears_stale_registration() {
     let workspace = unique_temp_dir("openyak-server-stop-stale");
     let openyak_dir = workspace.join(".openyak");
     std::fs::create_dir_all(&openyak_dir).expect("openyak dir should create");
-    std::fs::write(
-        openyak_dir.join("thread-server.json"),
-        serde_json::to_string_pretty(&serde_json::json!({
-            "baseUrl": "http://127.0.0.1:9",
-            "pid": 4242_u32,
-            "truthLayer": "daemon_local_v1",
-            "operatorPlane": "local_loopback_operator_v1",
-            "persistence": "workspace_sqlite_v1",
-            "attachApi": "/v1/threads",
-            "operatorToken": "fixture-token"
-        }))
-        .expect("thread server info should serialize"),
-    )
-    .expect("thread server info should write");
+    let stale_record = serde_json::to_string_pretty(&serde_json::json!({
+        "baseUrl": "http://127.0.0.1:9",
+        "pid": 4242_u32,
+        "truthLayer": "daemon_local_v1",
+        "operatorPlane": "local_loopback_operator_v1",
+        "persistence": "workspace_sqlite_v1",
+        "attachApi": "/v1/threads",
+        "operatorToken": "fixture-token"
+    }))
+    .expect("thread server info should serialize");
+    std::fs::write(openyak_dir.join("thread-server.json"), &stale_record)
+        .expect("thread server info should write");
+
+    let json_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "stop"])
+        .current_dir(&workspace)
+        .output()
+        .expect("json server stop should run");
+    assert!(
+        json_output.status.success(),
+        "json server stop should succeed"
+    );
+    let report: Value =
+        serde_json::from_slice(&json_output.stdout).expect("json stop should parse");
+    assert_eq!(report["status"], "stale_registration_cleared");
+    assert_eq!(report["discovery_cleared"], true);
+    assert_eq!(report["reachable_before_stop"], false);
+    assert_daemon_local_thread_contract(&report);
+    assert_lifecycle_status(&report, "stale_registration_cleared");
+    assert_lifecycle_has_no_recovery(&report);
+    assert_disabled_mcp_capability(&report);
+    assert!(
+        report["recommended_actions"]
+            .as_array()
+            .is_some_and(|actions| actions.iter().any(|value| value
+                .as_str()
+                .is_some_and(|action| action.contains("openyak server start --detach")))),
+        "{report}"
+    );
+    assert!(
+        !openyak_dir.join("thread-server.json").exists(),
+        "stale stop should clear the discovery file"
+    );
+
+    std::fs::write(openyak_dir.join("thread-server.json"), &stale_record)
+        .expect("thread server info should rewrite");
 
     let output = Command::new(common::openyak_binary())
         .args(["server", "stop"])
@@ -1018,6 +1976,19 @@ fn openyak_server_stop_clears_stale_registration() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(
         stdout.contains("Status           stale_registration_cleared"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Lifecycle        stale_registration_cleared"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("MCP capability   disabled"), "{stdout}");
+    assert!(
+        stdout.contains("Truth layer      daemon_local_v1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Try              start `openyak server start --detach --bind 127.0.0.1:0` in this workspace if you want a new local thread server"),
         "{stdout}"
     );
     assert!(
@@ -1049,6 +2020,30 @@ fn openyak_server_stop_rejects_unsafe_registration() {
     )
     .expect("thread server info should write");
 
+    let json_output = Command::new(common::openyak_binary())
+        .args(["--output-format", "json", "server", "stop"])
+        .current_dir(&workspace)
+        .output()
+        .expect("json server stop should run");
+    assert!(
+        !json_output.status.success(),
+        "server stop should reject unsafe discovery"
+    );
+    let report: Value =
+        serde_json::from_slice(&json_output.stdout).expect("stop json should parse");
+    assert_eq!(report["status"], "invalid_registration");
+    assert_missing_thread_contract(&report);
+    assert_lifecycle_status(&report, "invalid_registration");
+    assert_eq!(
+        report["lifecycle"]["failure_kind"],
+        "daemon_local_invalid_registration"
+    );
+    assert_eq!(
+        report["lifecycle"]["recovery"]["recovery_kind"],
+        "manual_repair_required"
+    );
+    assert_disabled_mcp_capability(&report);
+
     let output = Command::new(common::openyak_binary())
         .args(["server", "stop"])
         .current_dir(&workspace)
@@ -1063,6 +2058,11 @@ fn openyak_server_stop_rejects_unsafe_registration() {
         stdout.contains("Status           invalid_registration"),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("Lifecycle        invalid_registration"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("MCP capability   disabled"), "{stdout}");
     assert!(
         discovery_path.exists(),
         "unsafe discovery should remain for manual inspection"
@@ -1115,6 +2115,11 @@ fn openyak_server_stop_rejects_reachable_listener_with_mismatched_pid() {
         stdout.contains("Status           invalid_registration"),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("Lifecycle        invalid_registration"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("MCP capability   disabled"), "{stdout}");
     assert!(stdout.contains("reported pid"), "{stdout}");
     assert!(
         discovery_path.exists(),

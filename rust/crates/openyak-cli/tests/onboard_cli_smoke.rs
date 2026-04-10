@@ -57,6 +57,10 @@ fn openyak_onboard_fails_safely_without_a_tty() {
     assert!(stdout.contains("openyak init"));
     assert!(stdout.contains("openyak doctor"));
     assert!(stdout.contains("Local daemon"), "{stdout}");
+    assert!(
+        stdout.contains("openyak server install --bind 127.0.0.1:0"),
+        "{stdout}"
+    );
     assert!(stdout.contains("openyak server start --detach"), "{stdout}");
     assert!(stdout.contains("openyak server status"), "{stdout}");
     assert!(
@@ -67,6 +71,47 @@ fn openyak_onboard_fails_safely_without_a_tty() {
         !workspace.join(".openyak.json").exists(),
         "non-interactive onboarding must not initialize the repo"
     );
+
+    fs::remove_dir_all(root).expect("cleanup temp dir should succeed");
+}
+
+#[test]
+fn openyak_onboard_mentions_staged_install_bundle_guidance_without_a_tty() {
+    let root = unique_temp_dir("openyak-onboard-install-bundle");
+    let workspace = root.join("workspace");
+    let config_home = root.join("openyak-home");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+
+    let install_output = Command::new(common::openyak_binary())
+        .args(["server", "install", "--bind", "127.0.0.1:0"])
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("server install should run");
+    assert!(
+        install_output.status.success(),
+        "server install should succeed: {}",
+        String::from_utf8_lossy(&install_output.stderr)
+    );
+
+    let output = Command::new(common::openyak_binary())
+        .arg("onboard")
+        .current_dir(&workspace)
+        .env("OPENYAK_CONFIG_HOME", &config_home)
+        .output()
+        .expect("onboard should run");
+
+    assert!(
+        !output.status.success(),
+        "onboard should fail without a tty"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        stdout.contains("bundle-only") && stdout.contains("staged at"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("README.txt"), "{stdout}");
 
     fs::remove_dir_all(root).expect("cleanup temp dir should succeed");
 }

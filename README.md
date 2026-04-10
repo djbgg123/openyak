@@ -6,16 +6,19 @@
 
 [`快速开始`](#快速开始) · [`公开仓库基线`](#公开仓库基线) · [`Fresh Clone 最小复现`](#fresh-clone-最小复现) · [`当前状态`](#当前状态) · [`仓库结构`](#仓库结构) · [`Rust 工作区说明`](./rust/README.md) · [`0.1.0 发布说明`](./rust/docs/releases/0.1.0.md) · [`贡献指南`](./CONTRIBUTING.md) · [`安全策略`](./SECURITY.md) · [`行为准则`](./CODE_OF_CONDUCT.md) · [`许可证`](./LICENSE)
 
-最近一次全量文档与命令面对齐完成于 `2026-04-10`。本文内容已对照当前 `openyak --help` / `openyak skills help` / `openyak foundations --help` / `openyak server --help`、`2026-04-10` 完成的 fresh release-binary 全量直接命令矩阵（本轮包含 47 个 release-binary help/命令/子命令步骤，并补做 REPL、server API 与恢复路径复核）以及 CLI smoke/regression rerun 更新；仓库级全量验证基线仍以 Rust、根目录 Python、Python SDK、TypeScript SDK 四条本地链路为准。
+最近一次全量文档与命令面对齐完成于 `2026-04-10`。本文内容已对照当前 `openyak --help` / `openyak skills help` / `openyak foundations --help` / `openyak server --help`、`2026-04-10` 完成的 fresh release-binary 全量直接命令矩阵（本轮包含 48 个 release-binary help/命令/子命令步骤，并补做 REPL、server API、bundle-only service install 与恢复路径复核）以及 CLI smoke/regression rerun 更新；仓库级全量验证基线仍以 Rust、根目录 Python、Python SDK、TypeScript SDK 四条本地链路为准。
 
 ## 一眼看懂
 
 - 主产品实现面是 `rust/`，可直接构建、运行并打包 `openyak` CLI。
 - 当前主线已接通 REPL、单次 prompt、skills/agents、`openyak doctor`、`openyak foundations`、`openyak onboard`、`openyak package-release` 和 `openyak server`。
 - `openyak server` 是 local-only 的 thread/session HTTP/SSE server，当前公共协议边界锁定在 `/v1/threads`；它不是 hosted control plane，也不是 codex-style full app-server。
-- daemon/control-plane roadmap 当前仍处于 local-first 演进阶段：现有 `/v1/threads` 服务已经把线程状态持久化到工作区 `.openyak/state.sqlite3`，并会在 server 重启后把中断中的线程恢复成带 `recovery_note` 的 `interrupted` 快照；当前 thread contract 已显式标注 `truth_layer = daemon_local_v1`、`attach_api = /v1/threads`。当前已经发货 `openyak server start --detach` / `status` / `stop` / `recover` 这组 local-only operator 命令，但它们仍只覆盖当前工作区 thread truth，不是更宽的 hosted / remote control plane。
+- daemon/control-plane roadmap 当前仍处于 local-first 演进阶段：现有 `/v1/threads` 服务已经把线程状态持久化到工作区 `.openyak/state.sqlite3`，并会在 server 重启后把中断中的线程恢复成带 `recovery_note` 的 `interrupted` 快照；当前 thread contract 已显式标注 `truth_layer = daemon_local_v1`、`attach_api = /v1/threads`。当前已经发货 `openyak server install` / `start --detach` / `status` / `stop` / `recover` 这组 local-only operator 命令；其中 `install` 只会在 `OPENYAK_CONFIG_HOME` 下生成 user-scoped、可逆的 service bundle 与显式激活/移除命令，不会自动注册平台 daemon，也不是更宽的 hosted / remote control plane。
+- `openyak server status` 现在会同时回显 daemon discovery truth 和 install bundle truth：可以区分 missing / bundle_staged / invalid_manifest，并在 JSON 输出中提供 machine-readable install metadata。
+- `openyak server status` 现在也会回显 local MCP operator bootstrap truth：`capabilities.mcp` 会显式区分 `ready` / `auth_required` / `degraded` / `disabled`，并列出每个 configured MCP server 的 transport、auth_state，以及顶层 recommended_actions；这是一层 local bootstrap/readiness 观察，不是假装已经建立了 live MCP session。
+- `openyak server start --detach` / `recover` / `stop` 现在已经对齐同一套稳定的 text/json operator 输出：都会回显 `contract`、`lifecycle` 与 local bootstrap `capabilities.mcp`；其中 `stop_failed` 会映射为 typed local recovery metadata（`failure_kind = daemon_local_stop_failed`、`recovery_kind = inspect_error_and_retry`），用于本地诊断与重试分流，而不是把 stop 失败误讲成更宽的远程控制面语义。
 - `sdk/python` 和 `sdk/typescript` 是 attach-first、本地-only 的 alpha SDK，直接连接当前 `/v1/threads` 协议。
-- 最近一次 fresh release-binary 命令面巡检完成于 `2026-04-10`；当前直接命令矩阵包含 47 个真实 release-binary help/命令/子命令步骤，并额外复核了 `--version`、skills lifecycle 子命令、REPL `/help -> /exit`、detached/foreground server 生命周期、`/v1/threads` 与 legacy `/sessions/{id}` 恢复路径、打包后二进制 `--help`，以及环境依赖路径的受控失败。
+- 最近一次 fresh release-binary 命令面巡检完成于 `2026-04-10`；当前直接命令矩阵包含 48 个真实 release-binary help/命令/子命令步骤，并额外复核了 `--version`、skills lifecycle 子命令、REPL `/help -> /exit`、bundle-only `server install`、detached/foreground server 生命周期、`/v1/threads` 与 legacy `/sessions/{id}` 恢复路径、打包后二进制 `--help`，以及环境依赖路径的受控失败。
 
 ## 30 秒开始
 
@@ -24,6 +27,7 @@ cd rust
 cargo build --release -p openyak-cli
 cargo run --bin openyak -- --help
 cargo run --bin openyak -- doctor
+cargo run --bin openyak -- server install --bind 127.0.0.1:0
 cargo run --bin openyak -- server start --detach --bind 127.0.0.1:0
 cargo run --bin openyak -- server status
 ```
@@ -117,6 +121,7 @@ cd ../..
 - 当前 thread persistence / restart-recovery 只覆盖 thread 级 attach-first 状态：当 server 在 run 中途重启时，线程会恢复为 `interrupted` 并带 `recovery_note`，同时通过结构化 `recovery.failure_kind` / `recovery.recovery_kind` / `recovery.recommended_actions` 暴露恢复 guidance；这为后续 daemon/control-plane 路线提供恢复原语，但还没有把 Task / Team / Cron 等 foundation slices 提升成 daemon-backed orchestration truth。
 - 面向 operator 的真值标签当前必须分开理解：thread snapshot 使用 `truth_layer = daemon_local_v1` 且 `attach_api = /v1/threads`；Task / Team / Cron foundation 仍明确保留 `origin = process_local_v1`，只表示当前 runtime 进程内的临时 registry metadata。
 - thread/session operator surface 现在还会回显 `operator_plane = local_loopback_operator_v1` 与 `persistence = workspace_sqlite_v1`；这组 contract/recovery schema 只描述 `/v1/threads` attach-first truth，不代表 foundation registries 获得 daemon lifecycle store。
+- `openyak server start --detach` / `recover` / `stop` 现在也共用同一套 operator-facing `contract` / `lifecycle` / `capabilities.mcp` schema；其中 `stop_failed` 会显式回传 `failure_kind = daemon_local_stop_failed` 与 `recovery_kind = inspect_error_and_retry`，方便 CLI 和脚本把本地 stop 失败归到可重试/需诊断的恢复分支，而不是把它混成 live MCP session 或远程 daemon 错误。
 - 同一工作区存在重叠生命周期的多个 `openyak server` 实例时，本地 thread discovery 文件会按写入 `pid` 做 owner-safe 清理；较早退出的实例不会再误删较新实例的发现入口。
 - thread/session 工具现在会同时尝试当前工作区路径和 canonical 工作区路径下的 thread discovery 文件；通过 symlink、junction 或其他等价路径进入同一工作区时，仍能发现正在运行的本地 `openyak server`。
 - 已新增 attach-first、本地-only 的 SDK alpha：
@@ -127,7 +132,8 @@ cd ../..
 - `openyak login` 不再内置默认 OAuth 站点，OAuth 后端必须由你在 `settings.oauth` 中显式配置，并已支持 `manualRedirectUrl` 手动回调模式。
 - OAuth token 现在优先写系统凭据库；只有系统凭据库不可用时才回退到用户配置目录下的 `credentials.json`，并在支持的平台上以受限权限落盘。
 - 当 `settings.oauth.tokenUrl` 或 provider `baseUrl` 指向 `localhost` / loopback IP 时，CLI 会显式绕过继承的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`，避免本地 OAuth token exchange 或本地 gateway 调用被宿主代理劫持。
-- `openyak doctor` 已提供本地只读的 config/auth/runtime 健康检查，可直接指出常见的设置缺口和修复方向。
+- `openyak doctor` 已提供本地只读的 config/auth/runtime 健康检查，可直接指出常见的设置缺口和修复方向，并会把当前 workspace 的 local daemon install/start/recover 路径一起回显出来。
+- 当 workspace local daemon 可达、但 `capabilities.mcp` 仍处于 `auth_required` 或 `degraded` 时，`openyak doctor` 会把它降级为 warning，并复用 `openyak server status` 同一条 bootstrap capability truth 给出 MCP auth/config 修复提示。
 - `openyak doctor` 现在会尊重全局 `--model`；用 OpenAI-compatible 环境变量跑 `openyak --model <openai-family-model> doctor` 时，会检查与 prompt / REPL / GitHub workflow 相同的活动模型鉴权路径。
 - `openyak foundations [task|team|cron|lsp|mcp]` 与 `openyak /foundations [task|team|cron|lsp|mcp]` 已提供只读的 operator discovery surface，用于解释当前 Task / Team / Cron / LSP / MCP 五族的 tool membership 与边界，而不把它们伪装成更宽的控制面。
 - 当前还支持从本地 `toolProfiles` 配置中选择命名 tool profile，通过 `openyak --tool-profile <name> ...` 收窄当前 REPL 或单次 prompt 的 permission mode / allowed-tools ceiling；这一层仍然是 process-local、session transcript-only，且 sandbox 额外约束只对 `bash` 生效。
@@ -136,7 +142,7 @@ cd ../..
 - `/pr` 现在会基于当前分支相对默认分支的 diff 生成标题和正文，避免把纯工作区噪音误当成 PR 真值。
 - 编译产物的子命令 `--help` 语义已统一，不再错误地执行实际动作。
 - `/diff` 现在会正确显示未跟踪文件，同时继续排除 `.openyak/settings.local.json`、`.openyak/sessions/` 等本地状态噪音。
-- 最近一轮 fresh release-binary CLI command-surface 巡检已在 `2026-04-10` 再次执行：当前直接命令矩阵包含 47 个 release-binary help/命令/子命令步骤，并额外复核了 `--version`、skills lifecycle 子命令、REPL `/help -> /exit`、bare `openyak "..."` prompt fallback、`doctor` 对运行中本地 daemon 的 readiness 观察、empty-workspace `server recover`，以及 `/v1/threads` 与 legacy `/sessions/{id}` 的 persisted-truth / recovery 路径；对应 smoke/regression suites 也已同步重跑。
+- 最近一轮 fresh release-binary CLI command-surface 巡检已在 `2026-04-10` 再次执行：当前直接命令矩阵包含 48 个 release-binary help/命令/子命令步骤，并额外复核了 `--version`、skills lifecycle 子命令、REPL `/help -> /exit`、bare `openyak "..."` prompt fallback、bundle-only `server install`、`doctor` 对运行中本地 daemon 的 readiness 观察、empty-workspace `server recover`，以及 `/v1/threads` 与 legacy `/sessions/{id}` 的 persisted-truth / recovery 路径；对应 smoke/regression suites 也已同步重跑。
 - Python 对照层的 port session store 继续默认落在系统临时目录，并已明确拒绝 path-traversal / nested `session_id`，避免 `load-session` 或持久化读写越出会话目录。
 - 已新增 mock parity harness 基础设施、Task/Team/Cron registry-backed tool foundations、LSP/MCP registry operator surfaces，以及更强的 tool-layer permission enforcement；其中 Task/Team/Cron registry 的 V1 contract 已冻结为进程内临时状态与 metadata-first 语义。
 - 插件 manifest 的相对路径现在会做边界校验；解析后的路径必须保持在插件根目录内，不能再借由非字面量路径逃逸出插件目录。
@@ -302,7 +308,7 @@ cd rust
 cargo run --bin openyak -- onboard
 ```
 
-`openyak onboard` 只在交互式本地终端里运行；它会先做只读 readiness assessment，再按需串联 `openyak init`、用户级默认模型写入、provider-aware auth guidance / `openyak login` handoff，以及最终的 `openyak doctor`。如果在非交互终端里调用，它会直接拒绝执行并明确说明原因。
+`openyak onboard` 只在交互式本地终端里运行；它会先做只读 readiness assessment，再按需串联 `openyak init`、用户级默认模型写入、provider-aware auth guidance / `openyak login` handoff，以及最终的 `openyak doctor`。如果在非交互终端里调用，它会直接拒绝执行并明确说明原因，同时回显当前 workspace local daemon 的 install-aware handoff，包括 `openyak server install` 的 bundle path 与 `start --detach` / `status` / `recover` 下一步。
 
 ## 配置、路径与 skills 规则
 
@@ -433,14 +439,14 @@ pnpm build
 
 上述四条本地验证链路现在已经同步固化到 GitHub Actions [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)。CI 只复现这些当前可在仓库内真实执行的检查，不宣称 release/upload 已自动化完成。
 
-本次文档刷新还额外补做了一轮在 `2026-04-10` 完成的 fresh release-binary 级全量直接命令矩阵与 CLI smoke/regression rerun。当前矩阵包含 47 个直接 release-binary help/命令/子命令步骤，并额外复核 REPL、thread API 与恢复路径，覆盖：
+本次文档刷新还额外补做了一轮在 `2026-04-10` 完成的 fresh release-binary 级全量直接命令矩阵与 CLI smoke/regression rerun。当前矩阵包含 48 个直接 release-binary help/命令/子命令步骤，并额外复核 REPL、thread API、bundle-only service install 与恢复路径，覆盖：
 
 - `cargo build --manifest-path rust/Cargo.toml --workspace`
 - `cargo build --manifest-path rust/Cargo.toml --release -p openyak-cli`
 - `cargo test --manifest-path rust/Cargo.toml -p openyak-cli --test command_surface_cli_smoke --test doctor_cli_smoke --test server_cli_smoke --test onboard_cli_smoke --test package_release_cli_smoke`
 - `pnpm --dir sdk/typescript build`
 - `python -m build`（`sdk/python`）
-- 47 个直接 release-binary help/命令/子命令步骤
+- 48 个直接 release-binary help/命令/子命令步骤
 
 其中直接命令矩阵与补充复核共同覆盖了：
 
@@ -450,7 +456,7 @@ pnpm build
 - `openyak skills list|available|info|install|update|uninstall` 的 lifecycle help/parse surface
 - `openyak /agents`、`openyak /skills`、`openyak /foundations task`
 - REPL `/help` -> `/exit` 的最小交互闭环，以及 resume-safe slash batch 复核
-- `openyak server start --detach --bind 127.0.0.1:0`、`openyak server status`、`openyak server recover`、`openyak server stop`
+- `openyak server install --bind 127.0.0.1:0`、`openyak server start --detach --bind 127.0.0.1:0`、`openyak server status`、`openyak server recover`、`openyak server stop`
 - 空工作区上的 `openyak server recover` 受控无害路径，以及运行中本地 server 存在时的 `openyak doctor` readiness 观察
 - `openyak server --bind 127.0.0.1:0` 的真实启动与停服路径
 - 真实 `/v1/threads` 创建/查询与 legacy `/sessions/{id}` compatibility 读取，以及 persisted thread truth 的 restart-recovery 复核
@@ -471,7 +477,7 @@ pnpm build
 - `openyak doctor` 当前只做本地只读预检，不提供自动修复、配置迁移或远程服务探测。
 - Task/Team/Cron registry 的 V1 contract 仍然只提供进程内临时状态，不承诺跨进程持久化、恢复、租约或共享服务语义。
 - `openyak server` 当前是 bind 范围限制在 loopback 地址的本地 thread/session server，不是 codex-style full app-server 或远程控制面。
-- daemon/control-plane 路线仍未进入独立 operator plane 阶段：当前没有 daemon service install/start/stop/status/recover 的稳定 public surface，也没有远程 operator access。
+- daemon/control-plane 路线仍未进入独立 operator plane 阶段：当前已有 bundle-only 的 `openyak server install/start --detach/status/stop/recover` 本地 public surface，但 `install` 只负责 staging user-scoped service bundle，不会自动注册平台 daemon，也没有远程 operator access。
 - 当前补齐的 LSP/MCP 仍以 operator-facing bridge 为主；完整独立 LSP main entry 仍未作为稳定用户入口能力发货。
 - `0.x` 阶段的命令面和交互细节仍可能继续演进。
 
