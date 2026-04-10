@@ -13,7 +13,12 @@ from urllib.parse import urlparse
 
 import pytest
 
-from openyak_sdk import AsyncOpenyakClient, OpenyakClient, OpenyakReconnectRequiredError
+from openyak_sdk import (
+    AsyncOpenyakClient,
+    OpenyakClient,
+    OpenyakReconnectRequiredError,
+    OpenyakResyncRequiredError,
+)
 from openyak_sdk._models import RunFailedEvent
 
 from .helpers.harness import (
@@ -286,6 +291,37 @@ def test_streamed_sync_run_surfaces_reconnect_required_after_server_restart() ->
         server.close()
         mock.close()
         shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_streamed_sync_run_surfaces_live_resync_required_after_lag() -> None:
+    mock = start_mock_anthropic_service()
+    server = start_openyak_server(
+        {
+            **os.environ,
+            "ANTHROPIC_API_KEY": "test-sdk-key",
+            "ANTHROPIC_BASE_URL": mock.base_url,
+            "OPENYAK_TEST_THREAD_STREAM_DELAY_MS": "25",
+            "OPENYAK_TEST_BROADCAST_CAPACITY": "8",
+        }
+    )
+    try:
+        with OpenyakClient(base_url=server.base_url, timeout_s=30.0) as client:
+            thread = client.create_thread(model="claude-sonnet-4-6")
+
+            with thread.run_streamed("PARITY_SCENARIO:lagged_stream_resync") as streamed:
+                first = next(streamed.events)
+                assert first.type == "run.started"
+                time.sleep(0.5)
+
+                with pytest.raises(OpenyakResyncRequiredError) as error:
+                    list(streamed.events)
+
+            assert error.value.event.thread_id == thread.thread_id
+            assert error.value.event.payload.skipped > 0
+            assert error.value.event.payload.snapshot.thread_id == thread.thread_id
+    finally:
+        server.close()
+        mock.close()
 
 
 def test_attach_first_sync_stream_restart_yields_awaiting_snapshot() -> None:
@@ -821,6 +857,46 @@ def test_streamed_async_run_surfaces_reconnect_required_after_server_restart() -
             server.close()
             mock.close()
             shutil.rmtree(workspace, ignore_errors=True)
+
+    asyncio.run(case())
+
+
+def test_streamed_async_run_surfaces_live_resync_required_after_lag() -> None:
+    async def case() -> None:
+        mock = start_mock_anthropic_service()
+        server = start_openyak_server(
+            {
+                **os.environ,
+                "ANTHROPIC_API_KEY": "test-sdk-key",
+                "ANTHROPIC_BASE_URL": mock.base_url,
+                "OPENYAK_TEST_THREAD_STREAM_DELAY_MS": "25",
+                "OPENYAK_TEST_BROADCAST_CAPACITY": "8",
+            }
+        )
+        try:
+            async with AsyncOpenyakClient(
+                base_url=server.base_url,
+                timeout_s=30.0,
+            ) as client:
+                thread = await client.create_thread(model="claude-sonnet-4-6")
+
+                async with await thread.run_streamed(
+                    "PARITY_SCENARIO:lagged_stream_resync"
+                ) as streamed:
+                    first = await anext(streamed.events)
+                    assert first.type == "run.started"
+                    await asyncio.sleep(0.5)
+
+                    with pytest.raises(OpenyakResyncRequiredError) as error:
+                        async for _event in streamed.events:
+                            pass
+
+                assert error.value.event.thread_id == thread.thread_id
+                assert error.value.event.payload.skipped > 0
+                assert error.value.event.payload.snapshot.thread_id == thread.thread_id
+        finally:
+            server.close()
+            mock.close()
 
     asyncio.run(case())
 

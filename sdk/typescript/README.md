@@ -151,6 +151,7 @@ const snapshot = await thread.read();
 
 - The SDK hard-fails on unsupported `protocol_version`.
 - `thread.resync_required` becomes `OpenyakResyncRequiredError` in `runStreamed()`.
+- That resync path is now also locked in live local-server integration coverage for deliberately lagged attach-first streams; the SDK still treats it as resync-required, not replay.
 - `run()` may reconcile from `thread.read()` after a dropped stream and marks the result with `recoveredFromSnapshot: true`.
 - If the local server fails before runtime/provider bootstrap completes, the latest thread snapshot still preserves the submitted turn or user-input response instead of silently dropping it.
 - If the server restarts mid-run, the latest snapshot may come back as `status="interrupted"` with a `recovery_note`; the SDK exposes that persisted truth, but it does not invent daemon-side replay or recovery actions.

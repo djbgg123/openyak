@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { OpenyakClient, OpenyakReconnectRequiredError } from "../src/index.js";
+import {
+  OpenyakClient,
+  OpenyakReconnectRequiredError,
+  OpenyakResyncRequiredError,
+} from "../src/index.js";
 import {
   startMockAnthropicService,
   startOpenyakServer,
@@ -329,6 +333,52 @@ test("runStreamed surfaces reconnect-required truth after local server restart",
     await server.close();
     await mock.close();
     await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("runStreamed surfaces live thread.resync_required after a lagged local stream", async () => {
+  const mock = await startMockAnthropicService();
+  const server = await startOpenyakServer({
+    ...process.env,
+    ANTHROPIC_API_KEY: "test-sdk-key",
+    ANTHROPIC_BASE_URL: mock.baseUrl,
+    OPENYAK_TEST_THREAD_STREAM_DELAY_MS: "25",
+    OPENYAK_TEST_BROADCAST_CAPACITY: "8",
+  });
+  try {
+    const client = new OpenyakClient({
+      baseUrl: server.baseUrl,
+      timeoutMs: 30_000,
+    });
+
+    const thread = await client.createThread({
+      model: "claude-sonnet-4-6",
+    });
+
+    const streamed = await thread.runStreamed("PARITY_SCENARIO:lagged_stream_resync");
+    const iterator = streamed.events[Symbol.asyncIterator]();
+    const first = await iterator.next();
+    assert.equal(first.value?.type, "run.started");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    await assert.rejects(
+      (async () => {
+        while (true) {
+          const next = await iterator.next();
+          if (next.done) {
+            break;
+          }
+        }
+      })(),
+      (error: unknown) =>
+        error instanceof OpenyakResyncRequiredError &&
+        error.event.thread_id === thread.threadId &&
+        error.event.payload.skipped > 0 &&
+        error.event.payload.snapshot.thread_id === thread.threadId,
+    );
+  } finally {
+    await server.close();
+    await mock.close();
   }
 });
 

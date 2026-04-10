@@ -299,8 +299,9 @@ impl ThreadRecord {
     }
 
     fn from_inner(inner: ThreadInner, store: Arc<SqliteThreadStore>) -> Self {
-        let (protocol_events, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let (legacy_events, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let capacity = test_broadcast_capacity();
+        let (protocol_events, _) = broadcast::channel(capacity);
+        let (legacy_events, _) = broadcast::channel(capacity);
         Self {
             inner: Arc::new(Mutex::new(inner)),
             store,
@@ -523,7 +524,10 @@ impl ThreadRecord {
             self.emit_protocol_event(
                 "run.failed",
                 Some(run_id),
-                to_value(RunFailedPayload::from_error("storage_error", error.to_string())),
+                to_value(RunFailedPayload::from_error(
+                    "storage_error",
+                    error.to_string(),
+                )),
             );
             return;
         }
@@ -558,7 +562,10 @@ impl ThreadRecord {
                     self.emit_protocol_event(
                         "run.failed",
                         Some(run_id),
-                        to_value(RunFailedPayload::from_error("runtime_error", error.to_string())),
+                        to_value(RunFailedPayload::from_error(
+                            "runtime_error",
+                            error.to_string(),
+                        )),
                     );
                 }
             }
@@ -1075,9 +1082,13 @@ async fn stream_thread_events(
     let record = state.thread(&id)?;
     let (mut receiver, snapshot) = subscribe_thread_stream(&record);
     let mut snapshot_sequence = snapshot.sequence;
+    let event_delay = test_thread_stream_delay();
     let stream = stream! {
         yield Ok::<Event, Infallible>(snapshot.to_sse_event());
         loop {
+            if let Some(delay) = event_delay {
+                tokio::time::sleep(delay).await;
+            }
             let Some(event) = recv_thread_stream_event(&record, &mut receiver, &mut snapshot_sequence).await else {
                 break;
             };
@@ -1090,6 +1101,22 @@ async fn stream_thread_events(
     };
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+}
+
+fn test_thread_stream_delay() -> Option<Duration> {
+    env::var("OPENYAK_TEST_THREAD_STREAM_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+}
+
+fn test_broadcast_capacity() -> usize {
+    env::var("OPENYAK_TEST_BROADCAST_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(BROADCAST_CAPACITY)
 }
 
 async fn create_session(
@@ -1952,18 +1979,17 @@ mod tests {
     use super::{
         app, execute_run, recv_thread_stream_event, subscribe_thread_stream, AppState,
         CreateSessionResponse, ListSessionsResponse, ListThreadsResponse, RunFailedPayload,
-        RunInvocation,
-        SessionDetailsResponse, SqliteThreadStore, StartTurnRequest, SubmitUserInputRequest,
-        ThreadEventEnvelope, ThreadExecutionConfig, ThreadRecord, ThreadSnapshot,
-        TurnAcceptedResponse, UserInputAcceptedResponse,
+        RunInvocation, SessionDetailsResponse, SqliteThreadStore, StartTurnRequest,
+        SubmitUserInputRequest, ThreadEventEnvelope, ThreadExecutionConfig, ThreadRecord,
+        ThreadSnapshot, TurnAcceptedResponse, UserInputAcceptedResponse,
     };
     use mock_anthropic_service::MockAnthropicService;
     use reqwest::Client;
-    use rusqlite::Connection;
     use runtime::{
         ContentBlock, ConversationMessage, MessageRole, Session as RuntimeSession, TokenUsage,
         TurnSummary,
     };
+    use rusqlite::Connection;
     use serde_json::{json, Value};
     use std::collections::BTreeSet;
     use std::ffi::OsString;
@@ -2600,20 +2626,19 @@ mod tests {
             .json::<TurnAcceptedResponse>()
             .await
             .expect("runtime-failure turn response should parse");
-        let mut runtime_failure_events = vec![
-            serde_json::to_value(runtime_failure_snapshot)
-                .expect("runtime-failure snapshot should serialize"),
-        ];
+        let mut runtime_failure_events = vec![serde_json::to_value(runtime_failure_snapshot)
+            .expect("runtime-failure snapshot should serialize")];
         loop {
-            let frame =
-                next_sse_frame(&mut runtime_failure_events_response, &mut runtime_failure_buffer)
-                    .await;
+            let frame = next_sse_frame(
+                &mut runtime_failure_events_response,
+                &mut runtime_failure_buffer,
+            )
+            .await;
             let event: ThreadEventEnvelope = sse_json(&frame);
             let event_type = event.event_type.clone();
             if event.run_id.as_deref() == Some(runtime_failure_accepted.run_id.as_str()) {
                 runtime_failure_events.push(
-                    serde_json::to_value(event)
-                        .expect("runtime-failure event should serialize"),
+                    serde_json::to_value(event).expect("runtime-failure event should serialize"),
                 );
             }
             if event_type == "run.failed" {
@@ -2662,20 +2687,20 @@ mod tests {
                 usage: TokenUsage::default(),
             }),
         );
-        let mut storage_failure_events = vec![
-            serde_json::to_value(storage_snapshot)
-                .expect("storage-failure snapshot should serialize"),
-        ];
+        let mut storage_failure_events = vec![serde_json::to_value(storage_snapshot)
+            .expect("storage-failure snapshot should serialize")];
         loop {
-            let event =
-                recv_thread_stream_event(&storage_record, &mut storage_receiver, &mut storage_snapshot_sequence)
-                    .await
-                    .expect("storage failure event should arrive");
+            let event = recv_thread_stream_event(
+                &storage_record,
+                &mut storage_receiver,
+                &mut storage_snapshot_sequence,
+            )
+            .await
+            .expect("storage failure event should arrive");
             let event_type = event.event_type.clone();
             if event.run_id.as_deref() == Some("run-storage") {
                 storage_failure_events.push(
-                    serde_json::to_value(event)
-                        .expect("storage-failure event should serialize"),
+                    serde_json::to_value(event).expect("storage-failure event should serialize"),
                 );
             }
             if event_type == "run.failed" {
@@ -3457,16 +3482,14 @@ mod tests {
             }),
         );
 
-        let started =
-            recv_thread_stream_event(&record, &mut receiver, &mut snapshot_sequence)
-                .await
-                .expect("run.started should arrive");
+        let started = recv_thread_stream_event(&record, &mut receiver, &mut snapshot_sequence)
+            .await
+            .expect("run.started should arrive");
         assert_eq!(started.event_type, "run.started");
 
-        let failed =
-            recv_thread_stream_event(&record, &mut receiver, &mut snapshot_sequence)
-                .await
-                .expect("run.failed should arrive");
+        let failed = recv_thread_stream_event(&record, &mut receiver, &mut snapshot_sequence)
+            .await
+            .expect("run.failed should arrive");
         assert_eq!(failed.event_type, "run.failed");
         assert_eq!(failed.payload["code"], "storage_error");
         assert_eq!(failed.payload["status"], "failed");

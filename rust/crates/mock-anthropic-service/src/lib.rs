@@ -13,6 +13,8 @@ use tokio::time::{sleep, Duration};
 
 pub const SCENARIO_PREFIX: &str = "PARITY_SCENARIO:";
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+const LAGGED_STREAM_RESYNC_CHUNKS: usize = 64;
+const LAGGED_STREAM_RESYNC_CHUNK_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedRequest {
@@ -126,6 +128,7 @@ enum Scenario {
     BashPermissionPromptDenied,
     RequestUserInputRoundtrip,
     DelayedRequestUserInputRoundtrip,
+    LaggedStreamResync,
     PluginToolRoundtrip,
 }
 
@@ -143,6 +146,7 @@ impl Scenario {
             "bash_permission_prompt_denied" => Some(Self::BashPermissionPromptDenied),
             "request_user_input_roundtrip" => Some(Self::RequestUserInputRoundtrip),
             "delayed_request_user_input_roundtrip" => Some(Self::DelayedRequestUserInputRoundtrip),
+            "lagged_stream_resync" => Some(Self::LaggedStreamResync),
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             _ => None,
         }
@@ -161,6 +165,7 @@ impl Scenario {
             Self::BashPermissionPromptDenied => "bash_permission_prompt_denied",
             Self::RequestUserInputRoundtrip => "request_user_input_roundtrip",
             Self::DelayedRequestUserInputRoundtrip => "delayed_request_user_input_roundtrip",
+            Self::LaggedStreamResync => "lagged_stream_resync",
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
         }
     }
@@ -478,19 +483,22 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 &[r#"{"command":"printf 'should not run'","timeout":1000}"#],
             ),
         },
-        Scenario::RequestUserInputRoundtrip | Scenario::DelayedRequestUserInputRoundtrip => match latest_tool_result(request) {
-            Some((tool_output, _)) => final_text_sse(&format!(
-                "request-user-input completed: {}",
-                extract_user_input_content(&tool_output)
-            )),
-            None => tool_use_sse(
-                "req_user_input_roundtrip",
-                "openyak_request_user_input",
-                &[
-                    r#"{"request_id":"req-user-input-roundtrip","prompt":"Which branch should we continue with?","options":["main","feature"],"allow_freeform":true}"#,
-                ],
-            ),
-        },
+        Scenario::RequestUserInputRoundtrip | Scenario::DelayedRequestUserInputRoundtrip => {
+            match latest_tool_result(request) {
+                Some((tool_output, _)) => final_text_sse(&format!(
+                    "request-user-input completed: {}",
+                    extract_user_input_content(&tool_output)
+                )),
+                None => tool_use_sse(
+                    "req_user_input_roundtrip",
+                    "openyak_request_user_input",
+                    &[
+                        r#"{"request_id":"req-user-input-roundtrip","prompt":"Which branch should we continue with?","options":["main","feature"],"allow_freeform":true}"#,
+                    ],
+                ),
+            }
+        }
+        Scenario::LaggedStreamResync => lagged_stream_resync_sse(),
         Scenario::PluginToolRoundtrip => match latest_tool_result(request) {
             Some((tool_output, _)) => final_text_sse(&format!(
                 "plugin tool completed: {}",
@@ -645,26 +653,31 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                 json!({"command": "printf 'should not run'", "timeout": 1000}),
             ),
         },
-        Scenario::RequestUserInputRoundtrip | Scenario::DelayedRequestUserInputRoundtrip => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
-                "msg_request_user_input_final",
-                &format!(
-                    "request-user-input completed: {}",
-                    extract_user_input_content(&tool_output)
+        Scenario::RequestUserInputRoundtrip | Scenario::DelayedRequestUserInputRoundtrip => {
+            match latest_tool_result(request) {
+                Some((tool_output, _)) => text_message_response(
+                    "msg_request_user_input_final",
+                    &format!(
+                        "request-user-input completed: {}",
+                        extract_user_input_content(&tool_output)
+                    ),
                 ),
-            ),
-            None => tool_message_response(
-                "msg_request_user_input_start",
-                "req_user_input_roundtrip",
-                "openyak_request_user_input",
-                json!({
-                    "request_id": "req-user-input-roundtrip",
-                    "prompt": "Which branch should we continue with?",
-                    "options": ["main", "feature"],
-                    "allow_freeform": true
-                }),
-            ),
-        },
+                None => tool_message_response(
+                    "msg_request_user_input_start",
+                    "req_user_input_roundtrip",
+                    "openyak_request_user_input",
+                    json!({
+                        "request_id": "req-user-input-roundtrip",
+                        "prompt": "Which branch should we continue with?",
+                        "options": ["main", "feature"],
+                        "allow_freeform": true
+                    }),
+                ),
+            }
+        }
+        Scenario::LaggedStreamResync => {
+            text_message_response("msg_lagged_stream_resync", "lagged stream resync complete")
+        }
         Scenario::PluginToolRoundtrip => match latest_tool_result(request) {
             Some((tool_output, _)) => text_message_response(
                 "msg_plugin_tool_final",
@@ -696,6 +709,7 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::BashPermissionPromptDenied => "req_bash_permission_prompt_denied",
         Scenario::RequestUserInputRoundtrip => "req_request_user_input_roundtrip",
         Scenario::DelayedRequestUserInputRoundtrip => "req_delayed_request_user_input_roundtrip",
+        Scenario::LaggedStreamResync => "req_lagged_stream_resync",
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
     }
 }
@@ -970,6 +984,72 @@ fn final_text_sse(text: &str) -> String {
             "delta": {"type": "text_delta", "text": text}
         }),
     );
+    append_sse(
+        &mut body,
+        "content_block_stop",
+        json!({
+            "type": "content_block_stop",
+            "index": 0
+        }),
+    );
+    append_sse(
+        &mut body,
+        "message_delta",
+        json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": usage_json(14, 7)
+        }),
+    );
+    append_sse(&mut body, "message_stop", json!({"type": "message_stop"}));
+    body
+}
+
+fn lagged_stream_resync_sse() -> String {
+    let mut body = String::new();
+    append_sse(
+        &mut body,
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_lagged_stream_resync",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": DEFAULT_MODEL,
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": usage_json(14, 0)
+            }
+        }),
+    );
+    append_sse(
+        &mut body,
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }),
+    );
+
+    for index in 0..LAGGED_STREAM_RESYNC_CHUNKS {
+        let text = format!(
+            "{index:04}:{}",
+            "lagged-stream-".repeat(LAGGED_STREAM_RESYNC_CHUNK_BYTES / 14)
+        );
+        append_sse(
+            &mut body,
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text}
+            }),
+        );
+    }
+
     append_sse(
         &mut body,
         "content_block_stop",
