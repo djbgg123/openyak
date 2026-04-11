@@ -2,7 +2,7 @@
 
 `rust/` 是当前仓库的主产品实现面。这里包含可直接构建、运行和维护的 `openyak` CLI，以及其运行时、工具系统、插件框架和配套服务。
 
-最近一次全量文档与命令面对齐完成于 `2026-04-10`。本文内容已对照当前 `openyak` CLI help、`2026-04-10` 完成的 fresh release-binary 全量直接命令矩阵（本轮包含 48 个 release-binary help/命令/子命令步骤，并补做 REPL、server API、bundle-only service install 与恢复路径复核）与 CLI smoke/regression rerun 更新；工作区、根目录 Python、Python SDK、TypeScript SDK 的仓库级全量验证基线仍以 `2026-04-09` 的结果为准。
+最近一次全量文档与验证面对齐完成于 `2026-04-11`。本文内容已对照当前 `openyak` CLI help、`2026-04-11` 完成的 Rust/根目录 Python/Python SDK/TypeScript SDK 全量构建与验证复核，以及同日完成的 direct CLI/server 实执行矩阵（34 个非 server 步骤 + 12 个 server 步骤，另含 packaged binary `--help` 与 mock-provider prompt）更新。
 
 ## 当前定位
 
@@ -425,7 +425,7 @@ skills 目录支持两种布局：
 
 ## 验证
 
-最近一次工作区全量验收（`2026-04-09`）已覆盖：
+最近一次工作区全量验收（`2026-04-11`）已覆盖：
 
 ```bash
 cargo fmt --all --check
@@ -453,7 +453,7 @@ SDK 验证命令：
 cd sdk/python
 python -m pytest
 python -m ruff check .
-python -m mypy
+python -m mypy src
 python -m build
 ```
 
@@ -466,28 +466,25 @@ pnpm build
 
 上述验证命令现已同步固化到 GitHub Actions [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)，用于检查公开仓库可复现的主验证基线。
 
-本次文档刷新还额外补做了一轮在 `2026-04-10` 完成的 fresh release-binary 级全量直接命令矩阵与 CLI smoke/regression rerun。当前矩阵包含 48 个直接 release-binary help/命令/子命令步骤，并额外复核 REPL、thread API、bundle-only service install 与恢复路径，覆盖：
-
-- `cargo build --manifest-path rust/Cargo.toml --workspace`
-- `cargo build --manifest-path rust/Cargo.toml --release -p openyak-cli`
-- `cargo test --manifest-path rust/Cargo.toml -p openyak-cli --test command_surface_cli_smoke --test doctor_cli_smoke --test server_cli_smoke --test onboard_cli_smoke --test package_release_cli_smoke`
-- `pnpm --dir sdk/typescript build`
-- `python -m build`（`sdk/python`）
-- 48 个直接 release-binary help/命令/子命令步骤
-
-其中直接命令矩阵与补充复核共同覆盖了：
+本次文档刷新还同步记录了 `2026-04-11` 完成的 direct CLI/server 实执行矩阵。本轮额外执行了 46 个真实步骤（34 个非 server + 12 个 server），并复核：
 
 - `openyak --help`、`openyak --version`
-- `openyak prompt --help`、`dump-manifests --help`、`bootstrap-plan --help`、`agents --help`、`skills --help`、`foundations --help`、`system-prompt --help`、`login --help`、`logout --help`、`init --help`、`onboard --help`、`doctor --help`、`package-release --help`、`server --help`
-- `openyak dump-manifests`、`bootstrap-plan`、`agents`、`skills`、`foundations`、`foundations task`、`foundations mcp`、`system-prompt`、`logout`、`init`、`doctor`、`package-release`
-- `openyak skills list|available|info|install|update|uninstall` 的 lifecycle help/parse surface
-- `openyak /agents`、`openyak /skills`、`openyak /foundations task`
-- REPL `/help` -> `/exit` 的最小交互闭环，以及 resume-safe slash batch 复核
-- `openyak server install --bind 127.0.0.1:0`、`openyak server start --detach --bind 127.0.0.1:0`、`openyak server status`、`openyak server recover`、`openyak server stop`
-- 空工作区上的 `openyak server recover` 受控无害路径，以及运行中本地 server 存在时的 `openyak doctor` readiness 观察
-- `openyak server --bind 127.0.0.1:0` 的真实启动与停服路径
-- 真实 `/v1/threads` 创建/查询与 legacy `/sessions/{id}` compatibility 读取，以及 persisted thread truth 的 restart-recovery 复核
-- 打包后二进制 `openyak(.exe) --help`
+- REPL `/help` -> `/exit` 的最小交互闭环
+- `openyak prompt --help` 与缺少凭据时的受控失败
+- `dump-manifests`、`bootstrap-plan`、`agents`、`skills`、`system-prompt`、`login`、`logout`、`init`
+- `openyak foundations` inventory 与 `task|team|cron|lsp|mcp` 五个 family detail
+- `openyak doctor`
+- `openyak onboard --help` 与 non-TTY 安全失败
+- `openyak skills available|info|install|update|uninstall` 的 lifecycle
+- `openyak --resume SESSION.json ...` 的 resume-safe slash command 链
+- `openyak package-release` 与打包后二进制 `openyak(.exe) --help`
+- mock-provider `prompt` 路径（`PARITY_SCENARIO:streaming_text`）
+- `openyak server --help`
+- `openyak server --bind 127.0.0.1:0` 的真实前台启动、`/v1/threads` 探活和停服
+- `openyak server install --bind 127.0.0.1:0`
+- `openyak server start --detach --bind 127.0.0.1:0`、`status`、`stop`
+- 空工作区上的 `openyak server recover` 受控无害路径
+- persisted thread truth 存在时的 `openyak server recover` 复位路径
 - `openyak login`、`openyak onboard` 与 bare `openyak "..."` prompt fallback 的受控失败路径
 
 其中 `openyak foundations lsp` 仍以前一轮直接复核结论为准：当前 detail 输出使用高层 `Tools            LSP` 标签，不再展开成单条 `LspGetDiagnostics` 文案。

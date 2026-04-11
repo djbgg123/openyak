@@ -6,8 +6,8 @@ Current package metadata:
 
 - version: `0.0.0a1`
 - requires Python `>=3.10`
-- CLI/operator boundary rechecked against local `openyak` CLI `v0.1.0` on `2026-04-10`
-- full SDK verification commands below remain last repo-wide rerun on `2026-04-09`
+- CLI/operator boundary rechecked against local `openyak` CLI `v0.1.0` on `2026-04-11`
+- full SDK verification commands below were rerun successfully on `2026-04-11`
 
 ## Scope
 
@@ -222,8 +222,8 @@ Then run the verification suite from `sdk/python`:
 cd sdk/python
 python -m pytest
 python -m ruff check .
-python -m mypy
+python -m mypy src
 python -m build
 ```
 
-`python -m build` in this list was rerun successfully on `2026-04-10` during the latest documentation refresh. The full SDK verification set above remains the repo-wide baseline last rerun on `2026-04-09`.
+The full SDK verification set above was rerun successfully on `2026-04-11` during the latest documentation refresh.
